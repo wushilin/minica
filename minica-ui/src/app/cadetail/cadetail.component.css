@@ -1,0 +1,26 @@
+.small-card {
+  padding: 30px;
+}
+
+.cakeys {
+  padding-right: 20px;
+}
+.flex-container {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+.flex-container > div {
+}
+
+.expired {
+}
+
+.active {
+  background-color: #bef7dd;
+}
+
+mat-form-field {
+  padding: 5px;
+}
+

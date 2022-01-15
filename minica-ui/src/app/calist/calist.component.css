@@ -1,0 +1,27 @@
+.small-card {
+  width: 700px;
+  padding: 30px;
+}
+.small-card-title{
+  padding-left: 30px;
+  padding-top: 30px;
+}
+.flex-container {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+.flex-container > div {
+}
+
+.expired-ca {
+  background-color: #f2913d;
+}
+
+.active-ca {
+  background-color: #bef7dd;
+}
+
+mat-form-field {
+  padding: 5px;
+}

@@ -1,0 +1,43 @@
+<div>
+  <div class="small-card-title"><a href="/">Home</a></div>
+  <p></p>
+  <div class="small-card-title">
+    <h1>Available Certificate Authorities</h1>
+    <mat-card-actions align="start">
+      <button mat-raised-button color="primary" (click)="openCreateDialog()">Create New Certificate Authority</button>
+    </mat-card-actions>
+  </div>
+</div>
+<div class="flex-container">
+  <div fxLayout="wrap" fxLayoutAlign="start center" fxLayoutGap="1px" *ngFor="let ca of calist; index as i"
+       class="small-card" fxFlex="20">
+    <mat-card [ngClass]="{'expired-ca' : caService.expired(ca)}" matBadge="{{ca.certCount}}" matBadgeSize="large">
+      <mat-card-title style="font-size:16px">
+        CN={{ca.commonName}}
+      </mat-card-title>
+      <mat-card-subtitle>{{ca.subject}}</mat-card-subtitle>
+      <mat-card-content>
+        Valid from
+        <strong>{{ca.issueTime| date:'yyyy-MM-dd'}}</strong>
+        -&gt;
+        <strong>{{ca.validDays*3600000*24 + ca.issueTime | date:'yyyy-MM-dd'}}</strong>
+        <p></p>
+        Algorithms: <strong>RSA{{ca.keyLength}}Bits with {{ca.digestAlgorithm}}</strong>
+        <p></p>
+      </mat-card-content>
+      <mat-card-actions align="end">
+        <a mat-raised-button color="primary" href="cadetail/{{ca.id}}">Open</a>
+        <button mat-raised-button color="warn" (click)="deleteCA(ca.id, ca.subject)">Delete</button>
+      </mat-card-actions>
+    </mat-card>
+  </div>
+  <div *ngIf="calist.length == 0" fxLayout="wrap" fxLayoutAlign="start center" fxLayoutGap="1px" class="small-card" fxFlex="20">
+    <mat-card>
+      <mat-card-title style="font-size:16px">No Certificate Authorities Yet!</mat-card-title>
+      <mat-card-subtitle>Why don't you create one?</mat-card-subtitle>
+      <mat-card-content>
+        Just click the "Create New Certificate Authority" button above.
+      </mat-card-content>
+    </mat-card>
+  </div>
+</div>

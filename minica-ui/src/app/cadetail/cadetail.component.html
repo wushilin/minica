@@ -1,0 +1,92 @@
+<div>
+  <div fxLayout="wrap" fxLayoutAlign="start center" fxLayoutGap="1px" class="small-card" fxFlex="20">
+    <a href="/">Home</a> &gt; <a href="cadetail/{{cadetail?.id}}">CN={{cadetail?.commonName}}</a>
+    <mat-card [ngClass]="{'expired-ca' : caService.expired(cadetail)}" *ngIf="cadetail">
+      <h1>Certificate Authority Details</h1>
+      <mat-card-actions align="start">
+        <button mat-raised-button color="primary" (click)="openCreateDialog()">Create New Certificate</button>
+      </mat-card-actions>
+      <mat-card-title style="font-size:16px">CN={{cadetail.commonName}}</mat-card-title>
+      <mat-card-subtitle>{{cadetail.subject}}</mat-card-subtitle>
+      <mat-card-content>
+        Valid from
+        <strong>{{cadetail.issueTime| date:'yyyy-MM-dd'}}</strong>
+        -&gt;
+        <strong>{{cadetail.validDays*3600000*24 + cadetail.issueTime | date:'yyyy-MM-dd'}}</strong>
+        <p></p>
+        Algorithm: <strong>RSA{{cadetail.keyLength}}Bits with {{cadetail.digestAlgorithm}}</strong>
+        <p></p>
+      </mat-card-content>
+      <label *ngIf="caService.expired(cadetail)"><strong style="color:red">Invalid: Expired</strong></label>
+      <label *ngIf="!caService.expired(cadetail)"><strong style="color:green">Valid</strong></label>
+      <p></p>
+      <button mat-raised-button color="secondary" [cdkCopyToClipboard]="cadetail.cert">Copy CA Cert</button>
+      &nbsp;
+      <button mat-raised-button color="secondary" [cdkCopyToClipboard]="cadetail.key">Copy CA Key</button>
+      <div class="flex-container">
+        <mat-form-field class="cakeys" appearance="fill" style="width: 48%">
+          <mat-label>CA Certificate</mat-label>
+          <textarea matInput disabled cols="200" rows="30" style="font-family:Courier;">{{cadetail.cert}}</textarea>
+        </mat-form-field>
+
+        <mat-form-field class="cakeys" appearance="fill" style="width: 48%">
+          <mat-label>CA Private Key</mat-label>
+          <textarea matInput disabled cols="200" rows="30" style="font-family:Courier;">{{cadetail.key}}</textarea>
+        </mat-form-field>
+      </div>
+      Download CA:
+      &nbsp;
+      <a mat-raised-button color="primary" href="/ca/download/{{cadetail.id}}/cert">Cert</a>
+      &nbsp;
+      <a mat-raised-button color="primary" href="/ca/download/{{cadetail.id}}/key">Key</a>
+      &nbsp;
+      <a mat-raised-button color="primary" href="/ca/download/{{cadetail.id}}/pkcs12">PKCS12</a>
+      &nbsp;
+      <a mat-raised-button color="primary" href="/ca/download/{{cadetail.id}}/truststore">Trust Store (JKS Format)</a>
+      &nbsp;
+      <a mat-raised-button color="primary" href="/ca/download/{{cadetail.id}}/password">Keystore And Trust Store Password (Same)</a>
+    </mat-card>
+  </div>
+  <div class="flex-container" *ngIf="cadetail">
+    <div *ngIf="certList.length == 0" fxLayout="wrap" fxLayoutAlign="start center" fxLayoutGap="1px" class="small-card" fxFlex="20">
+      <mat-card>
+        <mat-card-title style="font-size:16px">No Certificates Yet!</mat-card-title>
+        <mat-card-subtitle>Why don't you create one?</mat-card-subtitle>
+        <mat-card-content>
+          Just click the "Create New Certificate" button above.
+        </mat-card-content>
+      </mat-card>
+    </div>
+    <div fxLayout="wrap" fxLayoutAlign="start center" fxLayoutGap="1px" *ngFor="let cert of certList; index as i"
+         class="small-card" fxFlex="20">
+      <mat-card [ngClass]="{'expired' : caService.expiredCert(cert), 'active':!caService.expiredCert(cert)}">
+        <mat-card-title style="font-size:16px">CN={{cert.commonName}}</mat-card-title>
+        <mat-card-content>
+          Cert ID: {{cert.id}}
+          <p></p>
+          Country: {{cert.countryCode}}
+          <p></p>
+          State: {{cert.state}}
+          <p></p>
+          Locality: {{cert.city}}
+          <p></p>
+          Organization: {{cert.organization}}
+          <p></p>
+          Organization Unit: {{cert.organizationUnit}}
+          <p></p>
+          Valid from
+          <strong>{{cert.issueTime| date:'yyyy-MM-dd'}}</strong>
+          -&gt;
+          <strong>{{cert.validDays*3600000*24 + cert.issueTime | date:'yyyy-MM-dd'}}</strong>
+          <p></p>
+          Algorithm: <strong>RSA{{cert.keyLength}}Bits with {{cert.digestAlgorithm}}</strong>
+          <p></p>
+        </mat-card-content>
+        <mat-card-actions align="end">
+          <a mat-raised-button color="primary" href="certdetail/{{cadetail.id}}/{{cert.id}}">View</a>
+          <button mat-raised-button color="warn" (click)="deleteCert(cadetail, cert)">Delete</button>
+        </mat-card-actions>
+      </mat-card>
+    </div>
+  </div>
+</div>

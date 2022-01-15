@@ -1,0 +1,14 @@
+{
+	"commonName": "jumper.wushilin.net",
+	"validDays": 7300,
+  "email":"wushilin@live.com",
+	"countryCode":"SG",
+	"organization":"Confluent",
+	"state":"Singapore",
+	"city":"Singapore",
+  "organizationUnit":"Professional Service",
+	"digestAlgorithm":"SHA512",
+	"keyLength": 4096,
+  "dnsList": ["jumper.wushilin.net", "*.wushilin.net"],
+  "ipList": ["192.168.44.1", "192.168.44.2"]
+}

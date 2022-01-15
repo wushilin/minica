@@ -1,0 +1,10 @@
+<h1 mat-dialog-title>{{data.title}}</h1>
+<div mat-dialog-content>
+  <div *ngFor="let message of data.messages; index as i">
+    <div>{{message}}</div>
+  </div>
+</div>
+<div mat-dialog-actions>
+  <button mat-button [mat-dialog-close]="true" cdkFocusInitial color="warn">Confirm</button>
+  <button mat-button [mat-dialog-close]="false">Cancel</button>
+</div>

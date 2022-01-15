@@ -1,0 +1,67 @@
+<div>
+  <div fxLayout="wrap" fxLayoutAlign="start center" fxLayoutGap="1px"  class="small-card" fxFlex="20">
+    <a href="/">Home</a> &gt; <a href="cadetail/{{cadetail?.id}}">CN={{cadetail?.commonName}}</a> &gt; <a href="certdetail/{{cadetail?.id}}/{{certdetail?.id}}">CN={{certdetail?.commonName}}</a>
+    <mat-card [ngClass]="{'expired' : caService.expiredCert(certdetail)}" *ngIf="certdetail">
+      <h1>Certificate Detail</h1>
+      <mat-card-title style="font-size:16px">CN={{certdetail.commonName}}</mat-card-title>
+      <mat-card-subtitle>{{certdetail.subject}}</mat-card-subtitle>
+      <mat-card-content>
+        Valid from:
+        <strong>{{certdetail.issueTime| date:'yyyy-MM-dd'}}</strong>
+        -&gt;
+        <strong>{{certdetail.validDays*3600000*24 + certdetail.issueTime | date:'yyyy-MM-dd'}}</strong>
+        <p></p>
+        Algorithm: <strong>RSA{{certdetail.keyLength}}Bits with {{certdetail.digestAlgorithm}}</strong>
+        <p></p>
+      </mat-card-content>
+      Status:
+      <label *ngIf="caService.expiredCert(certdetail)"><strong style="color:red">Invalid: Expired</strong></label>
+      <label *ngIf="!caService.expiredCert(certdetail)"><strong style="color:green">Valid</strong></label>
+      <p></p>
+      <div *ngIf="certdetail.dnsList.length > 0">
+        Valid for these DNS names:
+        <label *ngFor="let dns of certdetail.dnsList; index as i">
+          <strong>{{dns}}</strong>; &nbsp;
+        </label>
+      </div>
+      <label *ngIf="certdetail.dnsList.length == 0">
+        No DNS names configured.
+      </label>
+      <div *ngIf="certdetail.ipList.length > 0">
+        Valid for these IP Addresses:
+        <label *ngFor="let ip of certdetail.ipList; index as i">
+          <strong>{{ip}}</strong>; &nbsp;
+        </label>
+      </div>
+      <label *ngIf="certdetail.ipList.length == 0">
+        No IP Addresses configured.
+      </label>
+      <p></p>
+      <button mat-raised-button color="secondary" [cdkCopyToClipboard]="certdetail.cert">Copy Cert</button>
+      &nbsp;
+      <button mat-raised-button color="secondary" [cdkCopyToClipboard]="certdetail.key">Copy Key</button>
+      <div class="flex-container">
+        <mat-form-field class="cakeys" appearance="fill" style="width: 48%">
+        <mat-label>Certificate</mat-label>
+        <textarea matInput disabled cols="200" rows="30"  style="font-family:Courier;">{{certdetail.cert}}</textarea>
+      </mat-form-field>
+
+      <mat-form-field class="cakeys" appearance="fill" style="width: 48%">
+        <mat-label>Private Key</mat-label>
+        <textarea matInput disabled cols="200" rows="30"  style="font-family:Courier;">{{certdetail.key}}</textarea>
+      </mat-form-field>
+      </div>
+      <mat-card-actions align="start">
+        <a mat-raised-button color="primary" href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/bundle">Download Everything</a>
+        <a mat-raised-button color="primary" href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/cert">Cert</a>
+        <a mat-raised-button color="primary" href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/csr">Cert Request</a>
+        <a mat-raised-button color="primary" href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/key">Key</a>
+        <a mat-raised-button color="primary" href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/jks">KeyStore in JKS</a>
+        <a mat-raised-button color="primary" href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/pkcs12">KeyStore in PKCS12</a>
+        <a mat-raised-button color="primary" href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/password">KeyStore Password</a>
+        <a mat-raised-button color="primary" href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/truststore">Trust Store</a>
+        <a mat-raised-button color="primary" href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/truststorePassword">Trust Store Password</a>
+      </mat-card-actions>
+    </mat-card>
+  </div>
+</div>

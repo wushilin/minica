@@ -1,0 +1,96 @@
+<h1 mat-dialog-title>Create a new Cert</h1>
+<div mat-dialog-content>
+  <mat-form-field appearance="fill">
+    <mat-label>Common Name</mat-label>
+    <input matInput [(ngModel)]="data.commonName" required>
+  </mat-form-field>
+  <mat-form-field appearance="fill">
+    <mat-label>Country Code</mat-label>
+    <input matInput [(ngModel)]="data.countryCode" required>
+  </mat-form-field>
+  <mat-form-field appearance="fill">
+    <mat-label>State</mat-label>
+    <input matInput [(ngModel)]="data.state">
+  </mat-form-field>
+  <mat-form-field appearance="fill">
+    <mat-label>City</mat-label>
+    <input matInput [(ngModel)]="data.city">
+  </mat-form-field>
+  <mat-form-field appearance="fill">
+    <mat-label>Organization</mat-label>
+    <input matInput [(ngModel)]="data.organization" required>
+  </mat-form-field>
+  <mat-form-field appearance="fill">
+    <mat-label>Organization Unit</mat-label>
+    <input matInput [(ngModel)]="data.organizationUnit">
+  </mat-form-field>
+  <mat-form-field appearance="fill">
+    <mat-label>Email</mat-label>
+    <input matInput [(ngModel)]="data.email" required>
+  </mat-form-field>
+  <mat-form-field appearance="fill">
+    <mat-label>Valid Days</mat-label>
+    <input matInput [(ngModel)]="data.validDays" required>
+  </mat-form-field>
+  <mat-form-field appearance="fill">
+    <mat-label>Key Length</mat-label>
+    <mat-select [(value)]="data.keyLength" required>
+      <mat-option value="2048">
+        RSA2048 Bit
+      </mat-option>
+      <mat-option value="4096">
+        RSA4096 Bit
+      </mat-option>
+      <mat-option value="8192">
+        RSA8192 Bit
+      </mat-option>
+    </mat-select>
+  </mat-form-field>
+  <mat-form-field appearance="fill">
+    <mat-label>Digest Algorithm</mat-label>
+    <mat-select [(value)]="data.digestAlgorithm" required>
+      <mat-option value="sha256">
+        sha256
+      </mat-option>
+      <mat-option value="sha512">
+        sha512
+      </mat-option>
+    </mat-select>
+  </mat-form-field>
+  <mat-form-field appearance="fill">
+    <mat-label>DNS Names</mat-label>
+    <mat-chip-list #dnsList aria-label="DNS Name selection">
+      <mat-chip *ngFor="let dns of data.dnsList" (removed)="removeDNS(dns)">
+        {{dns}}
+        <button matChipRemove>
+          <mat-icon>cancel</mat-icon>
+        </button>
+      </mat-chip>
+      <input placeholder="New DNS..."
+             [matChipInputFor]="dnsList"
+             [matChipInputSeparatorKeyCodes]="separatorKeysCodes"
+             [matChipInputAddOnBlur]="addOnBlur"
+             (matChipInputTokenEnd)="addDNS($event)">
+    </mat-chip-list>
+  </mat-form-field>
+  <mat-form-field appearance="fill">
+    <mat-label>IP Addresses</mat-label>
+    <mat-chip-list #ipList aria-label="IP Addresses selection">
+      <mat-chip *ngFor="let ip of data.ipList" (removed)="removeIP(ip)">
+        {{ip}}
+        <button matChipRemove>
+          <mat-icon>cancel</mat-icon>
+        </button>
+      </mat-chip>
+      <input placeholder="New IP Address..."
+             [matChipInputFor]="ipList"
+             [matChipInputSeparatorKeyCodes]="separatorKeysCodes"
+             [matChipInputAddOnBlur]="addOnBlur"
+             (matChipInputTokenEnd)="addIP($event)">
+    </mat-chip-list>
+  </mat-form-field>
+</div>
+<div mat-dialog-actions>
+  <button mat-button [mat-dialog-close]="data" cdkFocusInitial color="primary">Create</button>
+  <button mat-button (click)="onNoClick()">Cancel</button>
+</div>
