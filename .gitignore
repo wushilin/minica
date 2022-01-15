@@ -25,3 +25,9 @@ hs_err_pid*
 # node modules
 minica-ui/node_modules/
 
+# Gradle binary
+.gradle
+
+# Build output
+
+build
