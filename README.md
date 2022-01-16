@@ -71,8 +71,14 @@ If you see something like this, that means your RESTful service is up.
 }
 ```
 
-You may refer to the following URLs for interacting with the restful:
-All requires basic authentication with viewer, or admin role.
+You may refer to the following URLs for interacting with the RESTfulservices endpoints. 
+
+```
+admin = view/download + modify
+viewer = view/download
+```
+All endpoints requires basic authentication with at least viewer.
+Modifications requires at least admin.
 1. Register new CA: 
 ```
 PUT /ca/new
@@ -99,6 +105,8 @@ Requires admin role
 GET /ca
 Authorization: xxx
 
+---
+Requires viewer role
 Note that each CA has an ID in json response, the ID is the unique identifier
 ```
 3. Get a single CA detail:
@@ -106,6 +114,8 @@ Note that each CA has an ID in json response, the ID is the unique identifier
 GET /ca/<ca-id>
 Authorization: xxx
 
+---
+Requires viewer role
 ```
 
 4. Delete a CA
