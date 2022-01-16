@@ -1,10 +1,13 @@
 # minica
 A Certificate Authority with RESTful interface and WEB UI
 
+# Home page
 ![home](https://github.com/wushilin/minica/blob/main/resources/home.png?raw=true)
 
+# View CA detail
 ![CA View](https://github.com/wushilin/minica/blob/main/resources/cadetail.png?raw=true)
 
+# View Cert Detail
 ![Cert View](https://github.com/wushilin/minica/blob/main/resources/certdetail.png?raw=true)
 
 
