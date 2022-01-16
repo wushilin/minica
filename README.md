@@ -14,11 +14,11 @@ This software is suitable for development & testing only, where you don't want t
 It is purely built using openssl and java keytool (shipped with JDK).
 
 # Building the MiniCA RESTful service
-
+```sh
 $ git clone https://github.com/wushilin/minica.git
 $ cd minica
 $ ./gradlew clean bootJar
-
+``
 The executable jar is located at build/libs/minica-0.0.1-SNAPSHOT.jar
 
 To run it, 
@@ -275,3 +275,42 @@ Authorization: xxx
 ---
 Requires viewer role
 ```
+
+
+# Building the UI service
+
+1. Install node and npm - steps skipped, node 16.10+
+
+2. Install angular js cli
+```
+$ npm install -g @angular/cli
+```
+
+3. Edit the proxy configuration `vim proxy.conf.js`
+This proxies /ca to the endpoint of your RESTful service. If you changed your port above in RESTful service, please change accordingly here.
+If you run the RESTful service in another host, please remember to change the target host as well.
+```
+const PROXY_CONFIG = [
+  {
+    context: [
+                 "/ca/"
+    ],
+    target: "http://localhost:9988/",
+    changeOrigin: true,
+    secure: false
+  }
+];
+
+module.exports = PROXY_CONFIG;
+
+```
+
+4. Starting the UI
+```sh
+$ ng serve --proxy-config proxy.conf.js --host 0.0.0.0 --configuration production
+```
+
+5. Test
+Open your browser and access http://<host>:4200. You will be prompted to login, enter the RESTful userid and password.
+
+For the admin users, you can do everything. For viewer users, the modifications are prohibited.
