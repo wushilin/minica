@@ -12,13 +12,18 @@ It is my first attempt with Front End Project.
 This software is suitable for development & testing only, where you don't want to manage a microsoft Active Directory server for certificates.
 
 It is purely built using openssl and java keytool (shipped with JDK).
-
+You need to have both installed in your system.
+Requirement:
+```
+openssl 1.0+
+jdk 11+
+```
 # Building the MiniCA RESTful service
 ```sh
 $ git clone https://github.com/wushilin/minica.git
 $ cd minica
 $ ./gradlew clean bootJar
-``
+```
 The executable jar is located at build/libs/minica-0.0.1-SNAPSHOT.jar
 
 To run it, 
