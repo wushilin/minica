@@ -34,3 +34,4 @@ build
 application.properties
 .idea
 .DS_Store
+**/*.localonly
