@@ -31,3 +31,5 @@ minica-ui/node_modules/
 # Build output
 
 build
+application.properties
+.idea/
