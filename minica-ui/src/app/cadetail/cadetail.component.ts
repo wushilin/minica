@@ -26,7 +26,6 @@ export class CadetailComponent implements OnInit {
     validDays: "365",
     digestAlgorithm: "sha512",
     keyLength: "4096",
-    email: "",
     dnsList: [],
     ipList: [],
   };

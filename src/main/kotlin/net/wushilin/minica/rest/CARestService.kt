@@ -1,9 +1,6 @@
 package net.wushilin.minica.rest
 
-import net.wushilin.minica.openssl.CA
-import net.wushilin.minica.openssl.CARequest
-import net.wushilin.minica.openssl.Cert
-import net.wushilin.minica.openssl.CertRequest
+import net.wushilin.minica.openssl.*
 import net.wushilin.minica.services.CAService
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
@@ -26,6 +23,7 @@ class CARestService {
     fun getCAList(): List<CA> {
         return caSvc.listCA()
     }
+
 
     @DeleteMapping("/ca/{id}")
     fun deleteCA(@PathVariable("id") id: String): CA {
@@ -62,6 +60,11 @@ class CARestService {
     @PutMapping("/ca/new")
     fun createCA(@RequestBody req: CARequest): CA {
         return caSvc.createCA(req)
+    }
+
+    @PutMapping("/ca/import")
+    fun importCA(@RequestBody req:ImportCARequest):CA {
+        return caSvc.importCA(req)
     }
 
     @PutMapping("/ca/{caid}/new")

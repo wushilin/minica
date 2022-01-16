@@ -3,7 +3,7 @@ const PROXY_CONFIG = [
     context: [
     		 "/ca/"
     ],
-    target: "http://192.168.44.101:9988/",
+    target: "http://localhost:8080/",
     changeOrigin: true,
     secure: false
   }

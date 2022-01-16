@@ -1,0 +1,15 @@
+<h1 mat-dialog-title>Import Existing CA</h1>
+<div mat-dialog-content>
+  <mat-form-field appearance="fill" style="width: 100%">
+    <mat-label>Certificate</mat-label>
+    <textarea matInput cols="200" rows="30" style="font-family:Courier;" [(ngModel)]="data.cert"></textarea>
+  </mat-form-field>
+  <mat-form-field appearance="fill" style="width: 100%">
+    <mat-label>Private Key</mat-label>
+    <textarea matInput cols="200" rows="30" style="font-family:Courier;" [(ngModel)]="data.key"></textarea>
+  </mat-form-field>
+</div>
+<div mat-dialog-actions>
+  <button mat-button [mat-dialog-close]="data" cdkFocusInitial color="primary">Create</button>
+  <button mat-button (click)="onNoClick()">Cancel</button>
+</div>

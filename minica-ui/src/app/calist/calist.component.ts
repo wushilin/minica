@@ -1,7 +1,7 @@
 import { Component, OnInit, Inject } from '@angular/core';
 import { ActivatedRoute } from '@angular/router';
 import { Location } from '@angular/common';
-import { CertificateAuthority, CAService, CreateCADialogData,withLoading,trap, reportError, reportSuccess } from '../minica.service';
+import { CertificateAuthority, CAService, ImportCADialogData, CreateCADialogData,withLoading,trap, reportError, reportSuccess } from '../minica.service';
 import { MatDialog, MatDialogRef, MAT_DIALOG_DATA} from '@angular/material/dialog';
 import { ConfirmDialogComponent } from '../confirmdialog/confirmdialog.component';
 import {MatSnackBar} from '@angular/material/snack-bar';
@@ -12,6 +12,10 @@ import {MatSnackBar} from '@angular/material/snack-bar';
   styleUrls: ['./calist.component.css']
 })
 export class CalistComponent implements OnInit {
+    importCAData: ImportCADialogData = {
+      cert: "",
+      key: "",
+    };
     createCAData: CreateCADialogData = {
       commonName: "",
       countryCode: "",
@@ -59,6 +63,30 @@ export class CalistComponent implements OnInit {
       }
     });
   }
+  openImportDialog(): void {
+    const dialogRef = this.dialog.open(ImportCADialog, {
+      width: '800px',
+      data: this.importCAData,
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+      if(result) {
+        console.log('The dialog was closed');
+        this.importCAData = result;
+        console.log(JSON.stringify(result));
+        withLoading(
+          ()=>this.caService.importCA(result),
+          (error)=>reportError(this._snackBar, "Failed to import CA", "Dismiss")
+          ).subscribe(what => {
+              if(what.id) {
+                reportSuccess(this._snackBar, "Successfully imported CA", "Dismiss");
+              }
+              this.getCAList();
+          });
+      }
+    });
+  }
+
   openCreateDialog(): void {
     const dialogRef = this.dialog.open(CreateCADialog, {
       width: '500px',
@@ -99,6 +127,22 @@ export class CreateCADialog {
   constructor(
     public dialogRef: MatDialogRef<CreateCADialog>,
     @Inject(MAT_DIALOG_DATA) public data: CreateCADialogData,
+  ) {}
+
+  onNoClick(): void {
+    this.dialogRef.close();
+  }
+}
+
+@Component({
+  selector: 'import-ca-dialog',
+  templateUrl: 'import-ca-dialog.html',
+  styleUrls: ['./calist.component.css']
+})
+export class ImportCADialog {
+  constructor(
+    public dialogRef: MatDialogRef<ImportCADialog>,
+    @Inject(MAT_DIALOG_DATA) public data: ImportCADialogData,
   ) {}
 
   onNoClick(): void {

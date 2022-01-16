@@ -41,7 +41,7 @@ class DebugService {
             ca->
             if(caSvc.listCert(ca).size < 5) {
                 val createResult = caSvc.createCert(
-                    ca, "common-$counter", "US", "a$counter@gmail.com", "Home$counter",
+                    ca, "common-$counter", "US", "Home$counter",
                     3650, "st$counter", "city$counter", "ou$counter", "sha512", 4096,
                     listOf(), listOf("127.0.0.1", "222.222.111.111")
                 )

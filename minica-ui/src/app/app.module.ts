@@ -2,8 +2,8 @@ import { NgModule } from '@angular/core';
 import { BrowserModule } from '@angular/platform-browser';
 import { AppRoutingModule } from './app-routing.module';
 import { AppComponent } from './app.component';
-import { CalistComponent, CreateCADialog } from './calist/calist.component';
-import { CadetailComponent,CreateCertDialog } from './cadetail/cadetail.component';
+import { CalistComponent, CreateCADialog, ImportCADialog} from './calist/calist.component';
+import { CadetailComponent,CreateCertDialog} from './cadetail/cadetail.component';
 import { CertComponent } from './cert/cert.component';
 import { CertDetailComponent } from './certdetail/certdetail.component';
 import { HttpClientModule } from '@angular/common/http';
@@ -29,7 +29,8 @@ import { ToasterComponent } from './toaster/toaster.component';
     ConfirmDialogComponent,
     CreateCertDialog,
     SpinnerComponent,
-    ToasterComponent
+    ToasterComponent,
+    ImportCADialog
   ],
   imports: [
     BrowserModule,

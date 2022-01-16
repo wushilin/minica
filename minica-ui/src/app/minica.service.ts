@@ -66,6 +66,10 @@ export interface CreateCADialogData {
   digestAlgorithm: string;
   keyLength: string;
 }
+export interface ImportCADialogData {
+  cert: string;
+  key: string;
+}
 
 export interface CreateCertDialogData {
   commonName: string;
@@ -77,7 +81,6 @@ export interface CreateCertDialogData {
   validDays: string;
   digestAlgorithm: string;
   keyLength: string;
-  email: string;
   dnsList: string[];
   ipList: string[];
 }
@@ -185,6 +188,12 @@ export class CAService {
     );
   }
 
+  importCA(data:ImportCADialogData):Observable<CertificateAuthority> {
+    return this.http.put<CertificateAuthority>(this.calistURL + "import", data)
+      .pipe(
+        tap(result => this.log(`import CA with ${JSON.stringify(data)} result ${JSON.stringify(result)}`)),
+      );
+  }
   createCA(data:CreateCADialogData):Observable<CertificateAuthority> {
     return this.http.put<CertificateAuthority>(this.calistURL + "new", data)
       .pipe(
