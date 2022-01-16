@@ -63,6 +63,9 @@ Authorization: xxx
   "digestAlgorithm":"SHA512",
   "keyLength": 4096 
 }
+
+---
+Requires admin role
 ```
 
 2. Listing all CAs:
@@ -86,7 +89,8 @@ Authorization: xxxxx
 
 Note that delete CA will also delete all certs in that CA. The issued certs can still be used. 
 
-Requires admin role.
+---
+Requires admin role
 ```
 
 5. List certs under CA
@@ -94,7 +98,8 @@ Requires admin role.
 GET /ca/<ca-id>/cert
 Authorization: xxx
 
---
+---
+Requires viwer role
 Note certs have unique identifier. A cert is uniquely identifiable via a pair of ca-id, which identifies which ca, and cert-id, which identifies the cert.
 ```
 
@@ -118,17 +123,26 @@ Authorization: xxx
   "ipList": ["192.168.44.1", "192.168.44.2"]
 }
 
+---
+Requires admin role
+
 ```
 
 7. Get a cert detail 
 ```
 GET /ca/<ca-id>/cert/<cert-id>
 Authorization: xxx
+
+---
+Requires viewer role
 ```
 8. Delete a cert from CA
 ```
 DELETE /ca/<ca-id>/cert/<cert-id>
 Authorization: xxx
+
+---
+Requires admin role
 ```
 
 9. Exporting
@@ -137,26 +151,46 @@ All following requests required Authorization, and at least viewer permission.
 Download CA Cert in PEM format
 ```
 GET /ca/download/<ca-id>/cert
+Authorization: xxx
+
+---
+Requires viewer role
 ```
 
 Download CA Key in PEM format, unencrypted
 ```
 GET /ca/download/<ca-id>/key
+Authorization: xxx
+
+---
+Requires viewer role
 ```
 
 Download CA Cert & Key pair in PKCS12, encrypted with the `password` below.
 ```
 GET /ca/download/<ca-id>/pkcs12
+Authorization: xxx
+
+---
+Requires viewer role
 ```
 
 Download the truststore in JKS format, encrypted with the `password` below.
 ```
 GET /ca/download/<ca-id>/truststore
+Authorization: xxx
+
+---
+Requires viewer role
 ```
 
 Download the keystore for pkcs12, keystore password, in text format
 ```
 GET /ca/download/<ca-id>/password
+Authorization: xxx
+
+---
+Requires viewer role
 ```
 
 Download everything about the cert in a zip file, include cert, csr, 
@@ -164,45 +198,80 @@ private key in PEM format, jks and pkcs12 keystore, jks truststore,
 ca cert in PEM, and all keystore passwords
 ```
 GET /ca/download/<ca-id>/cert/<cert-id>/bundle
-```
+Authorization: xxx
+
+---
+Requires viewer role
 ```
 
 Download the cert which is signed by the CA
 ```
 GET /ca/download/<ca-id>/cert/<cert-id>/cert
+Authorization: xxx
+
+---
+Requires viewer role
 ```
 
 Download the CSR
 ```
 GET /ca/download/<ca-id>/cert/<cert-id>/csr
+Authorization: xxx
+
+---
+Requires viewer role
 ```
 
 Download the key
 ```
 GET /ca/download/<ca-id>/cert/<cert-id>/key
+Authorization: xxx
+
+---
+Requires viewer role
 ```
 
 Download the keystore in JKS, encrypted with the `password` below
 ```
 GET /ca/download/<ca-id>/cert/<cert-id>/jks
+Authorization: xxx
+
+---
+Requires viewer role
 ```
 
 Download the keystore in PKCS12, encrypted with the `password` below
 ```
 GET /ca/download/<ca-id>/cert/<cert-id>/pkcs12
+Authorization: xxx
+
+---
+Requires viewer role
 ```
 
 Download the keystore password
 ```
 GET /ca/download/<ca-id>/cert/<cert-id>/password
+Authorization: xxx
+
+---
+Requires viewer role
 ```
 
 Download the truststore in jks. The truststore is from the CA
 ```
 GET /ca/download/<ca-id>/cert/<cert-id>/truststore
+Authorization: xxx
+
+---
+Requires viewer role
 ```
 
 Download the trust store password. Trust store is from the CA, thus using a different password
 ```
 GET /ca/download/<ca-id>/cert/<cert-id>/truststorePassword
+Authorization: xxx
+
+---
+Requires viewer role
 ```
