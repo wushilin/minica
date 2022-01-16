@@ -43,11 +43,32 @@ $ java -jar build/libs/minica-0.0.1-SNAPSHOT.jar --spring.config.location=./appl
 ```
 
 Test the service:
+```sh
 $ curl -u "admin:adminpass" -vvvv -H "Content-Type: application/json"  -X PUT --data '{"commonName": "ABC CORP CA", "validDays": 7300, "countryCode":"SG", "organization":"ABC Corp CA", "state":"Singapore", "city":"Singapore", "organizationUnit":"Home Office", "digestAlgorithm":"SHA512", "keyLength": 4096 }' http://localhost:9988/ca/new
+```
 
 If you see something like this, that means your RESTful service is up.
 ```json
-{"base":"/opt/minica/CAs/d60f9bed-05e2-4fe3-b326-7ba6db0c94e0","key":"-----BEGIN RSA PRIVATE KEY-----\n....\n-----END RSA PRIVATE KEY-----\n","id":"d60f9bed-05e2-4fe3-b326-7ba6db0c94e0","state":"Singapore","cert":"-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n","city":"Singapore","keyFile":"/opt/minica/CAs/d60f9bed-05e2-4fe3-b326-7ba6db0c94e0/ca-key.pem","subject":"/C=SG/ST=Singapore/L=Singapore/O=ABC Corp CA/OU=Home Office/CN=ABC CORP CA","certFile":"/opt/minica/CAs/d60f9bed-05e2-4fe3-b326-7ba6db0c94e0/ca-cert.pem","commonName":"ABC CORP CA","countryCode":"SG","organization":"ABC Corp CA","validDays":7300,"organizationUnit":"Home Office","digestAlgorithm":"SHA512","keyLength":4096,"issueTime":1642263016206,"certCount":0}
+{
+	"base":"/opt/minica/CAs/d60f9bed-05e2-4fe3-b326-7ba6db0c94e0",
+	"key":"-----BEGIN RSA PRIVATE KEY-----\n....\n-----END RSA PRIVATE KEY-----\n",
+	"id":"d60f9bed-05e2-4fe3-b326-7ba6db0c94e0",
+	"state":"Singapore",
+	"cert":"-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n",
+	"city":"Singapore",
+	"keyFile":"/opt/minica/CAs/d60f9bed-05e2-4fe3-b326-7ba6db0c94e0/ca-key.pem",
+	"subject":"/C=SG/ST=Singapore/L=Singapore/O=ABC Corp CA/OU=Home Office/CN=ABC CORP CA",
+	"certFile":"/opt/minica/CAs/d60f9bed-05e2-4fe3-b326-7ba6db0c94e0/ca-cert.pem",
+	"commonName":"ABC CORP CA",
+	"countryCode":"SG",
+	"organization":"ABC Corp CA",
+	"validDays":7300,
+	"organizationUnit":"Home Office",
+	"digestAlgorithm":"SHA512",
+	"keyLength":4096,
+	"issueTime":1642263016206,
+	"certCount":0
+}
 ```
 
 You may refer to the following URLs for interacting with the restful:
