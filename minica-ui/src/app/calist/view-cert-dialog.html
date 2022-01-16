@@ -1,0 +1,18 @@
+<h1 mat-dialog-title>View Cert Info</h1>
+<div mat-dialog-content>
+  <mat-form-field appearance="fill" style="width: 100%">
+    <mat-label>Certificate</mat-label>
+    <textarea matInput cols="200" rows="30" style="font-family:Courier;" [(ngModel)]="data.cert"></textarea>
+  </mat-form-field>
+  <div *ngIf="data.info.size > 0">Certificate Information</div>
+  <div *ngFor="let attribute of data.info | keyvalue: asIsOrder" style="padding:5px">
+    <mat-card>
+      <mat-card-title style="font-size: 12px">{{attribute.key}}</mat-card-title>
+      <mat-card-subtitle><label style="color:green">{{attribute.value}}</label></mat-card-subtitle>
+    </mat-card>
+  </div>
+</div>
+<div mat-dialog-actions>
+  <button mat-button cdkFocusInitial color="primary" (click)="decodeCert()">Decode</button>
+  <button mat-button (click)="onNoClick()">Cancel</button>
+</div>

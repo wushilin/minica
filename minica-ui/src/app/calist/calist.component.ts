@@ -1,7 +1,7 @@
 import { Component, OnInit, Inject } from '@angular/core';
 import { ActivatedRoute } from '@angular/router';
 import { Location } from '@angular/common';
-import { CertificateAuthority, CAService, ImportCADialogData, CreateCADialogData,withLoading,trap, reportError, reportSuccess } from '../minica.service';
+import { CertificateAuthority, CAService, ImportCADialogData, ViewCertDialogData, CreateCADialogData,withLoading,trap, reportError, reportSuccess } from '../minica.service';
 import { MatDialog, MatDialogRef, MAT_DIALOG_DATA} from '@angular/material/dialog';
 import { ConfirmDialogComponent } from '../confirmdialog/confirmdialog.component';
 import {MatSnackBar} from '@angular/material/snack-bar';
@@ -16,6 +16,12 @@ export class CalistComponent implements OnInit {
       cert: "",
       key: "",
     };
+
+    viewCertData: ViewCertDialogData = {
+      cert: "",
+      info: new Map<string, string>()
+    };
+
     createCAData: CreateCADialogData = {
       commonName: "",
       countryCode: "",
@@ -63,6 +69,13 @@ export class CalistComponent implements OnInit {
       }
     });
   }
+  openViewCertDialog(): void {
+    const dialogRef = this.dialog.open(ViewCertDialog, {
+      width: '80%',
+      data: this.viewCertData,
+    });
+  }
+
   openImportDialog(): void {
     const dialogRef = this.dialog.open(ImportCADialog, {
       width: '800px',
@@ -147,5 +160,42 @@ export class ImportCADialog {
 
   onNoClick(): void {
     this.dialogRef.close();
+  }
+}
+@Component({
+  selector: 'view-cert-dialog',
+  templateUrl: 'view-cert-dialog.html',
+  styleUrls: ['./calist.component.css']
+})
+export class ViewCertDialog {
+  constructor(
+    public dialogRef: MatDialogRef<ViewCertDialog>,
+    @Inject(MAT_DIALOG_DATA) public data: ViewCertDialogData,
+    public caService: CAService,
+    private _snackBar: MatSnackBar,
+
+  ) {}
+
+  onNoClick(): void {
+    this.data.cert = "";
+    this.data.info = new Map<string, string>();
+    this.dialogRef.close();
+  }
+  asIsOrder<T>(a:T, b:T) {
+    return 1;
+  }
+
+  decodeCert():void {
+    console.log(this.data.cert)
+    withLoading(
+      ()=>this.caService.inspectCert(this.data),
+      (error)=>reportError(this._snackBar, "Failed to inspect cert", "Dismiss")
+      ).subscribe(result => {
+      if(result.info) {
+         reportSuccess(this._snackBar, "Successfully inspected cert", "Dismiss");
+         console.log(JSON.stringify(result));
+         this.data.info = result.info;
+      }
+    });
   }
 }

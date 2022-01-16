@@ -71,6 +71,11 @@ export interface ImportCADialogData {
   key: string;
 }
 
+export interface ViewCertDialogData {
+  cert: string;
+  info: Map<string, string>;
+}
+
 export interface CreateCertDialogData {
   commonName: string;
   countryCode: string;
@@ -208,6 +213,12 @@ export class CAService {
       );
   }
 
+  inspectCert(data:ViewCertDialogData):Observable<ViewCertDialogData> {
+    return this.http.put<ViewCertDialogData>(this.calistURL + "cert/inspect", data)
+      .pipe(
+        tap(result => this.log(`Inspect Cert ${JSON.stringify(data)} result ${JSON.stringify(result)}`)),
+      );
+  }
 
   getCertByCAAndCertId(caid:string, certid:string):Observable<Certificate> {
     return this.http.get<Certificate>(this.calistURL + caid + "/cert/" + certid)

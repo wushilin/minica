@@ -10,6 +10,7 @@ import org.springframework.web.bind.annotation.*
 import org.springframework.web.server.ResponseStatusException
 import javax.servlet.http.HttpServletResponse
 import java.io.File
+import java.util.*
 import javax.servlet.http.HttpServletRequest
 
 @RestController
@@ -57,6 +58,30 @@ class CARestService {
         }
     }
 
+    @PutMapping("/ca/cert/inspect")
+    fun inspectCA(@RequestBody req:InspectRequest):InspectRequest {
+        val parsed = CertParser.parseCert(req.cert)
+        log.info("Parsed: $parsed")
+        val issuedBy:String = "/C=${parsed["caCountryCode"]!!}/ST=${parsed["caState"]}/L=${parsed["caCity"]}/${parsed["caOrganization"]}/OU=${parsed["caOrganizationUnit"]}/CN=${parsed["caCommonName"]}"
+        val subject = "/C=${parsed["certCountryCode"]!!}/ST=${parsed["certState"]}/L=${parsed["certCity"]}/${parsed["certOrganization"]}/OU=${parsed["certOrganizationUnit"]}/CN=${parsed["certCommonName"]}"
+        req.info = mapOf(
+            "Subject" to subject,
+            "Issuer" to issuedBy,
+            "Validity" to "From ${Date(parsed["validityStart"]!!.toLong())} to ${Date(parsed["validityEnd"]!!.toLong())}",
+            "Valid DNS Names" to parsed["dnsList"]!!,
+            "Valid IP Addreses" to parsed["ipList"]!!,
+            "Public Key Algorithm" to parsed["pkiAlgorithm"]!!,
+            "Signature Algorithm" to parsed["signatureAlgorithm"]!!,
+            "Key Usage" to parsed["keyUsage"]!!,
+            "Extended Key Usage" to parsed["extendedKeyUsage"]!!,
+            "Serial" to parsed["serial"]!!,
+            "Version" to parsed["version"]!!,
+            )
+        //2022-01-17 01:07:16.786  INFO 1946 --- [nio-8080-exec-2] net.wushilin.minica.rest.CARestService   : Parsed: {version=3, serial=178, isCA=false,
+        // pkiAlgorithm=4096-bit RSA key, signatureAlgorithm=SHA512withRSA, keyUsage=DigitalSignature,Non_repudiation,Key_Encipherment,
+        // extendedKeyUsage=clientAuth,emailProtection,serverAuth, dnsList=ipad, ipList=, validityStart=1641708304000, validityEnd=2272428304000, certCountryCode=SG, certCommonName=ipad, certOrganization=Confluent Singapore Pte. Ltd, certOrganizationUnit=, certCity=Singapore, certState=Singapore, caCountryCode=SG, caCommonName=Wu Shilin Certificate Authority, caOrganization=Confluent Singapore Pte. Ltd., caOrganizationUnit=Professional Services, caCity=Singapore, caState=Singapore}
+        return req
+    }
     @PutMapping("/ca/new")
     fun createCA(@RequestBody req: CARequest): CA {
         return caSvc.createCA(req)
