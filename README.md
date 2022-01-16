@@ -330,6 +330,8 @@ Requires viewer role
 2. Install angular js cli
 ```
 $ npm install -g @angular/cli
+$ npm install
+
 ```
 
 3. Edit the proxy configuration `vim proxy.conf.js`
