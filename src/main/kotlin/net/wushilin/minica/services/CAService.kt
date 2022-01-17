@@ -37,30 +37,6 @@ class CAService {
         return ca.removeCertById(certid)
     }
 
-    @PostConstruct
-    fun scan() {
-        log.info("Scanning invalid CAs...")
-        val base = File(config.minicaRoot, "CAs")
-        val files = base.listFiles()
-        if (files != null) {
-            val directories = files.filter {
-                it.isDirectory && !it.name.startsWith(".")
-            }
-
-            directories.forEach {
-                try {
-                    val ca = readCA(it)
-                    log.info("Found valid CA: $ca")
-                    log.info("Scanning certs in $CA")
-                    ca.scan()
-                } catch (ex: Exception) {
-                    val deleteResult = it.deleteRecursively()
-                    log.info("Found invalid CA: $it, delete result: $deleteResult")
-                }
-            }
-        }
-    }
-
     private fun caBaseDir(): File {
         return File(config.minicaRoot, "CAs").absoluteFile
     }

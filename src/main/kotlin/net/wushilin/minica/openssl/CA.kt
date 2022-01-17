@@ -134,20 +134,4 @@ class CA(var base: File) {
     fun getCertById(id:String):Cert {
         return Cert(File(base, id))
     }
-
-    fun scan() {
-        val childrenFiles = base.listFiles()
-        childrenFiles?.filter {
-            it.isDirectory
-        }?.filter {
-            !it.name.startsWith(".")
-        }?.filter {
-            !it.name.equals("certs")
-        }?.forEach {
-            if (!File(it, "CERT.complete").exists()) {
-                val deleteResult = it.deleteRecursively()
-                log.info("Found invalid cert $it, deleted => $deleteResult")
-            }
-        }
-    }
 }
