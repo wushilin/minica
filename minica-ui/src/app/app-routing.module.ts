@@ -2,7 +2,6 @@ import { NgModule } from '@angular/core';
 import { RouterModule, Routes, UrlSegment} from '@angular/router';
 import { CalistComponent } from './calist/calist.component';
 import { CadetailComponent } from './cadetail/cadetail.component';
-import { CertComponent } from './cert/cert.component';
 import { CertDetailComponent } from './certdetail/certdetail.component';
 
 const routes: Routes = [
@@ -41,7 +40,6 @@ const routes: Routes = [
               return null;
   }, component: CertDetailComponent},
   { path: 'calist', component: CalistComponent },
-  { path: 'cert', component: CertComponent },
 ];
 
 @NgModule({

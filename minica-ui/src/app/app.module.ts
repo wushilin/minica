@@ -4,7 +4,6 @@ import { AppRoutingModule } from './app-routing.module';
 import { AppComponent } from './app.component';
 import { CalistComponent, CreateCADialog, ImportCADialog, ViewCertDialog} from './calist/calist.component';
 import { CadetailComponent,CreateCertDialog} from './cadetail/cadetail.component';
-import { CertComponent } from './cert/cert.component';
 import { CertDetailComponent } from './certdetail/certdetail.component';
 import { HttpClientModule } from '@angular/common/http';
 import { BrowserAnimationsModule } from '@angular/platform-browser/animations';
@@ -23,7 +22,6 @@ import { ToasterComponent } from './toaster/toaster.component';
     AppComponent,
     CalistComponent,
     CadetailComponent,
-    CertComponent,
     CertDetailComponent,
     CreateCADialog,
     ConfirmDialogComponent,
