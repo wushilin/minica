@@ -42,6 +42,7 @@ class CertParser {
                 out["caState"] = caDetail["state"]!!
             } else {
                 println("Impossible ${result}")
+                throw IllegalArgumentException("Can't parse cert, Probably wrong cert???")
             }
 
             return out
