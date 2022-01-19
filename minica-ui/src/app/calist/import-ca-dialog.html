@@ -1,5 +1,9 @@
 <h1 mat-dialog-title>Import Existing CA</h1>
 <div mat-dialog-content>
+  <mat-form-field appearance="fill">
+    <mat-label>Keystore Password()</mat-label>
+    <input matInput [(ngModel)]="data.password">
+  </mat-form-field>
   <mat-form-field appearance="fill" style="width: 100%">
     <mat-label>Certificate</mat-label>
     <textarea matInput cols="200" rows="30" style="font-family:Courier;" [(ngModel)]="data.cert"></textarea>

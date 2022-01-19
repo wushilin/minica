@@ -150,7 +150,10 @@ class CAService {
         val state = parseResult["certState"]!!
         val city = parseResult["certCity"]!!
         val organizationUnit = parseResult["certOrganizationUnit"]!!
-        val random = IO.randomPassword(8)
+        var random = importRequest.password
+        if(random == "") {
+            random = IO.randomPassword(8)
+        }
         val issueTime = parseResult["validityStart"]!!.toLong()
         val validDays = ((parseResult["validityEnd"]!!.toLong() - issueTime + 1000) / 3600000 / 24).toInt();
         val subject = createSubject(commonName, countryCode, organization, state, city, organizationUnit)
@@ -187,7 +190,8 @@ class CAService {
             caRequest.city,
             caRequest.organizationUnit,
             caRequest.digestAlgorithm,
-            caRequest.keyLength
+            caRequest.keyLength,
+            caRequest.password
         )
     }
 
@@ -263,7 +267,7 @@ class CAService {
     fun createCA(
         commonName: String, countryCode: String, organization: String, validDays: Int = 365,
         state: String = "", city: String = "", organizationUnit: String = "",
-        digestAlgorithm: String = "sha256", keyLength: Int = 4096
+        digestAlgorithm: String = "sha256", keyLength: Int = 4096, password:String = ""
     ): CA {
         // check CA dir is there
         val cadir = caBaseDir()
@@ -300,7 +304,10 @@ class CAService {
         }
 
         log.info("Successfully self signed the CA: $processResult1")
-        val random = IO.randomPassword(8)
+        var random = IO.randomPassword(8)
+        if(password != "") {
+            random = password
+        }
         setupCAWithRandom(
             base,
             random,
@@ -349,7 +356,8 @@ class CAService {
             certRequest.digestAlgorithm,
             certRequest.keyLength,
             certRequest.dnsList,
-            certRequest.ipList
+            certRequest.ipList,
+            certRequest.password
         )
     }
 
@@ -365,7 +373,8 @@ class CAService {
         digestAlgorithm: String = "sha512",
         keyLength: Int = 4096,
         altDNSNames1: List<String> = listOf(),
-        altIPs: List<String> = listOf()
+        altIPs: List<String> = listOf(),
+        password:String = ""
     ): Cert {
         val uuid = UUID.randomUUID()
         val certBase = File(ca.base, "$uuid")
@@ -427,7 +436,10 @@ class CAService {
             throw IllegalArgumentException("Failed to sign CSR : ${processResult2.error()}")
 
         }
-        val random = IO.randomPassword(8)
+        var random = IO.randomPassword(8)
+        if(password != "") {
+            random = password
+        }
         // openssl pkcs12 -export -out Cert.p12 -in cert.pem -inkey key.pem -passin pass:root -passout pass:root
         val processResult3 = Run.ExecWait(
             caBase, 60000, null, listOf(

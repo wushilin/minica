@@ -15,6 +15,7 @@ export class CalistComponent implements OnInit {
     importCAData: ImportCADialogData = {
       cert: "",
       key: "",
+      password: "changeit"
     };
 
     viewCertData: ViewCertDialogData = {
@@ -32,6 +33,7 @@ export class CalistComponent implements OnInit {
       validDays: "365",
       digestAlgorithm: "sha512",
       keyLength: "4096",
+      password: "changeit",
     };
     calist: CertificateAuthority[] = []
 

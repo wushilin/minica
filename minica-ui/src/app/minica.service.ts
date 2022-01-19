@@ -65,10 +65,12 @@ export interface CreateCADialogData {
   validDays: string;
   digestAlgorithm: string;
   keyLength: string;
+  password: string;
 }
 export interface ImportCADialogData {
   cert: string;
   key: string;
+  password: string;
 }
 
 export interface ViewCertDialogData {
@@ -86,6 +88,7 @@ export interface CreateCertDialogData {
   validDays: string;
   digestAlgorithm: string;
   keyLength: string;
+  password: string;
   dnsList: string[];
   ipList: string[];
 }

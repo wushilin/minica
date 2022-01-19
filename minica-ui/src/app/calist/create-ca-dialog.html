@@ -29,6 +29,10 @@
     <input matInput [(ngModel)]="data.validDays" required>
   </mat-form-field>
   <mat-form-field appearance="fill">
+    <mat-label>Keystore Password(optional)</mat-label>
+    <input matInput [(ngModel)]="data.password">
+  </mat-form-field>
+  <mat-form-field appearance="fill">
     <mat-label>Key Length</mat-label>
     <mat-select [(value)]="data.keyLength" required>
       <mat-option value="2048">

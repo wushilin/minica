@@ -54,6 +54,10 @@
     </mat-select>
   </mat-form-field>
   <mat-form-field appearance="fill">
+    <mat-label>Keystore Password(optional)</mat-label>
+    <input matInput [(ngModel)]="data.password">
+  </mat-form-field>
+  <mat-form-field appearance="fill">
     <mat-label>DNS Names</mat-label>
     <mat-chip-list #dnsList aria-label="DNS Name selection">
       <mat-chip *ngFor="let dns of data.dnsList" (removed)="removeDNS(dns)">
