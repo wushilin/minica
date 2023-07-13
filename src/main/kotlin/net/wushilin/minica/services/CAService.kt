@@ -13,8 +13,6 @@ import java.io.FileOutputStream
 import java.util.*
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
-import javax.annotation.PostConstruct
-
 
 @Service
 class CAService {
@@ -38,7 +36,11 @@ class CAService {
     }
 
     private fun caBaseDir(): File {
-        return File(config.minicaRoot, "CAs").absoluteFile
+        val target = File(config.minicaRoot, "CAs").absoluteFile
+        if(!target.exists()) {
+            target.mkdirs()
+        }
+        return target
     }
 
     fun safeCheck(dir: File) {

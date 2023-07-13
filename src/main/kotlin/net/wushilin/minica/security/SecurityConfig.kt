@@ -4,42 +4,48 @@ import net.wushilin.minica.config.Config
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
-import org.springframework.http.HttpMethod
-import org.springframework.security.config.annotation.authentication.builders.AuthenticationManagerBuilder
 import org.springframework.security.config.annotation.web.builders.HttpSecurity
-import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity
-import org.springframework.security.config.annotation.web.configuration.WebSecurityConfigurerAdapter
-import org.springframework.security.core.userdetails.User
-import org.springframework.security.core.userdetails.UserDetails
 import org.springframework.security.core.userdetails.UserDetailsService
 import org.springframework.security.provisioning.InMemoryUserDetailsManager
+import org.springframework.security.web.SecurityFilterChain
+import org.springframework.security.web.csrf.CookieCsrfTokenRepository
+import org.springframework.security.web.csrf.CsrfTokenRequestAttributeHandler
+import org.springframework.security.web.csrf.HttpSessionCsrfTokenRepository
+import org.springframework.security.web.util.matcher.AntPathRequestMatcher
 
 
 @Configuration
-@EnableWebSecurity
-class CustomWebSecurityConfigurerAdapter : WebSecurityConfigurerAdapter() {
+class CustomWebSecurityConfigurerAdapter  {
     @Autowired
     private lateinit var config:Config
 
+    private val enableCSRF = false
+    @Bean
     @Throws(Exception::class)
-    override fun configure(http: HttpSecurity) {
-        http.csrf().disable()
-            .authorizeRequests()
-            .antMatchers("/public/**").permitAll()
-            .antMatchers(HttpMethod.GET,"/**").hasAnyRole("viewer", "admin")
-            .antMatchers(HttpMethod.POST, "/**").hasAnyRole("admin")
-            .antMatchers(HttpMethod.PUT, "/**").hasAnyRole("admin")
-            .antMatchers(HttpMethod.DELETE).hasAnyRole("admin")
-            .antMatchers(HttpMethod.PATCH).denyAll()
-            .antMatchers(HttpMethod.OPTIONS).denyAll()
-            .antMatchers(HttpMethod.TRACE).denyAll()
-            .antMatchers(HttpMethod.HEAD).denyAll()
-            .and()
-            .httpBasic()
+    fun filterChain(http: HttpSecurity): SecurityFilterChain? {
+        val requestHandler = CsrfTokenRequestAttributeHandler()
+        requestHandler.setCsrfRequestAttributeName(null);
+
+        http.csrf { obj ->
+                obj.disable()
+        }.authorizeHttpRequests {
+            authz ->
+            authz.requestMatchers(AntPathRequestMatcher("/**", "GET")).hasAnyRole("viewer", "admin")
+                 .requestMatchers(AntPathRequestMatcher("/**", "POST")).hasAnyRole("admin")
+                 .requestMatchers(AntPathRequestMatcher("/**", "PUT")).hasAnyRole("admin")
+                 .requestMatchers(AntPathRequestMatcher("/**", "DELETE")).hasAnyRole("admin")
+                 .requestMatchers(AntPathRequestMatcher("/**", "PATCH")).denyAll()
+                 .requestMatchers(AntPathRequestMatcher("/**", "OPTIONS")).denyAll()
+                 .requestMatchers(AntPathRequestMatcher("/**", "TRACE")).denyAll()
+                 .requestMatchers(AntPathRequestMatcher("/**", "HEAD")).denyAll()
+        }.httpBasic {
+        }
+        return http.build()
     }
 
+
     @Bean
-    override fun userDetailsService(): UserDetailsService {
+    fun userDetailsService(): UserDetailsService {
         return InMemoryUserDetailsManager(config.getAllUsers())
     }
 }

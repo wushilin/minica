@@ -1,10 +1,12 @@
 package net.wushilin.minica.config
 
+import net.wushilin.minica.security.DumbPasswordEncoder
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.context.annotation.Bean
 import org.springframework.security.core.userdetails.User
 import org.springframework.security.core.userdetails.UserDetails
+import org.springframework.security.crypto.password.PasswordEncoder
 import org.springframework.stereotype.Component
 import java.util.*
 import java.util.regex.Pattern
@@ -40,16 +42,19 @@ class Config {
         val split1 = userConfigString.split(";")
         val result = mutableListOf<UserDetails>()
         val pattern = Pattern.compile("^([^@]+)@(.+):(admin|viewer)$")
-        split1.map{ it.trim() }.filter{it.length > 0}.forEach {
+        split1.map{ it.trim() }.filter{ it.isNotEmpty() }.forEach {
             val matcher = pattern.matcher(it)
             if(!matcher.matches()) {
-                log.info("${it} is not a valid user definition.")
+                log.info("$it is not a valid user definition.")
             } else {
                 val username = matcher.group(1)
                 val password = matcher.group(2)
                 val role = matcher.group(3)
                 log.info("Adding user $username, password=[reducted(${password.length})], role $role ")
-                val user: UserDetails = User.withDefaultPasswordEncoder()
+
+                log.warn("Password for $username is $password")
+                
+                val user: UserDetails = User.builder()
                     .username(username)
                     .password(password)
                     .roles(role)
@@ -59,5 +64,10 @@ class Config {
             }
         }
         return result
+    }
+
+    @Bean
+    fun getPasswordEncoder():PasswordEncoder {
+        return DumbPasswordEncoder()
     }
 }

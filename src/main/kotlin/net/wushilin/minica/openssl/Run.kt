@@ -9,7 +9,7 @@ import kotlin.concurrent.thread
 
 public class Run {
     companion object {
-        val log = LoggerFactory.getLogger(Run.javaClass)
+        val log = LoggerFactory.getLogger(Run::class.java)
         fun ExecWait(workingDirectory: File, timeoutMs:Long, stdin: InputStream?=null, args: List<String>): ProcessResult {
             val pb = ProcessBuilder(args)
             pb.directory(workingDirectory)

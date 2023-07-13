@@ -1,17 +1,19 @@
 package net.wushilin.minica.rest
 
+import jakarta.servlet.http.HttpServletRequest
+import jakarta.servlet.http.HttpServletResponse
 import net.wushilin.minica.openssl.*
 import net.wushilin.minica.services.CAService
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.http.HttpStatus
 import org.springframework.http.MediaType
+import org.springframework.security.web.csrf.CsrfToken
 import org.springframework.web.bind.annotation.*
 import org.springframework.web.server.ResponseStatusException
-import javax.servlet.http.HttpServletResponse
 import java.io.File
 import java.util.*
-import javax.servlet.http.HttpServletRequest
+
 
 @RestController
 class CARestService {
@@ -20,7 +22,13 @@ class CARestService {
     @Autowired
     private lateinit var caSvc: CAService
 
-    @GetMapping("/ca", produces = arrayOf(MediaType.APPLICATION_JSON_VALUE))
+    @GetMapping("/ca/csrf")
+    fun getCsrfToken(request: HttpServletRequest):String {
+        // https://github.com/spring-projects/spring-security/issues/12094#issuecomment-1294150717
+        val csrfToken: CsrfToken = request.getAttribute(CsrfToken::class.java.getName()) as CsrfToken
+        return csrfToken.getToken()
+    }
+    @GetMapping("/ca/", produces = arrayOf(MediaType.APPLICATION_JSON_VALUE))
     fun getCAList(): List<CA> {
         return caSvc.listCA()
     }
@@ -60,6 +68,9 @@ class CARestService {
 
     @PutMapping("/ca/cert/inspect")
     fun inspectCA(@RequestBody req:InspectRequest):InspectRequest {
+        if(req.cert.isEmpty()) {
+            throw IllegalArgumentException("Invalid cert")
+        }
         val parsed = CertParser.parseCert(req.cert)
         log.info("Parsed: $parsed")
         val issuedBy:String = "/C=${parsed["caCountryCode"]!!}/ST=${parsed["caState"]}/L=${parsed["caCity"]}/${parsed["caOrganization"]}/OU=${parsed["caOrganizationUnit"]}/CN=${parsed["caCommonName"]}"

@@ -166,8 +166,8 @@ class CertParser {
             }
             return result
         }
-        fun match(input:String, regex:String, group:Int):String {
-            val regex = Pattern.compile(regex)
+        fun match(input:String, regexStr:String, group:Int):String {
+            val regex = Pattern.compile(regexStr)
             val matcher = regex.matcher(input)
             return if(matcher.find()) {
                 matcher.group(group)
