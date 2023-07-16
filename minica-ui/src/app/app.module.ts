@@ -1,4 +1,3 @@
-import { HashLocationStrategy, LocationStrategy } from '@angular/common';
 import { NgModule } from '@angular/core';
 import { BrowserModule } from '@angular/platform-browser';
 import { AppRoutingModule } from './app-routing.module';
@@ -46,7 +45,7 @@ import { ToasterComponent } from './toaster/toaster.component';
     MatSelectModule,
     MaterialModule,
   ],
-  providers: [{provide: LocationStrategy, useClass: HashLocationStrategy}],
+  providers: [],
   bootstrap: [AppComponent]
 })
 export class AppModule { }
