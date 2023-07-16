@@ -30,7 +30,7 @@
         <p></p>
       </mat-card-content>
       <mat-card-actions align="end">
-        <a mat-raised-button color="primary" href="cadetail/{{ca.id}}">Open</a>
+        <a mat-raised-button color="primary" routerLink="cadetail/{{ca.id}}">Open</a>
         <button mat-raised-button color="warn" (click)="deleteCA(ca.id, ca.subject)">Delete</button>
       </mat-card-actions>
     </mat-card>
