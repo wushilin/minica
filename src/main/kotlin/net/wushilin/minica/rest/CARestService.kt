@@ -28,7 +28,7 @@ class CARestService {
         val csrfToken: CsrfToken = request.getAttribute(CsrfToken::class.java.getName()) as CsrfToken
         return csrfToken.getToken()
     }
-    @GetMapping("/ca/", produces = arrayOf(MediaType.APPLICATION_JSON_VALUE))
+    @GetMapping("/ca/getAll", produces = arrayOf(MediaType.APPLICATION_JSON_VALUE))
     fun getCAList(): List<CA> {
         return caSvc.listCA()
     }
@@ -55,7 +55,7 @@ class CARestService {
         }
     }
 
-    @GetMapping("/ca/{id}")
+    @GetMapping("/ca/get/{id}")
     fun getCA(@PathVariable("id") id: String): CA {
         try {
             return caSvc.getCAById(id)
