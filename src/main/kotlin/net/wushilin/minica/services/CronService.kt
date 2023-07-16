@@ -17,6 +17,15 @@ class CronService {
 
     private val log = LoggerFactory.getLogger(CronService::class.java)
 
+    @Scheduled(fixedDelay=10000)
+    fun gc() {
+        val start = System.currentTimeMillis()
+        val freeBefore = Runtime.getRuntime().freeMemory()
+        System.gc()
+        val freeAfter = Runtime.getRuntime().freeMemory()
+        val end = System.currentTimeMillis()
+        log.info("GC in done ${end-start}ms, ${freeAfter-freeBefore} bytes freed")
+    }
     @Scheduled(fixedDelay = 300000)
     fun reaper() {
         var countCA = 0L
