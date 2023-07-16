@@ -24,7 +24,7 @@ class CronService {
         System.gc()
         val freeAfter = Runtime.getRuntime().freeMemory()
         val end = System.currentTimeMillis()
-        log.info("GC in done ${end-start}ms, ${freeAfter-freeBefore} bytes freed")
+        log.info("GC in done ${end-start}ms, ${freeAfter-freeBefore} bytes freed (FREE: $freeBefore -> $freeAfter)")
     }
     @Scheduled(fixedDelay = 300000)
     fun reaper() {
