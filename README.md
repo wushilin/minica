@@ -364,7 +364,7 @@ Open your browser and access http://<host>:4200. You will be prompted to login, 
 For the admin users, you can do everything. For viewer users, the modifications are prohibited.
 
 
-6. Live demo
+# Live demo
 You can see a live demo at http://ca.wushilin.net:40000/
 
 The login user (in username///password format):
