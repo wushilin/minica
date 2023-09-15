@@ -10,33 +10,44 @@ import org.springframework.security.config.annotation.web.builders.HttpSecurity
 import org.springframework.security.core.userdetails.UserDetailsService
 import org.springframework.security.provisioning.InMemoryUserDetailsManager
 import org.springframework.security.web.SecurityFilterChain
+import org.springframework.security.web.csrf.CookieCsrfTokenRepository
+import org.springframework.security.web.csrf.CsrfTokenRequestAttributeHandler
+import org.springframework.security.web.csrf.HttpSessionCsrfTokenRepository
 import org.springframework.security.web.util.matcher.AntPathRequestMatcher
 
 
 @Configuration
+
 class CustomWebSecurityConfigurerAdapter {
     companion object {
-        val log = LoggerFactory.getLogger(CustomWebSecurityConfigurerAdapter::class.java)
+        @Suppress("JAVA_CLASS_ON_COMPANION")
+        @JvmStatic
+        private val log = LoggerFactory.getLogger(javaClass.enclosingClass)
     }
+
     @Autowired
-    private lateinit var config:Config
+    private lateinit var config: Config
 
     @Bean
-    fun filterChain(http:HttpSecurity):SecurityFilterChain {
-        http.authorizeHttpRequests { authz ->
-                authz.requestMatchers(AntPathRequestMatcher("/**", "GET")).hasAnyRole("viewer", "admin")
-                .requestMatchers(AntPathRequestMatcher("/**", "POST")).hasAnyRole("viewer", "admin")
-                .requestMatchers(AntPathRequestMatcher("/**", "PUT")).hasAnyRole("viewer", "admin")
-                .requestMatchers(AntPathRequestMatcher("/**", "DELETE")).hasAnyRole("viewer", "admin")
-                .requestMatchers(AntPathRequestMatcher("/**", "PATCH")).denyAll()
-                .requestMatchers(AntPathRequestMatcher("/**", "OPTIONS")).denyAll()
-                .requestMatchers(AntPathRequestMatcher("/**", "TRACE")).denyAll()
-                .requestMatchers(AntPathRequestMatcher("/**", "HEAD")).denyAll()
-                .anyRequest().authenticated()
-        }.httpBasic(Customizer.withDefaults())
-        log.info("Security is configured")
-        val result = http.build()
-        return result
+    @Throws(Exception::class)
+    fun filterChain(http: HttpSecurity): SecurityFilterChain? {
+        val requestHandler = CsrfTokenRequestAttributeHandler()
+        requestHandler.setCsrfRequestAttributeName(null);
+
+        http.csrf { csrf ->
+            csrf.disable()
+        }.authorizeHttpRequests { authz ->
+            authz.requestMatchers(AntPathRequestMatcher("/**", "GET")).hasAnyRole("viewer", "admin")
+                    .requestMatchers(AntPathRequestMatcher("/**", "POST")).hasAnyRole("admin")
+                    .requestMatchers(AntPathRequestMatcher("/**", "PUT")).hasAnyRole("admin")
+                    .requestMatchers(AntPathRequestMatcher("/**", "DELETE")).hasAnyRole("admin")
+                    .requestMatchers(AntPathRequestMatcher("/**", "PATCH")).denyAll()
+                    .requestMatchers(AntPathRequestMatcher("/**", "OPTIONS")).denyAll()
+                    .requestMatchers(AntPathRequestMatcher("/**", "TRACE")).denyAll()
+                    .requestMatchers(AntPathRequestMatcher("/**", "HEAD")).denyAll()
+        }.httpBasic {
+        }
+        return http.build()
     }
 
 

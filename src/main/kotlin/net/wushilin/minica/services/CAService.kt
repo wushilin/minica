@@ -36,7 +36,11 @@ class CAService {
     }
 
     private fun caBaseDir(): File {
-        return File(config.minicaRoot, "CAs").absoluteFile
+        val target = File(config.minicaRoot, "CAs").absoluteFile
+        if(!target.exists()) {
+            target.mkdirs()
+        }
+        return target
     }
 
     fun safeCheck(dir: File) {

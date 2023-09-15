@@ -1,17 +1,18 @@
 package net.wushilin.minica.rest
 
+import jakarta.servlet.http.HttpServletRequest
+import jakarta.servlet.http.HttpServletResponse
 import net.wushilin.minica.openssl.*
 import net.wushilin.minica.services.CAService
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.http.HttpStatus
 import org.springframework.http.MediaType
+import org.springframework.security.web.csrf.CsrfToken
 import org.springframework.web.bind.annotation.*
 import org.springframework.web.server.ResponseStatusException
-import jakarta.servlet.http.HttpServletResponse
 import java.io.File
 import java.util.*
-import jakarta.servlet.http.HttpServletRequest
 
 @RestController
 class CARestService {
@@ -20,7 +21,14 @@ class CARestService {
     @Autowired
     private lateinit var caSvc: CAService
 
-    @GetMapping("/ca", produces = arrayOf(MediaType.APPLICATION_JSON_VALUE))
+    @GetMapping("/ca/csrf")
+    fun getCsrfToken(request: HttpServletRequest): String {
+        // https://github.com/spring-projects/spring-security/issues/12094#issuecomment-1294150717
+        val csrfToken: CsrfToken = request.getAttribute(CsrfToken::class.java.getName()) as CsrfToken
+        return csrfToken.getToken()
+    }
+
+    @GetMapping("/ca/getAll", produces = arrayOf(MediaType.APPLICATION_JSON_VALUE))
     fun getCAList(): List<CA> {
         return caSvc.listCA()
     }
@@ -47,48 +55,52 @@ class CARestService {
         }
     }
 
-    @GetMapping("/ca/{id}")
+    @GetMapping("/ca/get/{id}")
     fun getCA(@PathVariable("id") id: String): CA {
         try {
             return caSvc.getCAById(id)
         } catch (ex: Exception) {
             throw ResponseStatusException(
-                HttpStatus.NOT_FOUND, "entity not found"
+                    HttpStatus.NOT_FOUND, "entity not found"
             )
         }
     }
 
     @PutMapping("/ca/cert/inspect")
-    fun inspectCA(@RequestBody req:InspectRequest):InspectRequest {
+    fun inspectCA(@RequestBody req: InspectRequest): InspectRequest {
+        if (req.cert.isEmpty()) {
+            throw IllegalArgumentException("Invalid cert")
+        }
         val parsed = CertParser.parseCert(req.cert)
         log.info("Parsed: $parsed")
-        val issuedBy:String = "/C=${parsed["caCountryCode"]!!}/ST=${parsed["caState"]}/L=${parsed["caCity"]}/${parsed["caOrganization"]}/OU=${parsed["caOrganizationUnit"]}/CN=${parsed["caCommonName"]}"
+        val issuedBy: String = "/C=${parsed["caCountryCode"]!!}/ST=${parsed["caState"]}/L=${parsed["caCity"]}/${parsed["caOrganization"]}/OU=${parsed["caOrganizationUnit"]}/CN=${parsed["caCommonName"]}"
         val subject = "/C=${parsed["certCountryCode"]!!}/ST=${parsed["certState"]}/L=${parsed["certCity"]}/${parsed["certOrganization"]}/OU=${parsed["certOrganizationUnit"]}/CN=${parsed["certCommonName"]}"
         req.info = mapOf(
-            "Subject" to subject,
-            "Issuer" to issuedBy,
-            "Validity" to "From ${Date(parsed["validityStart"]!!.toLong())} to ${Date(parsed["validityEnd"]!!.toLong())}",
-            "Valid DNS Names" to parsed["dnsList"]!!,
-            "Valid IP Addreses" to parsed["ipList"]!!,
-            "Public Key Algorithm" to parsed["pkiAlgorithm"]!!,
-            "Signature Algorithm" to parsed["signatureAlgorithm"]!!,
-            "Key Usage" to parsed["keyUsage"]!!,
-            "Extended Key Usage" to parsed["extendedKeyUsage"]!!,
-            "Serial" to parsed["serial"]!!,
-            "Version" to parsed["version"]!!,
-            )
+                "Subject" to subject,
+                "Issuer" to issuedBy,
+                "Validity" to "From ${Date(parsed["validityStart"]!!.toLong())} to ${Date(parsed["validityEnd"]!!.toLong())}",
+                "Valid DNS Names" to parsed["dnsList"]!!,
+                "Valid IP Addreses" to parsed["ipList"]!!,
+                "Public Key Algorithm" to parsed["pkiAlgorithm"]!!,
+                "Signature Algorithm" to parsed["signatureAlgorithm"]!!,
+                "Key Usage" to parsed["keyUsage"]!!,
+                "Extended Key Usage" to parsed["extendedKeyUsage"]!!,
+                "Serial" to parsed["serial"]!!,
+                "Version" to parsed["version"]!!,
+        )
         //2022-01-17 01:07:16.786  INFO 1946 --- [nio-8080-exec-2] net.wushilin.minica.rest.CARestService   : Parsed: {version=3, serial=178, isCA=false,
         // pkiAlgorithm=4096-bit RSA key, signatureAlgorithm=SHA512withRSA, keyUsage=DigitalSignature,Non_repudiation,Key_Encipherment,
         // extendedKeyUsage=clientAuth,emailProtection,serverAuth, dnsList=ipad, ipList=, validityStart=1641708304000, validityEnd=2272428304000, certCountryCode=SG, certCommonName=ipad, certOrganization=Confluent Singapore Pte. Ltd, certOrganizationUnit=, certCity=Singapore, certState=Singapore, caCountryCode=SG, caCommonName=Wu Shilin Certificate Authority, caOrganization=Confluent Singapore Pte. Ltd., caOrganizationUnit=Professional Services, caCity=Singapore, caState=Singapore}
         return req
     }
+
     @PutMapping("/ca/new")
     fun createCA(@RequestBody req: CARequest): CA {
         return caSvc.createCA(req)
     }
 
     @PutMapping("/ca/import")
-    fun importCA(@RequestBody req:ImportCARequest):CA {
+    fun importCA(@RequestBody req: ImportCARequest): CA {
         return caSvc.importCA(req)
     }
 
@@ -106,7 +118,7 @@ class CARestService {
         } catch (ex: Exception) {
             log.error("Failed to list certs for CA:$id", ex)
             throw ResponseStatusException(
-                HttpStatus.NOT_FOUND, "entity not found"
+                    HttpStatus.NOT_FOUND, "entity not found"
             )
         }
     }
@@ -120,16 +132,16 @@ class CARestService {
         } catch (ex: Exception) {
             log.error("Failed to get cert by id $caid/$certid", ex)
             throw ResponseStatusException(
-                HttpStatus.NOT_FOUND, "entity not found"
+                    HttpStatus.NOT_FOUND, "entity not found"
             )
         }
     }
 
     @GetMapping("/ca/download/{caid}/truststore")
     fun downloadCATrustStore(
-        @PathVariable("caid") caid: String,
-        request: HttpServletRequest,
-        response: HttpServletResponse
+            @PathVariable("caid") caid: String,
+            request: HttpServletRequest,
+            response: HttpServletResponse
     ) {
         val ca = caSvc.getCAById(caid)
         val file = File(ca.base, "truststore.jks")
@@ -138,9 +150,9 @@ class CARestService {
 
     @GetMapping("/ca/download/{caid}/password")
     fun downloadCAPassword(
-        @PathVariable("caid") caid: String,
-        request: HttpServletRequest,
-        response: HttpServletResponse
+            @PathVariable("caid") caid: String,
+            request: HttpServletRequest,
+            response: HttpServletResponse
     ) {
         val ca = caSvc.getCAById(caid)
         val file = File(ca.base, "password.txt")
@@ -149,9 +161,9 @@ class CARestService {
 
     @GetMapping("/ca/download/{caid}/pkcs12")
     fun downloadCAPKCS12(
-        @PathVariable("caid") caid: String,
-        request: HttpServletRequest,
-        response: HttpServletResponse
+            @PathVariable("caid") caid: String,
+            request: HttpServletRequest,
+            response: HttpServletResponse
     ) {
         val ca = caSvc.getCAById(caid)
         val file = File(ca.base, "ca.p12")
@@ -174,10 +186,10 @@ class CARestService {
 
     @GetMapping("/ca/download/{caid}/cert/{certid}/bundle")
     fun downloadBundle(
-        @PathVariable("caid") caid: String,
-        @PathVariable("certid") certid: String,
-        request: HttpServletRequest,
-        response: HttpServletResponse
+            @PathVariable("caid") caid: String,
+            @PathVariable("certid") certid: String,
+            request: HttpServletRequest,
+            response: HttpServletResponse
     ) {
         val cert = caSvc.getCert(caid, certid)
         val file = File(cert.base, "bundle.zip")
@@ -186,10 +198,10 @@ class CARestService {
 
     @GetMapping("/ca/download/{caid}/cert/{certid}/cert")
     fun downloadCert(
-        @PathVariable("caid") caid: String,
-        @PathVariable("certid") certid: String,
-        request: HttpServletRequest,
-        response: HttpServletResponse
+            @PathVariable("caid") caid: String,
+            @PathVariable("certid") certid: String,
+            request: HttpServletRequest,
+            response: HttpServletResponse
     ) {
         val cert = caSvc.getCert(caid, certid)
         val file = File(cert.base, "cert.pem")
@@ -198,10 +210,10 @@ class CARestService {
 
     @GetMapping("/ca/download/{caid}/cert/{certid}/csr")
     fun downloadCertCSR(
-        @PathVariable("caid") caid: String,
-        @PathVariable("certid") certid: String,
-        request: HttpServletRequest,
-        response: HttpServletResponse
+            @PathVariable("caid") caid: String,
+            @PathVariable("certid") certid: String,
+            request: HttpServletRequest,
+            response: HttpServletResponse
     ) {
         val cert = caSvc.getCert(caid, certid)
         val file = File(cert.base, "cert.csr")
@@ -210,10 +222,10 @@ class CARestService {
 
     @GetMapping("/ca/download/{caid}/cert/{certid}/key")
     fun downloadKey(
-        @PathVariable("caid") caid: String,
-        @PathVariable("certid") certid: String,
-        request: HttpServletRequest,
-        response: HttpServletResponse
+            @PathVariable("caid") caid: String,
+            @PathVariable("certid") certid: String,
+            request: HttpServletRequest,
+            response: HttpServletResponse
     ) {
         val cert = caSvc.getCert(caid, certid)
         val file = File(cert.base, "cert.key")
@@ -222,10 +234,10 @@ class CARestService {
 
     @GetMapping("/ca/download/{caid}/cert/{certid}/jks")
     fun downloadJKS(
-        @PathVariable("caid") caid: String,
-        @PathVariable("certid") certid: String,
-        request: HttpServletRequest,
-        response: HttpServletResponse
+            @PathVariable("caid") caid: String,
+            @PathVariable("certid") certid: String,
+            request: HttpServletRequest,
+            response: HttpServletResponse
     ) {
         val cert = caSvc.getCert(caid, certid)
         val file = File(cert.base, "cert.jks")
@@ -234,10 +246,10 @@ class CARestService {
 
     @GetMapping("/ca/download/{caid}/cert/{certid}/pkcs12")
     fun downloadPKCS12(
-        @PathVariable("caid") caid: String,
-        @PathVariable("certid") certid: String,
-        request: HttpServletRequest,
-        response: HttpServletResponse
+            @PathVariable("caid") caid: String,
+            @PathVariable("certid") certid: String,
+            request: HttpServletRequest,
+            response: HttpServletResponse
     ) {
         val cert = caSvc.getCert(caid, certid)
         val file = File(cert.base, "cert.p12")
@@ -246,10 +258,10 @@ class CARestService {
 
     @GetMapping("/ca/download/{caid}/cert/{certid}/truststore")
     fun downloadTrustStore(
-        @PathVariable("caid") caid: String,
-        @PathVariable("certid") certid: String,
-        request: HttpServletRequest,
-        response: HttpServletResponse
+            @PathVariable("caid") caid: String,
+            @PathVariable("certid") certid: String,
+            request: HttpServletRequest,
+            response: HttpServletResponse
     ) {
         val ca = caSvc.getCAById(caid)
         val file = File(ca.base, "truststore.jks")
@@ -258,20 +270,21 @@ class CARestService {
 
     @GetMapping("/ca/download/{caid}/cert/{certid}/truststorePassword")
     fun downloadTrustStorePassword(
-        @PathVariable("caid") caid: String,
-        @PathVariable("certid") certid: String,
-        request: HttpServletRequest,
-        response: HttpServletResponse
+            @PathVariable("caid") caid: String,
+            @PathVariable("certid") certid: String,
+            request: HttpServletRequest,
+            response: HttpServletResponse
     ) {
         val ca = caSvc.getCAById(caid)
         val file = File(ca.base, "password.txt")
         handleDownload("cert-${certid}-truststore-password.txt", file, request, response)
     }
+
     @GetMapping("/ca/download/{caid}/cert/{certid}/password")
     fun downloadPassword(
-        @PathVariable("caid") caid: String, @PathVariable("certid") certid: String,
-        request: HttpServletRequest,
-        response: HttpServletResponse
+            @PathVariable("caid") caid: String, @PathVariable("certid") certid: String,
+            request: HttpServletRequest,
+            response: HttpServletResponse
     ) {
         val cert = caSvc.getCert(caid, certid)
         val file = File(cert.base, "password.txt")

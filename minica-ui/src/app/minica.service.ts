@@ -148,7 +148,7 @@ export class CAService {
   constructor(private http: HttpClient) { }
 
   getCAList(): Observable<CertificateAuthority[]> {
-    return this.http.get<CertificateAuthority[]>(this.calistURL)
+    return this.http.get<CertificateAuthority[]>(this.calistURL + "getAll")
           .pipe(
             tap(result => this.log(`fetched CA List ${JSON.stringify(result)}`)),
     );
@@ -183,7 +183,7 @@ export class CAService {
     return new Date().getTime() >= ca.issueTime + ca.validDays*3600000*24;
   }
   getCAById(id:string):Observable<CertificateAuthority> {
-    return this.http.get<CertificateAuthority>(this.calistURL+ id)
+    return this.http.get<CertificateAuthority>(this.calistURL+ "get/" + id)
           .pipe(
             tap(result => this.log(`fetched CA by id ${JSON.stringify(result)}`)),
     );

@@ -1,6 +1,6 @@
 <div>
   <div fxLayout="wrap" fxLayoutAlign="start center" fxLayoutGap="1px"  class="small-card" fxFlex="20">
-    <a href="/">Home</a> &gt; <a href="cadetail/{{cadetail?.id}}">CN={{cadetail?.commonName}}</a> &gt; <a href="certdetail/{{cadetail?.id}}/{{certdetail?.id}}">CN={{certdetail?.commonName}}</a>
+    <a routerLink="/">Home</a> &gt; <a routerLink="/cadetail/{{cadetail?.id}}">CN={{cadetail?.commonName}}</a> &gt; <a routerLink="/certdetail/{{cadetail?.id}}/{{certdetail?.id}}">CN={{certdetail?.commonName}}</a>
     <mat-card [ngClass]="{'expired' : caService.expiredCert(certdetail)}" *ngIf="certdetail">
       <h1>Certificate Detail</h1>
       <mat-card-title style="font-size:16px">CN={{certdetail.commonName}}</mat-card-title>

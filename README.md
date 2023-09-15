@@ -362,3 +362,14 @@ $ ng serve --proxy-config proxy.conf.js --host 0.0.0.0 --configuration productio
 Open your browser and access http://<host>:4200. You will be prompted to login, enter the RESTful userid and password.
 
 For the admin users, you can do everything. For viewer users, the modifications are prohibited.
+
+
+# Live demo
+You can see a live demo at http://ca.wushilin.net:40000/
+
+The login user (in username///password format):
+* Admin: admin///admin
+* Viewer: user///user
+
+Note that Certificated Created in this Live Demo will be deleted after 30 days automatically
+
