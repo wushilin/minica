@@ -36,3 +36,4 @@ application.properties
 .DS_Store
 **/*.localonly
 *.local.*
+bin/
