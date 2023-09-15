@@ -52,6 +52,12 @@ Start the service:
 $ java -jar build/libs/minica-0.0.1-SNAPSHOT.jar --spring.config.location=./application.properties
 ```
 
+Access the UI:
+Open your browser and access via http://host:9988
+
+Login with your configure password.
+
+
 Test the service:
 ```sh
 $ curl -u "admin:adminpass" -vvvv -H "Content-Type: application/json"  -X PUT --data '{"commonName": "ABC CORP CA", "validDays": 7300, "countryCode":"SG", "organization":"ABC Corp CA", "state":"Singapore", "city":"Singapore", "organizationUnit":"Home Office", "digestAlgorithm":"SHA512", "keyLength": 4096 }' http://localhost:9988/ca/new
@@ -324,6 +330,8 @@ Requires viewer role
 
 
 # Building the UI service
+NOTE: The UI is built and bundled in automatically. Use this only if you are keen to make the UI better.
+
 
 1. Install node and npm - steps skipped, node 16.10+
 
