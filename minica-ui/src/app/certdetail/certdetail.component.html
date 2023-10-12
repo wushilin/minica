@@ -1,6 +1,7 @@
 <div>
-  <div fxLayout="wrap" fxLayoutAlign="start center" fxLayoutGap="1px"  class="small-card" fxFlex="20">
-    <a routerLink="/">Home</a> &gt; <a routerLink="/cadetail/{{cadetail?.id}}">CN={{cadetail?.commonName}}</a> &gt; <a routerLink="/certdetail/{{cadetail?.id}}/{{certdetail?.id}}">CN={{certdetail?.commonName}}</a>
+  <div fxLayout="wrap" fxLayoutAlign="start center" fxLayoutGap="1px" class="small-card" fxFlex="20">
+    <a routerLink="/">Home</a> &gt; <a routerLink="/cadetail/{{cadetail?.id}}">CN={{cadetail?.commonName}}</a> &gt; <a
+      routerLink="/certdetail/{{cadetail?.id}}/{{certdetail?.id}}">CN={{certdetail?.commonName}}</a>
     <mat-card [ngClass]="{'expired' : caService.expiredCert(certdetail)}" *ngIf="certdetail">
       <h1>Certificate Detail</h1>
       <mat-card-title style="font-size:16px">CN={{certdetail.commonName}}</mat-card-title>
@@ -42,26 +43,45 @@
       <button mat-raised-button color="secondary" [cdkCopyToClipboard]="certdetail.key">Copy Key</button>
       <div class="flex-container">
         <mat-form-field class="cakeys" appearance="fill" style="width: 48%">
-        <mat-label>Certificate</mat-label>
-        <textarea matInput disabled cols="200" rows="30"  style="font-family:Courier;">{{certdetail.cert}}</textarea>
-      </mat-form-field>
+          <mat-label>Certificate</mat-label>
+          <textarea matInput disabled cols="200" rows="30" style="font-family:Courier;">{{certdetail.cert}}</textarea>
+        </mat-form-field>
 
-      <mat-form-field class="cakeys" appearance="fill" style="width: 48%">
-        <mat-label>Private Key</mat-label>
-        <textarea matInput disabled cols="200" rows="30"  style="font-family:Courier;">{{certdetail.key}}</textarea>
-      </mat-form-field>
+        <mat-form-field class="cakeys" appearance="fill" style="width: 48%">
+          <mat-label>Private Key</mat-label>
+          <textarea matInput disabled cols="200" rows="30" style="font-family:Courier;">{{certdetail.key}}</textarea>
+        </mat-form-field>
       </div>
-      <mat-card-actions align="start">
-        <a mat-raised-button color="primary" href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/bundle">Download Everything</a>
-        <a mat-raised-button color="primary" href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/cert">Cert</a>
-        <a mat-raised-button color="primary" href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/csr">Cert Request</a>
-        <a mat-raised-button color="primary" href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/key">Key</a>
-        <a mat-raised-button color="primary" href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/jks">KeyStore in JKS</a>
-        <a mat-raised-button color="primary" href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/pkcs12">KeyStore in PKCS12</a>
-        <a mat-raised-button color="primary" href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/password">KeyStore Password</a>
-        <a mat-raised-button color="primary" href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/truststore">Trust Store</a>
-        <a mat-raised-button color="primary" href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/truststorePassword">Trust Store Password</a>
-      </mat-card-actions>
+      <div>
+        <mat-card-actions align="start">
+          <a mat-raised-button color="primary"
+            href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/bundle">Download Everything</a>
+          <a mat-raised-button color="primary"
+            href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/cert">Cert</a>
+          <a mat-raised-button color="primary" href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/csr">Cert
+            Request</a>
+          <a mat-raised-button color="primary" href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/key">Key</a>
+          <a mat-raised-button color="primary" href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/jks">KeyStore
+            in JKS</a>
+          <a mat-raised-button color="primary"
+            href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/pkcs12">KeyStore in PKCS12</a>
+          <a mat-raised-button color="primary"
+            href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/password">KeyStore Password</a>
+          <a mat-raised-button color="primary"
+            href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/truststore">Trust Store</a>
+          <a mat-raised-button color="primary"
+            href="/ca/download/{{cadetail?.id}}/cert/{{certdetail?.id}}/truststorePassword">Trust Store Password</a>
+        </mat-card-actions>
+      </div>
+      <div>
+        <mat-form-field>
+          <mat-label>Days to renew (1~7350 only)</mat-label>
+          <input matInput name="days" type="number" min="1" max="7350" [(ngModel)]="renewDays">
+        </mat-form-field>
+        <mat-card-actions align="start">
+          <a mat-raised-button color="accent" (click)="doRenew()">Renew certificate</a>
+        </mat-card-actions>
+      </div>
     </mat-card>
   </div>
 </div>

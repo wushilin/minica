@@ -216,6 +216,13 @@ export class CAService {
       );
   }
 
+  renewCert(caid:string, certid:string, days:number):Observable<Certificate> {
+    return this.http.post<Certificate>(this.calistURL + caid + "/cert/" + certid + "/renew/" + days, "")
+      .pipe(
+        tap(result => this.log(`renew cert ${certid} in CA ${caid} for ${days} days result ${JSON.stringify(result)}`)),
+      );
+  }
+
   inspectCert(data:ViewCertDialogData):Observable<ViewCertDialogData> {
     return this.http.put<ViewCertDialogData>(this.calistURL + "cert/inspect", data)
       .pipe(
