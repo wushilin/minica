@@ -3,6 +3,7 @@ package net.wushilin.minica.openssl
 import net.wushilin.minica.IO
 import java.io.File
 import java.lang.IllegalArgumentException
+import java.nio.charset.StandardCharsets
 import java.util.*
 
 class Cert(var base: File){
@@ -18,6 +19,10 @@ class Cert(var base: File){
     val keyFile: File
         get() = _keyFile
 
+    private val _csrFile:File = File(base, "cert.csr")
+    val csrFile:File
+        get() = _csrFile
+
     private var _certFile: File = File(base, "cert.pem")
     val certFile: File
         get() = _certFile
@@ -26,6 +31,11 @@ class Cert(var base: File){
     val commonName: String
         get() = _commonName
 
+    fun readPassword():String {
+        val passwordFile = File(this.base, "password.txt")
+        val password = passwordFile.readText(StandardCharsets.UTF_8)
+        return password
+    }
     private var _city: String = ""
     val city: String
         get() = _city
@@ -82,10 +92,7 @@ class Cert(var base: File){
         _key = IO.readFileAsString(keyFile)
         _cert = IO.readFileAsString(certFile)
 
-        val props = Properties()
-        File(base, "meta.properties").inputStream().use {
-            props.load(it)
-        }
+        val props = readMeta()
         _validDays = props.getProperty("validDays", "0").toInt()
         this._city = props.getProperty("city", "")
         this._commonName = props.getProperty("commonName", "")
@@ -103,6 +110,14 @@ class Cert(var base: File){
         if(!File(base, "CERT.complete").exists()) {
             throw IllegalArgumentException("possibly invalid CERT")
         }
+    }
+
+    fun readMeta():Properties {
+        val props = Properties()
+        File(base, "meta.properties").inputStream().use {
+            props.load(it)
+        }
+        return props
     }
 
     override fun toString():String {

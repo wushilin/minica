@@ -122,7 +122,6 @@ class CA(var base: File) {
         return "CA:$_subject@${base.name}"
     }
 
-
     fun removeCertById(id:String):Cert {
         val result = getCertById(id)
         val deleteResult = result.base.deleteRecursively()

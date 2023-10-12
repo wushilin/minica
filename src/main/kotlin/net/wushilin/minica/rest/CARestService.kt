@@ -123,6 +123,20 @@ class CARestService {
         }
     }
 
+    @PostMapping("/ca/{caid}/cert/{certid}/renew/{days}")
+    fun renewCert(@PathVariable("caid") caid: String, @PathVariable("certid") certid:String, @PathVariable("days") days:Int):Cert {
+        try {
+            val ca = caSvc.getCAById(caid)
+            val cert = ca.getCertById(certid)
+            // both exists, good!
+            return caSvc.renewCert(ca, cert, days)
+        } catch(ex:Exception) {
+            log.error("Failed to extend cert by id $caid/$certid for $days days", ex)
+            throw ResponseStatusException(
+                HttpStatus.INTERNAL_SERVER_ERROR, "entity error"
+            )
+        }
+    }
     @GetMapping("/ca/{caid}/cert/{certid}")
     fun getCACert(@PathVariable("caid") caid: String, @PathVariable("certid") certid: String): Cert {
         try {

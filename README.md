@@ -245,6 +245,15 @@ Authorization: xxx
 Requires viewer role
 ```
 
+Renew certificate by X days
+```
+POST /ca/<ca-id>/cert/<cert-id>/<days>
+Authorization: xxx
+
+---
+Requires admin role
+```
+
 Download everything about the cert in a zip file, include cert, csr, 
 private key in PEM format, jks and pkcs12 keystore, jks truststore, 
 ca cert in PEM, and all keystore passwords
