@@ -21,7 +21,7 @@ import java.util.*
 @ConditionalOnProperty(name=["authentication.mode"], matchIfMissing = false, havingValue = "request-header")
 class ExternalHeaderSecurityConfig {
     init {
-        log.info("initializing default security config")
+        log.info("initializing external header based security config")
     }
     companion object {
         @Suppress("JAVA_CLASS_ON_COMPANION")
