@@ -24,15 +24,24 @@ This software is suitable for development & testing only, where you don't want t
 It is purely built using openssl and java keytool (shipped with JDK).
 You need to have both installed in your system.
 
+# Change log
+
+## 1.0.3
 Since 1.0.3, additional support for external trusted http header authentication is added.
 
-Now the trusted user can be passed in by any header name, and trusted group can be passed in by any header name too in CSV format.
+Now it should be easy to put this service behind IAM services where user can enjoy SSO to this application.
+The trusted user can be passed in by any header name, and trusted group can be passed in by any header name too in CSV format.
 e.g. 
 ```
 x-user: steve
 x-groups: iam_group3, iam_group4
 ```
 
+See configuration example below for details. It is easy!
+
+This feature may not be very useful for individual developers that has no IAM services.
+
+# Requirements
 Requirement:
 ```
 openssl 1.0+
@@ -62,6 +71,7 @@ server.port=9988 <= default port is 8080, you may change it here
 # authentication.mode=request-header|default <= default: use users.config and basic, request-header: use trusted header for username
 # request-header.name.username=x-user <= the http request header name to retrieve curently loggedin user
 # request-header.name.group=x-group <= the http request header name to retrieve current user's group. 
+# # Groups is in csv format. it can be aaa,bbb,ccc, or "aaa","bbb","ccc". Any CSV format is good!
 # request-header.group.admin.name=admin <= the group name for admin user rights
 # request-header.group.viewer.name=viewer <= the group name for viewer user rights
 
