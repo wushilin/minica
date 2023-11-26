@@ -23,10 +23,20 @@ This software is suitable for development & testing only, where you don't want t
 
 It is purely built using openssl and java keytool (shipped with JDK).
 You need to have both installed in your system.
+
+Since 1.0.3, additional support for external trusted http header authentication is added.
+
+Now the trusted user can be passed in by any header name, and trusted group can be passed in by any header name too in CSV format.
+e.g. 
+```
+x-user: steve
+x-groups: iam_group3, iam_group4
+```
+
 Requirement:
 ```
 openssl 1.0+
-jdk 11+
+jdk 17+ (springboot requirement)
 ```
 # Building the MiniCA RESTful service
 ```sh
@@ -34,7 +44,7 @@ $ git clone https://github.com/wushilin/minica.git
 $ cd minica
 $ ./gradlew clean bootJar
 ```
-The executable jar is located at build/libs/minica-0.0.1-SNAPSHOT.jar
+The executable jar is located at build/libs/minica-1.0.3-SNAPSHOT.jar
 
 To run it, 
 
@@ -45,11 +55,27 @@ minica.root=/opt/minica <= point to a directory for all your CA certificates and
 keytool.path=/usr/local/bin/keytool <= point to your jdk keytool command
 users.config=admin@adminpass:admin;user@password:viewer;invalid@invalid:invalid <= config the user access in username@password:role;username2@password2:role2 format. You can specify many users. The users will be using Basic authentication when talking to the RESTful service. The admin role users will be able to make changes (e.g. create/delete CA, request/delete certificates). The viewer will not able to do so, but viewer can download and view the certs without problem.
 server.port=9988 <= default port is 8080, you may change it here
+
+
+# If you want to support trusted header (where idm/iam is protecting this service, you may use external header authentication)
+# Uncomment to use:
+# authentication.mode=request-header|default <= default: use users.config and basic, request-header: use trusted header for username
+# request-header.name.username=x-user <= the http request header name to retrieve curently loggedin user
+# request-header.name.group=x-group <= the http request header name to retrieve current user's group. 
+# request-header.group.admin.name=admin <= the group name for admin user rights
+# request-header.group.viewer.name=viewer <= the group name for viewer user rights
+
+# Every user, on top of the groups retrieved from group name header(if set), will be given additional role '$any'.
+# you can choose not to set `request-header.name.group` and use '$any' for group names.
+
+
+# Do not use this if your end user can directly access the minica. as they can always pass user header and group header
+# directly
 ```
 
 Start the service:
 ```sh
-$ java -jar build/libs/minica-0.0.1-SNAPSHOT.jar --spring.config.location=./application.properties
+$ java -jar build/libs/minica-1.0.3-SNAPSHOT.jar --spring.config.location=./application.properties
 ```
 
 Access the UI:
