@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "net.wushilin.minica"
-version = "1.0.2-RELEASE"
+version = "1.0.3-RELEASE"
 java.sourceCompatibility = JavaVersion.VERSION_17
 
 repositories {
@@ -22,6 +22,7 @@ dependencies {
     implementation("org.springframework.boot:spring-boot-starter-web")
     implementation("org.springframework.boot:spring-boot-starter-security")
     developmentOnly("org.springframework.boot:spring-boot-devtools")
+    implementation("com.opencsv:opencsv:5.9")
     compileOnly("jakarta.servlet:jakarta.servlet-api:6.0.0")
     testImplementation("org.springframework.boot:spring-boot-starter-test")
 }
