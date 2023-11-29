@@ -160,7 +160,8 @@ Authorization: xxx
   "city":"Singapore",
   "organizationUnit":"Home Office",
   "digestAlgorithm":"SHA512",
-  "keyLength": 4096 
+  "keyLength": 4096,
+  "password": "changeit"
 }
 
 ---
