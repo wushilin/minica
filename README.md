@@ -95,8 +95,23 @@ Login with your configure password.
 
 
 Test the service:
+
+# IMPORTANT 
+
+Cross Site Request Forgery notes
+
+MiniCA added XSRF protection now. The angular / UI automatically handles that for you.
+
+For RESTful API, you will have to add additional two headers.
+```
+-H "X-XSRF-TOKEN: 123" -H "Cookie: XSRF-TOKEN=123;"
+```
+
+The cookie value XSRF-TOKEN must equal to request header X-XSRF-TOKEN value.
+Otherwise, the request will be denied because of CSRF check failed.
+
 ```sh
-$ curl -u "admin:adminpass" -vvvv -H "Content-Type: application/json"  -X PUT --data '{"commonName": "ABC CORP CA", "validDays": 7300, "countryCode":"SG", "organization":"ABC Corp CA", "state":"Singapore", "city":"Singapore", "organizationUnit":"Home Office", "digestAlgorithm":"SHA512", "keyLength": 4096 }' http://localhost:9988/ca/new
+$ curl -H "X-XSRF-TOKEN: 123" -H "Cookie: XSRF-TOKEN=123;" -u "admin:adminpass" -vvvv -H "Content-Type: application/json"  -X PUT --data '{"commonName": "ABC CORP CA", "validDays": 7300, "countryCode":"SG", "organization":"ABC Corp CA", "state":"Singapore", "city":"Singapore", "organizationUnit":"Home Office", "digestAlgorithm":"SHA512", "keyLength": 4096 }' http://localhost:9988/ca/new
 ```
 
 If you see something like this, that means your RESTful service is up.
