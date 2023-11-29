@@ -14,6 +14,8 @@ export function withLoading<T>(functionObject:TrapFunc<T>, errorer?:ErrorFunc<T>
     return trap(functionObject, showLoading, hideLoading , errorer)
 }
 
+
+
 export function trap<T>(functionObject: TrapFunc<T>, starter?:()=>void, ender?:()=>void, errorer?:ErrorFunc<T>):Observable<T> {
     if(starter) {
        starter();
@@ -71,6 +73,12 @@ export interface ImportCADialogData {
   cert: string;
   key: string;
   password: string;
+}
+
+export interface CSRFTokenObject {
+  parameterName: string;
+  headerName: string;
+  token: string;
 }
 
 export interface ViewCertDialogData {
@@ -154,6 +162,12 @@ export class CAService {
     );
   }
 
+  loadCSRF():Observable<CSRFTokenObject> {
+    return this.http.get<CSRFTokenObject>(this.calistURL + "csrf")
+      .pipe(
+        tap(result => this.log(`fetched CSRF token ${JSON.stringify(result)}`))
+      );
+  }
   deleteCA(id:string):Observable<CertificateAuthority> {
     console.log(`Executing deleteCA ${id}`)
     return this.http.delete<CertificateAuthority>(this.calistURL + id)

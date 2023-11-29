@@ -22,17 +22,22 @@ class CARestService {
     private lateinit var caSvc: CAService
 
     @GetMapping("/ca/csrf")
-    fun getCsrfToken(request: HttpServletRequest): String {
+    @ResponseBody
+    fun getCsrfToken(request: HttpServletRequest): CsrfToken {
         // https://github.com/spring-projects/spring-security/issues/12094#issuecomment-1294150717
-        val csrfToken: CsrfToken = request.getAttribute(CsrfToken::class.java.getName()) as CsrfToken
-        return csrfToken.getToken()
+        val csrfToken: CsrfToken = request.getAttribute("_csrf") as CsrfToken
+        return csrfToken
     }
 
     @GetMapping("/ca/getAll", produces = arrayOf(MediaType.APPLICATION_JSON_VALUE))
-    fun getCAList(): List<CA> {
+    fun getCAList(request: HttpServletRequest): List<CA> {
         return caSvc.listCA()
     }
 
+    @DeleteMapping("/ca/deleteTest")
+    fun deleteTest():String {
+        return "DELETE OK"
+    }
 
     @DeleteMapping("/ca/{id}")
     fun deleteCA(@PathVariable("id") id: String): CA {

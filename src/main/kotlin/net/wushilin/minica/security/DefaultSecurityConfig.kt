@@ -10,6 +10,7 @@ import org.springframework.security.config.annotation.web.builders.HttpSecurity
 import org.springframework.security.core.userdetails.UserDetailsService
 import org.springframework.security.provisioning.InMemoryUserDetailsManager
 import org.springframework.security.web.SecurityFilterChain
+import org.springframework.security.web.csrf.CookieCsrfTokenRepository
 import org.springframework.security.web.csrf.CsrfTokenRequestAttributeHandler
 import org.springframework.security.web.util.matcher.AntPathRequestMatcher
 
@@ -32,11 +33,10 @@ class DefaultWebSecurityConfigurerAdapter {
     @Bean
     @Throws(Exception::class)
     fun filterChain(http: HttpSecurity): SecurityFilterChain? {
-        val requestHandler = CsrfTokenRequestAttributeHandler()
-        requestHandler.setCsrfRequestAttributeName(null);
-
-        var builder = http.csrf { csrf ->
-            csrf.disable()
+        var builder = http.csrf{
+            csrf ->
+            csrf.csrfTokenRepository(CookieCsrfTokenRepository.withHttpOnlyFalse())
+            csrf.csrfTokenRequestHandler(CsrfTokenRequestAttributeHandler())
         }.authorizeHttpRequests { authz ->
             authz.requestMatchers(AntPathRequestMatcher("/**", "GET")).hasAnyRole("viewer", "admin")
                     .requestMatchers(AntPathRequestMatcher("/**", "POST")).hasAnyRole("admin")

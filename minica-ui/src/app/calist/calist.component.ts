@@ -46,7 +46,15 @@ export class CalistComponent implements OnInit {
     ) {}
 
   ngOnInit(): void {
-    this.getCAList();
+    this.loadCSRFToken()
+  }
+
+  loadCSRFToken() {
+      console.log("Loading csrf")
+      this.caService.loadCSRF().subscribe(result =>{
+        console.log(`loaded csrf token`)
+        this.getCAList()
+      })
   }
 
   deleteCA(id:string, name:string) {
