@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "net.wushilin.minica"
-version = "1.0.3-RELEASE"
+version = "1.0.4-RELEASE"
 java.sourceCompatibility = JavaVersion.VERSION_17
 
 repositories {
