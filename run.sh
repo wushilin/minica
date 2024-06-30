@@ -1,4 +1,4 @@
 #!/bin/sh
 
 
-ng serve --proxy-config proxy.conf.js.localonly --host 0.0.0.0 --configuration production
+java -jar minica-1.0.4-RELEASE.jar --spring.config.location=./application.properties
