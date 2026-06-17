@@ -5,9 +5,10 @@
 //	minica cert [flags]
 //
 // It first checks whether a certificate with the requested common name already
-// exists under the CA; if so it downloads that certificate, otherwise it creates
-// a new one. Either way it saves the cert, key, PKCS#12 bundle, the bundle
-// password, and the issuing CA certificate to disk.
+// exists under the CA; if so it downloads that certificate (renewing it for 365
+// days first when it expires within a year), otherwise it creates a new one.
+// Either way it saves the cert, key, PKCS#12 bundle, the bundle password, and
+// the issuing CA certificate to disk.
 //
 // Configuration is resolved with the precedence: flag > environment > prompt.
 // Prompts are skipped entirely with -y/--non-interactive.
@@ -36,7 +37,25 @@ const (
 	defaultKeyProfile = "rsa:4096"
 	defaultDigest     = "sha256"
 	defaultDays       = 825
+
+	msPerDay = int64(86_400_000)
+	// On the reuse path, renew when the existing certificate expires within
+	// this many days, re-issuing it for renewDays days.
+	renewWithinDays = int64(365)
+	renewDays       = 365
 )
+
+// timeNowMs returns the current time in milliseconds since the Unix epoch,
+// matching the server's millisecond timestamps.
+func timeNowMs() int64 { return time.Now().UnixMilli() }
+
+// needsRenew reports whether a certificate with the given issue time (ms) and
+// validity (days) expires less than renewWithinDays days from nowMs. An
+// already-expired certificate also needs renewal.
+func needsRenew(issueTimeMs, validDays, nowMs int64) bool {
+	remainingMs := issueTimeMs + validDays*msPerDay - nowMs
+	return remainingMs < renewWithinDays*msPerDay
+}
 
 func main() {
 	if len(os.Args) < 2 || os.Args[1] != "cert" {
@@ -53,9 +72,10 @@ func usage() {
 	fmt.Fprint(os.Stderr, `minica - retrieve certificates from a MiniCA server
 
 Checks whether a certificate with the requested common name already exists under
-the CA: if it does, that certificate is downloaded; otherwise a new one is
-created. Either way the certificate, private key, PKCS#12 bundle, the bundle
-password, and the issuing CA certificate are saved to disk.
+the CA: if it does, that certificate is downloaded (and first renewed for 365
+days when it expires within a year); otherwise a new one is created. Either way
+the certificate, private key, PKCS#12 bundle, the bundle password, and the
+issuing CA certificate are saved to disk.
 
 USAGE:
   minica cert [flags]
@@ -297,6 +317,22 @@ func runCert(args []string) error {
 	} else if found {
 		fmt.Fprintf(os.Stderr, "Certificate %q already exists in this CA; downloading.\n", commonName)
 		fmt.Printf("Cert Id is: %s\n", existingID)
+
+		// Renew before downloading if the existing certificate is within a year
+		// of expiry, so the downloaded artifacts carry the renewed validity. A
+		// failed renewal is not fatal: warn and download the current cert.
+		existing, err := client.getCert(url, caID, existingID)
+		if err != nil {
+			return err
+		}
+		if needsRenew(existing.IssueTime, existing.ValidDays, timeNowMs()) {
+			remaining := (existing.IssueTime + existing.ValidDays*msPerDay - timeNowMs()) / msPerDay
+			fmt.Fprintf(os.Stderr, "Certificate expires in %d days; renewing for %d days.\n", remaining, renewDays)
+			if err := client.renewCert(url, caID, existingID, renewDays); err != nil {
+				fmt.Fprintf(os.Stderr, "could not renew (%v); downloading current certificate.\n", err)
+			}
+		}
+
 		certPEM, err := client.download(url, fmt.Sprintf("/download/cert/%s/%s/cert", caID, existingID))
 		if err != nil {
 			return err
@@ -560,9 +596,11 @@ func newClient(user, password string, insecure bool) *client {
 }
 
 type certificate struct {
-	ID      string `json:"id"`
-	CertPEM string `json:"cert_pem"`
-	KeyPEM  string `json:"key_pem"`
+	ID        string `json:"id"`
+	CertPEM   string `json:"cert_pem"`
+	KeyPEM    string `json:"key_pem"`
+	IssueTime int64  `json:"issue_time"`
+	ValidDays int64  `json:"valid_days"`
 }
 
 type envelope struct {
@@ -618,6 +656,69 @@ func (c *client) createCert(baseURL, caID string, body map[string]any) (*certifi
 		return nil, fmt.Errorf("server returned an empty certificate id")
 	}
 	return &cert, nil
+}
+
+// getCert fetches a certificate's metadata (including issue time and validity)
+// by id under a CA.
+func (c *client) getCert(baseURL, caID, certID string) (*certificate, error) {
+	endpoint := fmt.Sprintf("%s/api/cas/%s/certs/%s", baseURL, caID, certID)
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.SetBasicAuth(c.user, c.password)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, fmt.Errorf("unexpected response (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	if !env.Success || resp.StatusCode >= 300 {
+		if env.Error != nil {
+			return nil, fmt.Errorf("get cert failed (%s): %s", env.Error.Code, env.Error.Message)
+		}
+		return nil, fmt.Errorf("get cert failed: HTTP %d", resp.StatusCode)
+	}
+	var cert certificate
+	if err := json.Unmarshal(env.Data, &cert); err != nil {
+		return nil, fmt.Errorf("decoding certificate: %w", err)
+	}
+	return &cert, nil
+}
+
+// renewCert re-issues an existing certificate for the given number of days.
+func (c *client) renewCert(baseURL, caID, certID string, days int) error {
+	endpoint := fmt.Sprintf("%s/api/cas/%s/certs/%s/renew/%d", baseURL, caID, certID, days)
+	req, err := http.NewRequest(http.MethodPost, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	req.SetBasicAuth(c.user, c.password)
+	// Mutating API calls require the double-submit CSRF token pair.
+	csrf := csrfToken()
+	req.Header.Set("X-CSRF-Token", csrf)
+	req.Header.Set("Cookie", "minica_csrf="+csrf)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return fmt.Errorf("unexpected response (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	if !env.Success || resp.StatusCode >= 300 {
+		if env.Error != nil {
+			return fmt.Errorf("%s: %s", env.Error.Code, env.Error.Message)
+		}
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // findCertIDByCN looks up an existing certificate id by common name under a CA.

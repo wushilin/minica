@@ -2,9 +2,10 @@
 
 A small client for retrieving certificates from a MiniCA server. It first checks
 whether a certificate with the requested common name already exists under the
-CA: if it does, that certificate is downloaded; otherwise a new one is created.
-Either way it saves the cert, private key, PKCS#12 bundle, the bundle password,
-and the issuing CA certificate to disk.
+CA: if it does, that certificate is downloaded (and first renewed for 365 days
+when it expires within a year); otherwise a new one is created. Either way it
+saves the cert, private key, PKCS#12 bundle, the bundle password, and the issuing
+CA certificate to disk.
 
 ## Build
 
