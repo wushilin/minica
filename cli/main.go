@@ -95,7 +95,7 @@ CERTIFICATE FIELDS (flag or env; prompted otherwise)
   --name           MINICA_NAME           <sanitized CN>     Output file prefix
 
 OUTPUT / BEHAVIOR (flag or env only, never prompted)
-  --out-dir        MINICA_OUT_DIR        .                  Directory to write files into
+  --out-dir        MINICA_OUT_DIR        ./certs            Directory to write files into
   --insecure       MINICA_INSECURE       (off)              Skip TLS certificate verification
   -y, --non-interactive                                     Use flags/env/defaults without prompting
   -h, --help                                                Show this help
@@ -288,13 +288,13 @@ func runCert(args []string) error {
 		outPrefix = "cert"
 	}
 
-	// Output directory: flag > MINICA_OUT_DIR > current directory (not prompted).
+	// Output directory: flag > MINICA_OUT_DIR > ./certs (not prompted).
 	outDir := f.outDir
 	if outDir == "" {
 		outDir = getEnv("MINICA_OUT_DIR")
 	}
 	if outDir == "" {
-		outDir = "."
+		outDir = "./certs"
 	}
 
 	client := newClient(user, password, f.insecure || getEnv("MINICA_INSECURE") != "")
@@ -316,7 +316,13 @@ func runCert(args []string) error {
 		body["password"] = p12Password
 	}
 
-	fmt.Fprintln(os.Stderr, "\nGetting certs...")
+	// The leading blank line separates the interactive prompts from the status
+	// output; with -y there are no prompts, so skip it to avoid a stray blank line.
+	if f.nonInteractive {
+		fmt.Fprintln(os.Stderr, "Getting certs...")
+	} else {
+		fmt.Fprintln(os.Stderr, "\nGetting certs...")
+	}
 	cert, err := client.createCert(url, caID, body)
 	if err != nil {
 		return err

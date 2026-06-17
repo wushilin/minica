@@ -43,6 +43,10 @@ Hostnames are one comma-separated list; anything that parses as an IP address is
 sent as an IP SAN, everything else as a DNS SAN. The common name is added as a
 DNS SAN automatically by the server.
 
+The list is optional: leave it empty to issue a certificate with just the common
+name. When empty, the client sends `dns_list`/`ip_list` as JSON `null`, which the
+server accepts as an empty list.
+
 ## Configuration
 
 Resolution precedence: **flag > environment > `~/.minica` > interactive prompt**
@@ -95,7 +99,7 @@ MINICA_ORG="Example Corp"
 
 | Flag | Meaning |
 | --- | --- |
-| `--out-dir` (or `MINICA_OUT_DIR`) | Output directory (default `.`) |
+| `--out-dir` (or `MINICA_OUT_DIR`) | Output directory (default `./certs`) |
 | `-y`, `--non-interactive` | Use flags/env/defaults without prompting |
 | `--insecure` (or `MINICA_INSECURE`) | Skip TLS certificate verification |
 
