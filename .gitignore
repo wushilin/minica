@@ -31,9 +31,10 @@ minica-ui/node_modules/
 # Build output
 
 build
-application.properties
 .idea
 .DS_Store
 **/*.localonly
 *.local.*
 bin/
+minica.conf
+application.local.properties
