@@ -1,4 +1,16 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Deserialize a value, treating an explicit JSON `null` (as well as a missing
+/// field, when combined with `#[serde(default)]`) as the type's default. The Go
+/// CLI marshals empty slices to `null`, so requests can arrive with
+/// `"dns_list": null` / `"ip_list": null`.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CertificateAuthority {
@@ -83,9 +95,9 @@ pub struct CreateCertRequest {
     pub digest_algorithm: String,
     pub key_profile: String,
     pub password: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub dns_list: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub ip_list: Vec<String>,
 }
 
@@ -116,4 +128,29 @@ pub struct InspectResponse {
     pub ip_addresses: Vec<String>,
     pub purposes: Vec<(String, String)>,
     pub raw_text: String,
+}
+
+#[cfg(test)]
+mod null_list_tests {
+    use super::*;
+
+    #[test]
+    fn create_cert_request_accepts_null_lists() {
+        let json = r#"{
+            "common_name": "example.com",
+            "country_code": "US",
+            "state": "CA",
+            "city": "SF",
+            "organization": "Org",
+            "organization_unit": "Unit",
+            "valid_days": 365,
+            "digest_algorithm": "sha256",
+            "key_profile": "rsa2048",
+            "dns_list": null,
+            "ip_list": null
+        }"#;
+        let req: CreateCertRequest = serde_json::from_str(json).expect("null lists should deserialize");
+        assert!(req.dns_list.is_empty());
+        assert!(req.ip_list.is_empty());
+    }
 }

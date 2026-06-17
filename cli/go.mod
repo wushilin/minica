@@ -1,3 +1,3 @@
-module mca
+module mcacli
 
 go 1.21
