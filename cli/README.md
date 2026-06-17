@@ -1,8 +1,10 @@
 # minica CLI (Go)
 
-A small client for retrieving certificates from a MiniCA server. It creates a
-certificate under a CA and saves the cert, private key, PKCS#12 bundle, the
-bundle password, and the issuing CA certificate to disk.
+A small client for retrieving certificates from a MiniCA server. It first checks
+whether a certificate with the requested common name already exists under the
+CA: if it does, that certificate is downloaded; otherwise a new one is created.
+Either way it saves the cert, private key, PKCS#12 bundle, the bundle password,
+and the issuing CA certificate to disk.
 
 ## Build
 
@@ -109,8 +111,8 @@ Given an output prefix of `test1`:
 
 | File | Source |
 | --- | --- |
-| `test1.pem` | `cert_pem` from the create response |
-| `test1.key` | `key_pem` from the create response |
+| `test1.pem` | `cert_pem` from the create response, or `GET /download/cert/{ca}/{cert}/cert` when reusing |
+| `test1.key` | `key_pem` from the create response, or `GET /download/cert/{ca}/{cert}/key` when reusing |
 | `test1.p12` | `GET /download/cert/{ca}/{cert}/pkcs12` |
 | `test1.p12.password` | `GET /download/cert/{ca}/{cert}/password` |
 | `CA.pem` | `GET /download/ca/{ca}/cert` |

@@ -4,8 +4,10 @@
 //
 //	minica cert [flags]
 //
-// It creates a certificate under a CA and saves the cert, key, PKCS#12 bundle,
-// the bundle password, and the issuing CA certificate to disk.
+// It first checks whether a certificate with the requested common name already
+// exists under the CA; if so it downloads that certificate, otherwise it creates
+// a new one. Either way it saves the cert, key, PKCS#12 bundle, the bundle
+// password, and the issuing CA certificate to disk.
 //
 // Configuration is resolved with the precedence: flag > environment > prompt.
 // Prompts are skipped entirely with -y/--non-interactive.
@@ -22,6 +24,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -49,8 +52,10 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `minica - retrieve certificates from a MiniCA server
 
-Creates a certificate under a CA and saves the certificate, private key, PKCS#12
-bundle, the bundle password, and the issuing CA certificate to disk.
+Checks whether a certificate with the requested common name already exists under
+the CA: if it does, that certificate is downloaded; otherwise a new one is
+created. Either way the certificate, private key, PKCS#12 bundle, the bundle
+password, and the issuing CA certificate are saved to disk.
 
 USAGE:
   minica cert [flags]
@@ -257,6 +262,69 @@ func runCert(args []string) error {
 	if commonName == "" {
 		return fmt.Errorf("commonName is required")
 	}
+
+	client := newClient(user, password, f.insecure || getEnv("MINICA_INSECURE") != "")
+
+	// Output name and directory resolution, shared by the reuse and create
+	// paths. Name: flag > prompt (default sanitized CN) > env > "cert". Dir:
+	// flag > env > "./certs".
+	resolveOutPrefix := func() string {
+		outPrefix := f.name
+		if outPrefix == "" {
+			outPrefix = ask("Output name (file prefix)", "", "MINICA_NAME", sanitize(commonName))
+		}
+		if outPrefix == "" {
+			outPrefix = "cert"
+		}
+		return outPrefix
+	}
+	resolveOutDir := func() string {
+		outDir := f.outDir
+		if outDir == "" {
+			outDir = getEnv("MINICA_OUT_DIR")
+		}
+		if outDir == "" {
+			outDir = "./certs"
+		}
+		return outDir
+	}
+
+	// Probe first: if a certificate with this common name already exists under
+	// the CA, download it instead of creating a new one (the create call would
+	// fail the server's per-CA CN uniqueness check anyway).
+	if existingID, found, err := client.findCertIDByCN(url, caID, commonName); err != nil {
+		return err
+	} else if found {
+		fmt.Fprintf(os.Stderr, "Certificate %q already exists in this CA; downloading.\n", commonName)
+		fmt.Printf("Cert Id is: %s\n", existingID)
+		certPEM, err := client.download(url, fmt.Sprintf("/download/cert/%s/%s/cert", caID, existingID))
+		if err != nil {
+			return err
+		}
+		keyPEM, err := client.download(url, fmt.Sprintf("/download/cert/%s/%s/key", caID, existingID))
+		if err != nil {
+			return err
+		}
+		p12, err := client.download(url, fmt.Sprintf("/download/cert/%s/%s/pkcs12", caID, existingID))
+		if err != nil {
+			return err
+		}
+		pw, err := client.download(url, fmt.Sprintf("/download/cert/%s/%s/password", caID, existingID))
+		if err != nil {
+			return err
+		}
+		caPEM, err := client.download(url, fmt.Sprintf("/download/ca/%s/cert", caID))
+		if err != nil {
+			return err
+		}
+		written, err := saveBundle(resolveOutDir(), resolveOutPrefix(), certPEM, keyPEM, p12, pw, caPEM)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Saved as %s\n", strings.Join(written, ", "))
+		return nil
+	}
+
 	// country_code and organization are required non-empty by the server,
 	// so they carry meaningful defaults; state/city/org_unit may be blank.
 	country := ask("What is your country code", f.country, "MINICA_COUNTRY", "US")
@@ -280,24 +348,8 @@ func runCert(args []string) error {
 		p12Password = getEnv("MINICA_P12_PASSWORD")
 	}
 
-	outPrefix := f.name
-	if outPrefix == "" {
-		outPrefix = ask("Output name (file prefix)", "", "MINICA_NAME", sanitize(commonName))
-	}
-	if outPrefix == "" {
-		outPrefix = "cert"
-	}
-
-	// Output directory: flag > MINICA_OUT_DIR > ./certs (not prompted).
-	outDir := f.outDir
-	if outDir == "" {
-		outDir = getEnv("MINICA_OUT_DIR")
-	}
-	if outDir == "" {
-		outDir = "./certs"
-	}
-
-	client := newClient(user, password, f.insecure || getEnv("MINICA_INSECURE") != "")
+	outPrefix := resolveOutPrefix()
+	outDir := resolveOutDir()
 
 	body := map[string]any{
 		"common_name":       commonName,
@@ -329,8 +381,36 @@ func runCert(args []string) error {
 	}
 	fmt.Printf("Cert Id is: %s\n", cert.ID)
 
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
+	// PKCS#12, its password, and the CA cert come from download endpoints; the
+	// cert and key come from the create response.
+	p12, err := client.download(url, fmt.Sprintf("/download/cert/%s/%s/pkcs12", caID, cert.ID))
+	if err != nil {
 		return err
+	}
+	pw, err := client.download(url, fmt.Sprintf("/download/cert/%s/%s/password", caID, cert.ID))
+	if err != nil {
+		return err
+	}
+	caPEM, err := client.download(url, fmt.Sprintf("/download/ca/%s/cert", caID))
+	if err != nil {
+		return err
+	}
+	written, err := saveBundle(outDir, outPrefix, []byte(cert.CertPEM), []byte(cert.KeyPEM), p12, pw, caPEM)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Saved as %s\n", strings.Join(written, ", "))
+	return nil
+}
+
+// saveBundle writes the five certificate artifacts into outDir using the given
+// file-name prefix, returning the names written in order. Modes match the
+// sensitivity of each file: the certificate and CA cert are world-readable
+// (0644); the key, PKCS#12 bundle, and its password are owner-only (0600).
+func saveBundle(outDir, prefix string, certPEM, keyPEM, p12, p12pw, caPEM []byte) ([]string, error) {
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return nil, err
 	}
 	written := []string{}
 	write := func(name string, data []byte, mode os.FileMode) error {
@@ -341,41 +421,22 @@ func runCert(args []string) error {
 		written = append(written, name)
 		return nil
 	}
-
-	if err := write(outPrefix+".pem", []byte(cert.CertPEM), 0o644); err != nil {
-		return err
+	if err := write(prefix+".pem", certPEM, 0o644); err != nil {
+		return nil, err
 	}
-	if err := write(outPrefix+".key", []byte(cert.KeyPEM), 0o600); err != nil {
-		return err
+	if err := write(prefix+".key", keyPEM, 0o600); err != nil {
+		return nil, err
 	}
-
-	// PKCS#12, its password, and the CA cert come from download endpoints.
-	p12, err := client.download(url, fmt.Sprintf("/download/cert/%s/%s/pkcs12", caID, cert.ID))
-	if err != nil {
-		return err
+	if err := write(prefix+".p12", p12, 0o600); err != nil {
+		return nil, err
 	}
-	if err := write(outPrefix+".p12", p12, 0o600); err != nil {
-		return err
-	}
-
-	pw, err := client.download(url, fmt.Sprintf("/download/cert/%s/%s/password", caID, cert.ID))
-	if err != nil {
-		return err
-	}
-	if err := write(outPrefix+".p12.password", pw, 0o600); err != nil {
-		return err
-	}
-
-	caPEM, err := client.download(url, fmt.Sprintf("/download/ca/%s/cert", caID))
-	if err != nil {
-		return err
+	if err := write(prefix+".p12.password", p12pw, 0o600); err != nil {
+		return nil, err
 	}
 	if err := write("CA.pem", caPEM, 0o644); err != nil {
-		return err
+		return nil, err
 	}
-
-	fmt.Printf("Saved as %s\n", strings.Join(written, ", "))
-	return nil
+	return written, nil
 }
 
 // splitHostnames classifies a comma-separated list into DNS names and IPs.
@@ -557,6 +618,47 @@ func (c *client) createCert(baseURL, caID string, body map[string]any) (*certifi
 		return nil, fmt.Errorf("server returned an empty certificate id")
 	}
 	return &cert, nil
+}
+
+// findCertIDByCN looks up an existing certificate id by common name under a CA.
+// A 404 means no such certificate (found=false, no error); the common name is
+// matched case- and whitespace-insensitively by the server.
+func (c *client) findCertIDByCN(baseURL, caID, cn string) (string, bool, error) {
+	endpoint := fmt.Sprintf("%s/api/cas/%s/certs_by_cn?cn=%s", baseURL, caID, url.QueryEscape(cn))
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", false, err
+	}
+	req.SetBasicAuth(c.user, c.password)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", false, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusNotFound {
+		return "", false, nil
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return "", false, fmt.Errorf("unexpected response (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	if !env.Success || resp.StatusCode >= 300 {
+		if env.Error != nil {
+			return "", false, fmt.Errorf("lookup failed (%s): %s", env.Error.Code, env.Error.Message)
+		}
+		return "", false, fmt.Errorf("lookup failed: HTTP %d", resp.StatusCode)
+	}
+	var data struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(env.Data, &data); err != nil {
+		return "", false, fmt.Errorf("decoding lookup response: %w", err)
+	}
+	if data.ID == "" {
+		return "", false, fmt.Errorf("server returned an empty certificate id")
+	}
+	return data.ID, true, nil
 }
 
 // download fetches a raw artifact (PKCS#12, password, CA cert) from a
