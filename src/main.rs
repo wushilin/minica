@@ -86,10 +86,7 @@ async fn main() -> Result<()> {
     // arguments, or neither (prompt for both); one argument is rejected.
     if let Some(args) = cli.verify_password {
         let (password, hash) = match args.as_slice() {
-            [] => (
-                prompt_secret("Password: ")?,
-                prompt_line("Bcrypt hash: ")?,
-            ),
+            [] => (prompt_secret("Password: ")?, prompt_line("Bcrypt hash: ")?),
             [password, hash] => (password.clone(), hash.clone()),
             _ => {
                 eprintln!(
@@ -916,7 +913,9 @@ mod tests {
             .await;
         duplicate_cert.assert_status(StatusCode::BAD_REQUEST);
 
-        let duplicate_ca_from_cert_name = env
+        // CA common names are unique among CAs only, not against cert CNs:
+        // creating a CA named after an existing cert's CN is allowed.
+        let ca_reusing_cert_name = env
             .json(
                 "PUT",
                 "/minica/api/cas",
@@ -925,7 +924,59 @@ mod tests {
                 ca_payload("leaf.lifecycle.test"),
             )
             .await;
-        duplicate_ca_from_cert_name.assert_status(StatusCode::BAD_REQUEST);
+        ca_reusing_cert_name.assert_status(StatusCode::OK);
+        let reused_name_ca_id = ca_reusing_cert_name.json()["id"]
+            .as_str()
+            .expect("ca id")
+            .to_string();
+        let delete_reused_name_ca = env
+            .json(
+                "DELETE",
+                &format!("/minica/api/cas/{reused_name_ca_id}"),
+                Some(("admin", "adminpass")),
+                Some(&csrf),
+                json!({}),
+            )
+            .await;
+        delete_reused_name_ca.assert_status(StatusCode::OK);
+
+        // Look up the cert id by common name (case- and whitespace-insensitive).
+        let lookup = env
+            .send(
+                "GET",
+                &format!("/minica/api/cas/{ca_id}/certs_by_cn?cn=LEAF.lifecycle.test"),
+                Some(("viewer", "viewerpass")),
+                None,
+                None,
+                Body::empty(),
+            )
+            .await;
+        lookup.assert_status(StatusCode::OK);
+        assert_eq!(lookup.json()["id"], cert_id);
+
+        let lookup_missing = env
+            .send(
+                "GET",
+                &format!("/minica/api/cas/{ca_id}/certs_by_cn?cn=nope.lifecycle.test"),
+                Some(("viewer", "viewerpass")),
+                None,
+                None,
+                Body::empty(),
+            )
+            .await;
+        lookup_missing.assert_status(StatusCode::NOT_FOUND);
+
+        let lookup_no_cn = env
+            .send(
+                "GET",
+                &format!("/minica/api/cas/{ca_id}/certs_by_cn"),
+                Some(("viewer", "viewerpass")),
+                None,
+                None,
+                Body::empty(),
+            )
+            .await;
+        lookup_no_cn.assert_status(StatusCode::BAD_REQUEST);
 
         let import_duplicate_cert = env
             .json(

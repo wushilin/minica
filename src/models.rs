@@ -149,7 +149,8 @@ mod null_list_tests {
             "dns_list": null,
             "ip_list": null
         }"#;
-        let req: CreateCertRequest = serde_json::from_str(json).expect("null lists should deserialize");
+        let req: CreateCertRequest =
+            serde_json::from_str(json).expect("null lists should deserialize");
         assert!(req.dns_list.is_empty());
         assert!(req.ip_list.is_empty());
     }

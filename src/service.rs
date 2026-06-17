@@ -219,7 +219,7 @@ impl AppService {
         );
         validate_days(req.valid_days)?;
         let key = key_spec(&req.key_profile)?;
-        self.ensure_unique_common_name(&req.common_name)?;
+        self.ensure_unique_ca_common_name(&req.common_name)?;
         let subject = create_subject(
             &req.common_name,
             &req.country_code,
@@ -299,7 +299,7 @@ impl AppService {
             .unwrap_or_else(|| "Imported CA".to_string());
         let common_name =
             parse_subject_part(&subject_text, "CN").unwrap_or_else(|| "Imported CA".to_string());
-        self.ensure_unique_common_name(&common_name)?;
+        self.ensure_unique_ca_common_name(&common_name)?;
         let country_code =
             parse_subject_part(&subject_text, "C").unwrap_or_else(|| "XX".to_string());
         let organization =
@@ -453,7 +453,7 @@ impl AppService {
             ip.parse::<std::net::IpAddr>()
                 .with_context(|| format!("invalid IP SAN: {ip}"))?;
         }
-        self.ensure_unique_common_name(&req.common_name)?;
+        self.ensure_unique_cert_common_name(ca_id, &req.common_name)?;
         let _ca = self.db.get_ca(ca_id)?;
         let ca_secrets = self.db.get_ca_secrets(ca_id)?;
         let crl_url = self.crl_url(ca_id);
@@ -571,7 +571,7 @@ impl AppService {
             let subject_text = info_value(&info, "subject").unwrap_or_default();
             let common_name = parse_subject_part(&subject_text, "CN")
                 .unwrap_or_else(|| "Imported Certificate".to_string());
-            self.ensure_unique_common_name(&common_name)?;
+            self.ensure_unique_cert_common_name(ca_id, &common_name)?;
             let country_code =
                 parse_subject_part(&subject_text, "C").unwrap_or_else(|| "XX".to_string());
             let organization =
@@ -1124,11 +1124,27 @@ impl AppService {
         Ok(())
     }
 
-    fn ensure_unique_common_name(&self, common_name: &str) -> Result<()> {
-        if self.db.common_name_exists(common_name)? {
+    /// CA common names are unique among CAs (not checked against cert CNs).
+    fn ensure_unique_ca_common_name(&self, common_name: &str) -> Result<()> {
+        if self.db.ca_common_name_exists(common_name)? {
             bail!("common name already exists: {}", common_name.trim());
         }
         Ok(())
+    }
+
+    /// Cert common names are unique within their CA; the same CN may be reused
+    /// under a different CA.
+    fn ensure_unique_cert_common_name(&self, ca_id: &str, common_name: &str) -> Result<()> {
+        if self.db.cert_common_name_exists(ca_id, common_name)? {
+            bail!("common name already exists: {}", common_name.trim());
+        }
+        Ok(())
+    }
+
+    /// Returns the id of the non-deleted certificate under `ca_id` whose common
+    /// name matches (case- and whitespace-insensitively), if any.
+    pub fn find_cert_id_by_cn(&self, ca_id: &str, common_name: &str) -> Result<Option<String>> {
+        self.db.find_cert_id_by_cn(ca_id, common_name)
     }
 
     pub fn crl_url(&self, ca_id: &str) -> Option<String> {

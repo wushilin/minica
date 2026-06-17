@@ -233,6 +233,20 @@ impl Db {
                 role TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );
+
+            -- certificates.ca_id is filtered on every CA view (list_cas' LEFT
+            -- JOIN, the per-CA cert listings, and the dashboard/trash COUNT
+            -- subqueries) and walked by ON DELETE CASCADE. Without an index each
+            -- of those is a full scan of the (growing) certificates table. The
+            -- trailing created_at lets the index also satisfy the ORDER BY.
+            CREATE INDEX IF NOT EXISTS idx_certificates_ca_id
+                ON certificates(ca_id, created_at);
+
+            -- Partial index for the soft-delete "trash" listing
+            -- (WHERE deleted = 1 ORDER BY updated_at DESC). Only indexes deleted
+            -- rows, so it stays tiny while making that view index-driven.
+            CREATE INDEX IF NOT EXISTS idx_certificates_trash
+                ON certificates(updated_at) WHERE deleted = 1;
             "#,
         )?;
         // Add the soft-delete columns to databases created before they existed.
@@ -886,19 +900,50 @@ impl Db {
         Ok(count == 0)
     }
 
-    pub fn common_name_exists(&self, common_name: &str) -> Result<bool> {
+    /// True when a non-deleted CA already uses this common name. CA common
+    /// names are unique among CAs only; they are not checked against cert CNs.
+    pub fn ca_common_name_exists(&self, common_name: &str) -> Result<bool> {
         let normalized = common_name.trim();
         let conn = self.conn.lock().expect("db mutex poisoned");
         let count: i64 = conn.query_row(
-            r#"
-            SELECT
-                (SELECT COUNT(*) FROM certificate_authorities WHERE deleted = 0 AND lower(trim(common_name)) = lower(?1)) +
-                (SELECT COUNT(*) FROM certificates WHERE deleted = 0 AND lower(trim(common_name)) = lower(?1))
-            "#,
+            "SELECT COUNT(*) FROM certificate_authorities WHERE deleted = 0 AND lower(trim(common_name)) = lower(?1)",
             params![normalized],
             |row| row.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    /// True when a non-deleted certificate under the given CA already uses this
+    /// common name. Cert common names are unique within their CA; the same CN
+    /// may be reused under a different CA.
+    pub fn cert_common_name_exists(&self, ca_id: &str, common_name: &str) -> Result<bool> {
+        let normalized = common_name.trim();
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM certificates WHERE deleted = 0 AND ca_id = ?1 AND lower(trim(common_name)) = lower(?2)",
+            params![ca_id, normalized],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Finds the id of a non-deleted certificate under a non-deleted CA whose
+    /// common name matches (case- and whitespace-insensitively). Per-CA CN
+    /// uniqueness guarantees at most one match.
+    pub fn find_cert_id_by_cn(&self, ca_id: &str, common_name: &str) -> Result<Option<String>> {
+        let normalized = common_name.trim();
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.query_row(
+            r#"
+            SELECT id FROM certificates
+            WHERE ca_id = ?1 AND deleted = 0 AND lower(trim(common_name)) = lower(?2)
+              AND (SELECT deleted FROM certificate_authorities WHERE id = ?1) = 0
+            "#,
+            params![ca_id, normalized],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     pub fn update_cert_with_state(
@@ -1421,4 +1466,159 @@ fn split_list(input: &str) -> Vec<String> {
 
 fn blob_string(bytes: Vec<u8>) -> String {
     String::from_utf8_lossy(&bytes).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db() -> Db {
+        let suffix: String = rand::rng()
+            .sample_iter(Alphanumeric)
+            .take(12)
+            .map(char::from)
+            .collect();
+        let dir = std::env::temp_dir().join(format!("minica-db-test-{suffix}"));
+        Db::open(&dir.join("test.sqlite")).expect("open temp db")
+    }
+
+    fn sample_ca(id: &str, common_name: &str) -> (CaMeta, CaSecrets) {
+        (
+            CaMeta {
+                id: id.to_string(),
+                common_name: common_name.to_string(),
+                country_code: "SG".to_string(),
+                state: "SG".to_string(),
+                city: "SG".to_string(),
+                organization: "Org".to_string(),
+                organization_unit: "Unit".to_string(),
+                subject: format!("CN={common_name}"),
+                issue_time: 0,
+                valid_days: 365,
+                key_profile: "rsa:2048".to_string(),
+                digest_algorithm: "sha256".to_string(),
+            },
+            CaSecrets {
+                cert_pem: Vec::new(),
+                key_pem: Vec::new(),
+                pkcs12: Vec::new(),
+                password: Vec::new(),
+                index_txt: Vec::new(),
+                serial_txt: Vec::new(),
+                crl_der: Vec::new(),
+                crl_updated_at: 0,
+            },
+        )
+    }
+
+    fn sample_cert(id: &str, ca_id: &str, common_name: &str) -> (CertMeta, CertSecrets) {
+        (
+            CertMeta {
+                id: id.to_string(),
+                ca_id: ca_id.to_string(),
+                common_name: common_name.to_string(),
+                country_code: "SG".to_string(),
+                state: "SG".to_string(),
+                city: "SG".to_string(),
+                organization: "Org".to_string(),
+                organization_unit: "Unit".to_string(),
+                subject: format!("CN={common_name}"),
+                issue_time: 0,
+                valid_days: 365,
+                dns_list: Vec::new(),
+                ip_list: Vec::new(),
+                key_profile: "rsa:2048".to_string(),
+                digest_algorithm: "sha256".to_string(),
+                revoked_at: None,
+                revocation_reason: None,
+            },
+            CertSecrets {
+                cert_pem: Vec::new(),
+                key_pem: Vec::new(),
+                csr_pem: Vec::new(),
+                pkcs12: Vec::new(),
+                password: Vec::new(),
+                bundle_zip: Vec::new(),
+            },
+        )
+    }
+
+    fn insert_ca(db: &Db, id: &str, common_name: &str) {
+        let (meta, secrets) = sample_ca(id, common_name);
+        db.insert_ca(&meta, &secrets).expect("insert ca");
+    }
+
+    fn insert_cert(db: &Db, id: &str, ca_id: &str, common_name: &str) {
+        let (meta, secrets) = sample_cert(id, ca_id, common_name);
+        db.insert_cert_restore(&meta, &secrets)
+            .expect("insert cert");
+    }
+
+    #[test]
+    fn cert_common_name_is_unique_within_ca_not_across_cas() {
+        let db = temp_db();
+        insert_ca(&db, "ca1", "CA One");
+        insert_ca(&db, "ca2", "CA Two");
+        insert_cert(&db, "cert1", "ca1", "web");
+
+        assert!(db.cert_common_name_exists("ca1", "web").unwrap());
+        // Different CA: the same cert CN is allowed.
+        assert!(!db.cert_common_name_exists("ca2", "web").unwrap());
+        // Same CA, case- and whitespace-insensitive.
+        assert!(db.cert_common_name_exists("ca1", "  WEB ").unwrap());
+        assert!(!db.cert_common_name_exists("ca1", "other").unwrap());
+    }
+
+    #[test]
+    fn deleted_cert_does_not_count_for_uniqueness() {
+        let db = temp_db();
+        insert_ca(&db, "ca1", "CA One");
+        insert_cert(&db, "cert1", "ca1", "web");
+        db.delete_cert("ca1", "cert1").unwrap();
+
+        assert!(!db.cert_common_name_exists("ca1", "web").unwrap());
+    }
+
+    #[test]
+    fn ca_common_name_is_unique_among_cas_only() {
+        let db = temp_db();
+        insert_ca(&db, "ca1", "Root CA");
+        insert_cert(&db, "cert1", "ca1", "shared");
+
+        assert!(db.ca_common_name_exists("root ca").unwrap());
+        assert!(!db.ca_common_name_exists("Other CA").unwrap());
+        // A cert CN must not register as a CA CN.
+        assert!(!db.ca_common_name_exists("shared").unwrap());
+    }
+
+    #[test]
+    fn find_cert_id_by_cn_returns_matching_id() {
+        let db = temp_db();
+        insert_ca(&db, "ca1", "CA One");
+        insert_ca(&db, "ca2", "CA Two");
+        insert_cert(&db, "cert1", "ca1", "web");
+
+        assert_eq!(
+            db.find_cert_id_by_cn("ca1", "web").unwrap().as_deref(),
+            Some("cert1")
+        );
+        // Case- and whitespace-insensitive.
+        assert_eq!(
+            db.find_cert_id_by_cn("ca1", " WEB ").unwrap().as_deref(),
+            Some("cert1")
+        );
+        // Scoped to the CA: a match under a different CA is not found here.
+        assert_eq!(db.find_cert_id_by_cn("ca2", "web").unwrap(), None);
+        assert_eq!(db.find_cert_id_by_cn("ca1", "nope").unwrap(), None);
+    }
+
+    #[test]
+    fn find_cert_id_by_cn_skips_deleted_cert() {
+        let db = temp_db();
+        insert_ca(&db, "ca1", "CA One");
+        insert_cert(&db, "cert1", "ca1", "web");
+        db.delete_cert("ca1", "cert1").unwrap();
+
+        assert_eq!(db.find_cert_id_by_cn("ca1", "web").unwrap(), None);
+    }
 }

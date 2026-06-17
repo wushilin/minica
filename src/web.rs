@@ -9,7 +9,7 @@ use crate::{
 use anyhow::{Result, anyhow, bail};
 use axum::{
     Form, Json, Router,
-    extract::{Multipart, Path, State, rejection::JsonRejection},
+    extract::{Multipart, Path, Query, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{any, get, post, put},
@@ -46,6 +46,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/cas/{ca_id}/certs/import",
             put(api_import_cert).fallback(api_method_not_allowed),
+        )
+        .route(
+            "/cas/{ca_id}/certs_by_cn",
+            get(api_find_cert_by_cn).fallback(api_method_not_allowed),
         )
         .route(
             "/cas/{ca_id}/certs/{cert_id}",
@@ -1194,6 +1198,39 @@ async fn api_get_cert(
     api_view(headers, &state, || state.service.get_cert(&ca_id, &cert_id))
 }
 
+#[derive(Deserialize)]
+struct CertCnQuery {
+    cn: Option<String>,
+}
+
+async fn api_find_cert_by_cn(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(ca_id): Path<String>,
+    Query(query): Query<CertCnQuery>,
+) -> Response {
+    if let Err(err) = auth::require_viewer(&headers, &state) {
+        return api_error_response(err);
+    }
+    let cn = query.cn.unwrap_or_default();
+    if cn.trim().is_empty() {
+        return api_error_status(
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+            "query parameter 'cn' is required",
+        );
+    }
+    match state.service.find_cert_id_by_cn(&ca_id, &cn) {
+        Ok(Some(id)) => api_success(serde_json::json!({ "id": id })),
+        Ok(None) => api_error_status(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no certificate with that common name under this CA",
+        ),
+        Err(err) => api_error_response(err),
+    }
+}
+
 async fn api_create_cert(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2241,6 +2278,20 @@ fn openapi_spec_json(base: &str) -> String {
                     "parameters": [{ "name": "ca_id", "in": "path", "required": true, "schema": { "type": "string" } }],
                     "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ImportCertRequest" } } } },
                     "responses": { "200": { "description": "Imported certificate" } }
+                }
+            },
+            "/api/cas/{ca_id}/certs_by_cn": {
+                "get": {
+                    "summary": "Find certificate id by common name",
+                    "parameters": [
+                        { "name": "ca_id", "in": "path", "required": true, "schema": { "type": "string" } },
+                        { "name": "cn", "in": "query", "required": true, "schema": { "type": "string" }, "description": "Common name to look up (case- and whitespace-insensitive)" }
+                    ],
+                    "responses": {
+                        "200": { "description": "Matching certificate id" },
+                        "400": { "description": "Missing cn query parameter" },
+                        "404": { "description": "No certificate with that common name under this CA" }
+                    }
                 }
             },
             "/api/cas/{ca_id}/certs/{cert_id}": {
