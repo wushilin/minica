@@ -24,10 +24,11 @@ pub fn authenticate(headers: &HeaderMap, state: &AppState) -> Result<User> {
         bail!("invalid Basic auth payload");
     };
 
-    // Bootstrap accounts come from the config file (plaintext). These exist so
-    // the very first admin can log in and manage DB-backed users.
+    // Bootstrap accounts come from the config file. Their stored password may be
+    // a bcrypt hash or (legacy) plaintext; these exist so the very first admin
+    // can log in and manage DB-backed users.
     for user in &state.config.auth.users {
-        if user.username == username && user.password == password {
+        if user.username == username && verify_config_password(&user.password, password) {
             return Ok(User {
                 username: user.username.clone(),
                 role: user.role,
@@ -49,6 +50,23 @@ pub fn authenticate(headers: &HeaderMap, state: &AppState) -> Result<User> {
     bail!("invalid username or password")
 }
 
+/// A stored credential is treated as a bcrypt hash when it carries a recognised
+/// bcrypt identifier prefix; otherwise it is legacy plaintext.
+pub fn looks_like_bcrypt(stored: &str) -> bool {
+    stored.starts_with("$2a$") || stored.starts_with("$2b$") || stored.starts_with("$2y$")
+}
+
+/// Verify a provided password against a config-file credential. Bcrypt hashes are
+/// verified with bcrypt; anything else is compared as plaintext (a startup
+/// warning is emitted for plaintext credentials, so we don't warn per-request).
+pub fn verify_config_password(stored: &str, provided: &str) -> bool {
+    if looks_like_bcrypt(stored) {
+        bcrypt::verify(provided, stored).unwrap_or(false)
+    } else {
+        stored == provided
+    }
+}
+
 pub fn require_viewer(headers: &HeaderMap, state: &AppState) -> Result<User> {
     authenticate(headers, state)
 }
@@ -67,6 +85,26 @@ pub fn csrf_token() -> String {
         .take(32)
         .map(char::from)
         .collect()
+}
+
+#[cfg(test)]
+mod password_tests {
+    use super::*;
+
+    #[test]
+    fn plaintext_credential_matches_exact() {
+        assert!(verify_config_password("adminpass", "adminpass"));
+        assert!(!verify_config_password("adminpass", "wrong"));
+        assert!(!looks_like_bcrypt("adminpass"));
+    }
+
+    #[test]
+    fn bcrypt_credential_verifies_against_hash() {
+        let hash = bcrypt::hash("adminpass", 4).unwrap();
+        assert!(looks_like_bcrypt(&hash));
+        assert!(verify_config_password(&hash, "adminpass"));
+        assert!(!verify_config_password(&hash, "wrong"));
+    }
 }
 
 pub fn check_csrf(method: &Method, headers: &HeaderMap) -> Result<()> {

@@ -32,6 +32,8 @@ openssl:
 
 # Only the bootstrap admin is configured here. All other accounts (including
 # viewers) are managed in the database via the Admin Console at /minica/admin.
+# The password may be a bcrypt hash (recommended: `minica --gen-password`) or
+# plaintext. Plaintext still works but logs a warning at startup.
 auth:
   users:
     - username: admin

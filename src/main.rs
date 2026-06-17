@@ -9,11 +9,13 @@ mod web;
 
 use anyhow::Result;
 use axum::{Router, routing::get};
+use clap::{ArgGroup, CommandFactory, Parser};
 use config::Config;
 use db::Db;
 use logging::RotatingFileMakeWriter;
 use openssl::OpenSsl;
 use service::AppService;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{
@@ -26,9 +28,145 @@ pub struct AppState {
     pub service: AppService,
 }
 
+/// MiniCA command-line interface. Exactly one action flag may be given; with no
+/// action the help text is printed.
+#[derive(Parser, Debug)]
+#[command(
+    name = "minica",
+    version,
+    about = "MiniCA - a small certificate authority server",
+    group(ArgGroup::new("action").required(false).multiple(false)),
+)]
+struct Cli {
+    /// Path to the config file (used by --start)
+    #[arg(short = 'c', long, value_name = "FILE", default_value = "config.yaml")]
+    config: PathBuf,
+
+    /// Start the MiniCA server
+    #[arg(long, group = "action")]
+    start: bool,
+
+    /// Write a sample config.yaml to the current directory and exit
+    #[arg(long, group = "action")]
+    gen_config: bool,
+
+    /// Hash a password with bcrypt and print the hash (prompts if no value given)
+    #[arg(long, group = "action", value_name = "PASSWORD", num_args = 0..=1)]
+    gen_password: Option<Option<String>>,
+
+    /// Verify a password against a bcrypt hash. With no values, prompts for the
+    /// password (hidden) and the hash. Or pass both: --verify-password <PASSWORD> <HASH>
+    #[arg(long, group = "action", num_args = 0..=2, value_names = ["PASSWORD", "HASH"])]
+    verify_password: Option<Vec<String>>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = Config::load()?;
+    let cli = Cli::parse();
+
+    // --gen-config: write the bundled sample config and exit (no config needed).
+    if cli.gen_config {
+        let path = Config::gen_config()?;
+        println!("Wrote sample config to {}", path.display());
+        return Ok(());
+    }
+
+    // --gen-password [PASSWORD]: print a bcrypt hash. With no value, prompt.
+    if let Some(value) = cli.gen_password {
+        let password = match value {
+            Some(p) => p,
+            None => prompt_secret("Password: ")?,
+        };
+        let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST)?;
+        println!("{hash}");
+        return Ok(());
+    }
+
+    // --verify-password: exit 0 on match, 1 on mismatch. Accept both values as
+    // arguments, or neither (prompt for both); one argument is rejected.
+    if let Some(args) = cli.verify_password {
+        let (password, hash) = match args.as_slice() {
+            [] => (
+                prompt_secret("Password: ")?,
+                prompt_line("Bcrypt hash: ")?,
+            ),
+            [password, hash] => (password.clone(), hash.clone()),
+            _ => {
+                eprintln!(
+                    "--verify-password needs both values: pass `--verify-password <PASSWORD> <HASH>`, \
+                     or `--verify-password` with no values to be prompted for both"
+                );
+                std::process::exit(2);
+            }
+        };
+        if bcrypt::verify(&password, &hash).unwrap_or(false) {
+            println!("OK: password matches the hash");
+            return Ok(());
+        }
+        eprintln!("MISMATCH: password does not match the hash");
+        std::process::exit(1);
+    }
+
+    // --start: load config and run the server.
+    if cli.start {
+        let config = Config::load(&cli.config)?;
+        return start_server(config).await;
+    }
+
+    // Default: no action selected, print help.
+    Cli::command().print_help()?;
+    println!();
+    Ok(())
+}
+
+/// Prompt on stderr and read a line of cleartext from stdin (input is echoed).
+fn prompt_line(prompt: &str) -> Result<String> {
+    use std::io::Write;
+    eprint!("{prompt}");
+    std::io::stderr().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim_end_matches(['\n', '\r']).to_string())
+}
+
+/// Prompt on stderr and read a secret from stdin without echoing it. Echo is
+/// only suppressed when stdin is a terminal; piped input is read normally.
+fn prompt_secret(prompt: &str) -> Result<String> {
+    use std::io::Write;
+    eprint!("{prompt}");
+    std::io::stderr().flush()?;
+
+    // Disable terminal echo for the duration of the read, restoring it after.
+    let fd = libc::STDIN_FILENO;
+    let mut saved: Option<libc::termios> = None;
+    unsafe {
+        if libc::isatty(fd) == 1 {
+            let mut term: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut term) == 0 {
+                let original = term;
+                term.c_lflag &= !libc::ECHO;
+                if libc::tcsetattr(fd, libc::TCSANOW, &term) == 0 {
+                    saved = Some(original);
+                }
+            }
+        }
+    }
+
+    let mut line = String::new();
+    let read = std::io::stdin().read_line(&mut line);
+
+    if let Some(original) = saved {
+        unsafe {
+            libc::tcsetattr(fd, libc::TCSANOW, &original);
+        }
+        // The user's Enter wasn't echoed; move to a fresh line.
+        eprintln!();
+    }
+    read?;
+    Ok(line.trim_end_matches(['\n', '\r']).to_string())
+}
+
+async fn start_server(config: Config) -> Result<()> {
     let file_writer = RotatingFileMakeWriter::new(&config.logging)?;
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
@@ -44,6 +182,17 @@ async fn main() -> Result<()> {
                 .with_ansi(false),
         )
         .init();
+
+    // Bootstrap credentials may still be plaintext; warn once at startup so the
+    // operator knows to replace them with bcrypt hashes (minica --gen-password).
+    for user in &config.auth.users {
+        if !auth::looks_like_bcrypt(&user.password) {
+            tracing::warn!(
+                username = %user.username,
+                "bootstrap password stored in plaintext; replace it with a bcrypt hash via `minica --gen-password`"
+            );
+        }
+    }
 
     tracing::info!(
         log_file = %config.logging.file.display(),

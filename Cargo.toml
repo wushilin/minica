@@ -1,6 +1,6 @@
 [package]
 name = "minica"
-version = "0.1.0"
+version = "1.0.5"
 edition = "2024"
 
 [dependencies]
@@ -8,6 +8,7 @@ anyhow = "1.0"
 axum = { version = "0.8", features = ["macros", "multipart"] }
 base64 = "0.22"
 bcrypt = "0.19.2"
+clap = { version = "4.5", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 cookie = "0.18"
 flate2 = "1.1"

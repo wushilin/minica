@@ -1,4 +1,5 @@
 runtime/
 target/
 logs/
-cli/mca
+cli/mcacli
+dist/

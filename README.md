@@ -95,25 +95,33 @@ backup-able state, real revocation, hashed credentials, and safe concurrency.
 
 ## Getting started
 
-1. **Configure.** Edit [`config.yaml`](./config.yaml) — server bind/port and
-   `base_path`, `public_base_url` (used for CRL distribution URLs and links
-   behind a proxy), the `openssl` path, and the bootstrap `admin` user. The
-   config-file password is **plaintext by design** (it's only the bootstrap
-   admin; all other users are bcrypt-hashed in the DB).
+1. **Configure.** Generate a starter config from the bundled sample, then edit it:
+   ```sh
+   minica --gen-config        # writes ./config.yaml (won't overwrite an existing one)
+   ```
+   Set the server bind/port and `base_path`, `public_base_url` (used for CRL
+   distribution URLs and links behind a proxy), the `openssl` path, and the
+   bootstrap `admin` user. The bootstrap password may be a **bcrypt hash**
+   (recommended — generate one with `minica --gen-password`) or plaintext; a
+   plaintext bootstrap password still works but logs a warning at startup. All
+   other users are bcrypt-hashed in the DB.
 
 2. **Run the service.**
    ```sh
-   cargo run --release -- -c config.yaml
+   cargo run --release -- --start -c config.yaml
+   # or, from a built binary:
+   ./minica --start -c config.yaml
    ```
    The UI and API are served under `base_path` (default `/minica`); Swagger is at
-   `/minica/swagger`.
+   `/minica/swagger`. Run `minica --help` to see all actions
+   (`--start`, `--gen-config`, `--gen-password`, `--verify-password`).
 
 3. **Issue certs from the CLI.** See [cli/README.md](./cli/README.md):
    ```sh
-   cd cli && go build -o minica .
+   cd cli && go build -o mcacli .
    MINICA_URL=http://127.0.0.1:9988/minica MINICA_USER=admin \
    MINICA_PASSWORD=adminpass MINICA_CA_ID=<ca-id> \
-   ./minica cert --cn test1.example.com --hostnames a.com,b.com,10.0.0.5
+   ./mcacli cert --cn test1.example.com --hostnames a.com,b.com,10.0.0.5
    ```
 
 > **Note:** Like the original, this is intended for development and internal/test

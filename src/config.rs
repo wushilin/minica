@@ -1,6 +1,10 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::{env, fs, net::SocketAddr, path::PathBuf};
+use std::{
+    fs,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -119,20 +123,29 @@ impl Role {
     }
 }
 
-impl Config {
-    pub fn load() -> Result<Self> {
-        let mut args = env::args().skip(1);
-        let mut path = PathBuf::from("config.yaml");
-        while let Some(arg) = args.next() {
-            if arg == "-c" || arg == "--config" {
-                path = args
-                    .next()
-                    .map(PathBuf::from)
-                    .context("-c requires a config path")?;
-            }
-        }
+/// The sample configuration, bundled into the binary at compile time. Exposed
+/// to users via the `--gen-config` flag.
+pub const SAMPLE_CONFIG: &str = include_str!("../config.yaml.example");
 
-        let text = fs::read_to_string(&path)
+impl Config {
+    /// Write the bundled sample config to `config.yaml` in the current
+    /// directory, refusing to clobber an existing file. Backs the
+    /// `--gen-config` flag.
+    pub fn gen_config() -> Result<PathBuf> {
+        let path = PathBuf::from("config.yaml");
+        if path.exists() {
+            anyhow::bail!(
+                "{} already exists; remove it first or write the sample elsewhere",
+                path.display()
+            );
+        }
+        fs::write(&path, SAMPLE_CONFIG)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        Ok(path)
+    }
+
+    pub fn load(path: &Path) -> Result<Self> {
+        let text = fs::read_to_string(path)
             .with_context(|| format!("failed to read config file {}", path.display()))?;
         let mut config: Config = serde_yaml::from_str(&text)
             .with_context(|| format!("failed to parse {}", path.display()))?;
