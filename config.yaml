@@ -1,0 +1,39 @@
+server:
+  host: 0.0.0.0
+  port: 9988
+  base_path: /minica
+
+public_base_url: http://127.0.0.1:9988/minica
+
+crl:
+  enabled: true
+  next_update_days: 30
+
+runtime:
+  folder: ./runtime
+  db_folder: null
+
+logging:
+  file: ./logs/minica.log
+  rotate_size_bytes: 10485760
+  max_backups: 10
+  compress: true
+
+openssl:
+  path: /usr/bin/openssl
+  # Max wall-clock time for a single openssl command. On expiry the process is
+  # terminated (SIGTERM, then SIGKILL) and reaped so nothing escapes. Default 15.
+  timeout_seconds: 15
+  working_root: ./runtime/openssl-work
+  keep_failed_workdirs: false
+  # Sweep interval for temporary working directories that were abandoned (e.g.
+  # left behind by a crash); successful operations clean up their own workdir.
+  reap_after_hours: 24
+
+# Only the bootstrap admin is configured here. All other accounts (including
+# viewers) are managed in the database via the Admin Console at /minica/admin.
+auth:
+  users:
+    - username: admin
+      password: adminpass
+      role: admin

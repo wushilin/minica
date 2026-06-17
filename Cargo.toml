@@ -1,0 +1,29 @@
+[package]
+name = "minica"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+axum = { version = "0.8", features = ["macros", "multipart"] }
+base64 = "0.22"
+bcrypt = "0.19.2"
+chrono = { version = "0.4", features = ["serde"] }
+cookie = "0.18"
+flate2 = "1.1"
+hex = "0.4"
+libc = "0.2.186"
+rand = "0.9"
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+sha2 = "0.10"
+thiserror = "2.0"
+tokio = { version = "1.43", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }
+zip = "2.2"
