@@ -180,14 +180,24 @@ async fn start_server(config: Config) -> Result<()> {
         )
         .init();
 
-    // Bootstrap credentials may still be plaintext; warn once at startup so the
-    // operator knows to replace them with bcrypt hashes (minica --gen-password).
-    for user in config.auth.users.as_deref().unwrap_or_default() {
-        if !auth::looks_like_bcrypt(&user.password) {
-            tracing::warn!(
-                username = %user.username,
-                "bootstrap password stored in plaintext; replace it with a bcrypt hash via `minica --gen-password`"
+    // Header auth takes precedence over basic auth when both are configured.
+    if config.auth.headers.is_some() {
+        if config.auth.users.is_some() {
+            tracing::info!(
+                "reverse-proxy header auth is enabled; auth.users entries are ignored"
             );
+        }
+    } else {
+        // Bootstrap credentials may still be plaintext; warn once at startup so
+        // the operator knows to replace them with bcrypt hashes
+        // (minica --gen-password).
+        for user in config.auth.users.as_deref().unwrap_or_default() {
+            if !auth::looks_like_bcrypt(&user.password) {
+                tracing::warn!(
+                    username = %user.username,
+                    "bootstrap password stored in plaintext; replace it with a bcrypt hash via `minica --gen-password`"
+                );
+            }
         }
     }
 

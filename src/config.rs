@@ -101,22 +101,20 @@ fn default_viewer_group() -> String {
 }
 
 impl AuthConfig {
-    /// Exactly one of `users` (basic auth) or `headers` (reverse-proxy header
-    /// auth) selects the authentication mode. Also pre-parses
-    /// `trusted_remotes` so bad entries fail at startup, not per-request.
+    /// `headers` (reverse-proxy header auth) takes precedence when defined;
+    /// otherwise `users` (basic auth) applies. At least one must be present.
+    /// Also pre-parses `trusted_remotes` so bad entries fail at startup, not
+    /// per-request.
     pub fn validate(&mut self) -> Result<()> {
         match (self.users.is_some(), self.headers.as_mut()) {
-            (true, Some(_)) => {
-                anyhow::bail!("auth: configure either 'users' or 'headers', not both")
-            }
-            (false, None) => anyhow::bail!(
-                "auth: configure one of 'users' (basic auth) or 'headers' (reverse-proxy header auth)"
-            ),
-            (false, Some(headers)) => {
+            (_, Some(headers)) => {
                 headers.trusted_networks = parse_trusted_remotes(&headers.trusted_remotes)?;
                 Ok(())
             }
             (true, None) => Ok(()),
+            (false, None) => anyhow::bail!(
+                "auth: configure one of 'users' (basic auth) or 'headers' (reverse-proxy header auth)"
+            ),
         }
     }
 }
@@ -295,10 +293,17 @@ mod auth_config_tests {
     }
 
     #[test]
-    fn both_users_and_headers_rejected() {
-        let mut auth = parse("users: []\nheaders: {}\n");
-        let err = auth.validate().unwrap_err().to_string();
-        assert!(err.contains("not both"), "{err}");
+    fn both_present_prefers_headers() {
+        let mut auth = parse(
+            "users:\n  - username: a\n    password: p\n    role: admin\nheaders:\n  trusted_remotes:\n    - 10.0.0.0/8\n",
+        );
+        auth.validate().expect("valid: headers takes precedence");
+        // headers stays active (auth.rs dispatches on it) and its networks are parsed
+        assert_eq!(
+            auth.headers.expect("headers config").trusted_networks.len(),
+            1
+        );
+        assert!(auth.users.is_some(), "users kept but ignored at runtime");
     }
 
     #[test]
