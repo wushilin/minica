@@ -268,6 +268,24 @@ mod tests {
 
     impl TestEnv {
         fn new() -> Self {
+            Self::with_auth(config::AuthConfig {
+                users: Some(vec![
+                    config::UserConfig {
+                        username: "admin".to_string(),
+                        password: "adminpass".to_string(),
+                        role: config::Role::Admin,
+                    },
+                    config::UserConfig {
+                        username: "viewer".to_string(),
+                        password: "viewerpass".to_string(),
+                        role: config::Role::Viewer,
+                    },
+                ]),
+                headers: None,
+            })
+        }
+
+        fn with_auth(auth: config::AuthConfig) -> Self {
             let root = std::env::temp_dir().join(format!("minica-rust-test-{}", Uuid::new_v4()));
             fs::create_dir_all(root.join("runtime")).expect("create test runtime");
             fs::create_dir_all(root.join("openssl-work")).expect("create openssl work root");
@@ -291,21 +309,7 @@ mod tests {
                     keep_failed_workdirs: false,
                     reap_after_hours: 24,
                 },
-                auth: config::AuthConfig {
-                    users: Some(vec![
-                        config::UserConfig {
-                            username: "admin".to_string(),
-                            password: "adminpass".to_string(),
-                            role: config::Role::Admin,
-                        },
-                        config::UserConfig {
-                            username: "viewer".to_string(),
-                            password: "viewerpass".to_string(),
-                            role: config::Role::Viewer,
-                        },
-                    ]),
-                    headers: None,
-                },
+                auth,
                 logging: config::LoggingConfig::default(),
             };
 
@@ -351,6 +355,25 @@ mod tests {
                 .app
                 .clone()
                 .oneshot(builder.body(body.into()).expect("build request"))
+                .await
+                .expect("route request");
+            TestResponse::from_response(response).await
+        }
+
+        async fn request_with_headers(
+            &self,
+            method: &str,
+            uri: &str,
+            extra: &[(&str, &str)],
+        ) -> TestResponse {
+            let mut builder = Request::builder().method(method).uri(uri);
+            for (name, value) in extra {
+                builder = builder.header(*name, *value);
+            }
+            let response = self
+                .app
+                .clone()
+                .oneshot(builder.body(Body::empty()).expect("build request"))
                 .await
                 .expect("route request");
             TestResponse::from_response(response).await
@@ -469,6 +492,109 @@ mod tests {
         fn text(&self) -> String {
             String::from_utf8_lossy(&self.body).to_string()
         }
+    }
+
+    fn header_auth(trusted_remotes: &[&str]) -> config::AuthConfig {
+        let mut auth = config::AuthConfig {
+            users: None,
+            headers: Some(config::HeaderAuthConfig {
+                username: "Remote-User".to_string(),
+                group: "Remote-Groups".to_string(),
+                admin_group: "admin".to_string(),
+                viewer_group: "user".to_string(),
+                trusted_remotes: trusted_remotes.iter().map(ToString::to_string).collect(),
+                trusted_networks: Vec::new(),
+            }),
+        };
+        auth.validate().expect("valid header auth config");
+        auth
+    }
+
+    #[tokio::test]
+    async fn header_auth_viewer_group_can_list_cas() {
+        let env = TestEnv::with_auth(header_auth(&[]));
+        let response = env
+            .request_with_headers(
+                "GET",
+                "/minica/api/cas",
+                &[("Remote-User", "alice"), ("Remote-Groups", "user")],
+            )
+            .await;
+        response.assert_status(StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn header_auth_semicolon_groups_and_admin_role() {
+        let env = TestEnv::with_auth(header_auth(&[]));
+        // viewer-only groups cannot perform admin actions
+        let forbidden = env
+            .request_with_headers(
+                "DELETE",
+                "/minica/api/cas/nonexistent",
+                &[("Remote-User", "alice"), ("Remote-Groups", "ops;user")],
+            )
+            .await;
+        forbidden.assert_status(StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn header_auth_missing_username_is_401_without_basic_challenge() {
+        let env = TestEnv::with_auth(header_auth(&[]));
+        let response = env
+            .request_with_headers("GET", "/minica/api/cas", &[])
+            .await;
+        response.assert_status(StatusCode::UNAUTHORIZED);
+        assert!(
+            !response.headers.contains_key(header::WWW_AUTHENTICATE),
+            "header mode must not trigger the browser Basic-auth prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn header_auth_untrusted_peer_is_403_naming_the_user() {
+        let env = TestEnv::with_auth(header_auth(&["10.0.0.0/8"]));
+        let response = env
+            .request_with_headers(
+                "GET",
+                "/minica/api/cas",
+                &[
+                    ("Remote-User", "alice"),
+                    ("Remote-Groups", "user"),
+                    (auth::PEER_IP_HEADER, "192.168.1.5"),
+                ],
+            )
+            .await;
+        response.assert_status(StatusCode::FORBIDDEN);
+        let body = String::from_utf8_lossy(&response.body);
+        assert!(body.contains("alice"), "{body}");
+        assert!(body.contains("untrusted remote"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn header_auth_trusted_peer_is_accepted() {
+        let env = TestEnv::with_auth(header_auth(&["10.0.0.0/8"]));
+        let response = env
+            .request_with_headers(
+                "GET",
+                "/minica/api/cas",
+                &[
+                    ("Remote-User", "alice"),
+                    ("Remote-Groups", "user"),
+                    (auth::PEER_IP_HEADER, "10.1.2.3"),
+                ],
+            )
+            .await;
+        response.assert_status(StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn basic_auth_401_still_carries_challenge() {
+        let env = TestEnv::new();
+        let response = env
+            .request_with_headers("GET", "/minica/api/cas", &[])
+            .await;
+        response.assert_status(StatusCode::UNAUTHORIZED);
+        assert!(response.headers.contains_key(header::WWW_AUTHENTICATE));
     }
 
     fn basic_auth(username: &str, password: &str) -> String {
