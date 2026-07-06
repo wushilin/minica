@@ -1,0 +1,61 @@
+# Docker-friendly MiniCA config template.
+#
+# Every value is a {{ENV:VAR:default}} token: it resolves to the environment
+# variable when set, otherwise to the default after the second colon. The
+# defaults reproduce config.yaml.example, so running with no environment
+# variables behaves exactly like the stock config. Resolution happens after
+# the file is read and before YAML parsing, so values may be any YAML —
+# including lists (see MINICA_TRUSTED_REMOTES).
+#
+#   docker run -e MINICA_PORT=8443 -e MINICA_ADMIN_PASSWORD='$2b$12$...' ...
+#   minica --start -c config.yaml.docker
+
+server:
+  host: {{ENV:MINICA_HOST:0.0.0.0}}
+  port: {{ENV:MINICA_PORT:9988}}
+  base_path: {{ENV:MINICA_BASE_PATH:/minica}}
+
+public_base_url: {{ENV:MINICA_PUBLIC_BASE_URL:http://127.0.0.1:9988/minica}}
+
+crl:
+  enabled: {{ENV:MINICA_CRL_ENABLED:true}}
+  next_update_days: {{ENV:MINICA_CRL_NEXT_UPDATE_DAYS:30}}
+
+runtime:
+  folder: {{ENV:MINICA_RUNTIME_FOLDER:./runtime}}
+  db_folder: {{ENV:MINICA_DB_FOLDER:null}}
+
+logging:
+  file: {{ENV:MINICA_LOG_FILE:./logs/minica.log}}
+  rotate_size_bytes: {{ENV:MINICA_LOG_ROTATE_SIZE_BYTES:10485760}}
+  max_backups: {{ENV:MINICA_LOG_MAX_BACKUPS:10}}
+  compress: {{ENV:MINICA_LOG_COMPRESS:true}}
+
+openssl:
+  path: {{ENV:MINICA_OPENSSL_PATH:/usr/bin/openssl}}
+  timeout_seconds: {{ENV:MINICA_OPENSSL_TIMEOUT_SECONDS:15}}
+  working_root: {{ENV:MINICA_OPENSSL_WORKING_ROOT:./runtime/openssl-work}}
+  keep_failed_workdirs: {{ENV:MINICA_OPENSSL_KEEP_FAILED_WORKDIRS:false}}
+  reap_after_hours: {{ENV:MINICA_OPENSSL_REAP_AFTER_HOURS:24}}
+
+# Both auth sections coexist; when both are enabled, header auth wins.
+auth:
+  users:
+    enabled: {{ENV:MINICA_BASIC_AUTH_ENABLE:true}}
+    list:
+      - username: {{ENV:MINICA_ADMIN_USER:admin}}
+        password: {{ENV:MINICA_ADMIN_PASSWORD:adminpass}}
+        role: {{ENV:MINICA_ADMIN_ROLE:admin}}
+
+  # Reverse-proxy header auth. Defaults to disabled: enabling it makes MiniCA
+  # trust identity headers, so only turn it on behind an authenticating proxy
+  # (and preferably pin the proxy with MINICA_TRUSTED_REMOTES).
+  headers:
+    enabled: {{ENV:MINICA_HEADER_AUTH_ENABLE:false}}
+    username: {{ENV:MINICA_HEADER_USERNAME:Remote-User}}
+    group: {{ENV:MINICA_HEADER_GROUP:Remote-Groups}}
+    admin_group: {{ENV:MINICA_HEADER_ADMIN_GROUP:admin}}
+    viewer_group: {{ENV:MINICA_HEADER_VIEWER_GROUP:user}}
+    # YAML list of IPs/CIDRs, e.g. MINICA_TRUSTED_REMOTES='["127.0.0.1", "10.0.0.0/8"]'
+    # Empty list = trust every remote.
+    trusted_remotes: {{ENV:MINICA_TRUSTED_REMOTES:[]}}

@@ -219,6 +219,31 @@ Response mapping:
 - Header-mode 401 carries no `WWW-Authenticate`; basic-mode 401 still does.
 - "untrusted remote" / "no authorized group" messages → 403.
 
+## Amendments (2026-07-06, post-implementation)
+
+User-directed changes that supersede parts of the design above:
+
+1. **No more `users` XOR `headers`.** Both sections may coexist. Each has an
+   `enabled` toggle (default `true` when the section is present). Enabled
+   header auth wins over enabled basic auth; at least one mode must be
+   enabled or startup fails. `users:` accepts the legacy bare account list
+   (implies `enabled: true`) or the object form `{ enabled, list }`.
+2. **`{{ENV:VAR:default}}` tokens.** `Config::load` resolves these against
+   environment variables on the raw text after reading the file and before
+   YAML parsing (unquoted tokens are not valid YAML, so resolution must
+   precede parsing). No default + unset variable = startup error naming the
+   variable. Defaults may be empty or contain colons; they may expand to any
+   YAML fragment (e.g. a flow list for `trusted_remotes`).
+3. **`config.yaml.docker`.** A fully parameterised template in which every
+   value is a `MINICA_*` token whose default reproduces
+   `config.yaml.example`. `MINICA_HEADER_AUTH_ENABLE` defaults to `false`
+   there so a container without env configuration does not trust identity
+   headers.
+4. **LibreSSL** (separate request): `x509 -ext subjectAltName` was the single
+   LibreSSL-incompatible invocation; `inspect_cert_sans` now falls back to
+   parsing `x509 -noout -text` output when `-ext` fails, and the README
+   documents pointing `openssl.path` at a LibreSSL binary.
+
 ## Risks
 
 - String-based status mapping means future error messages containing

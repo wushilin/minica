@@ -121,6 +121,38 @@ backup-able state, real revocation, hashed credentials, and safe concurrency.
    ./mcacli cert --cn test1.example.com --hostnames a.com,b.com,10.0.0.5
    ```
 
+### Environment variables in the config (Docker)
+
+Any value in the config file may be written as `{{ENV:VAR:default}}`: it
+resolves to the environment variable `VAR` when set, otherwise to the default
+after the second colon (`{{ENV:VAR}}` with no default fails startup when the
+variable is unset). Resolution happens after the file is read and before YAML
+parsing, so tokens don't need quoting and may expand to any YAML — even lists:
+
+```yaml
+auth:
+  users:
+    enabled: {{ENV:MINICA_BASIC_AUTH_ENABLE:true}}
+    list:
+      - username: {{ENV:MINICA_ADMIN_USER:admin}}
+        password: {{ENV:MINICA_ADMIN_PASSWORD:adminpass}}
+        role: admin
+  headers:
+    enabled: {{ENV:MINICA_HEADER_AUTH_ENABLE:false}}
+    trusted_remotes: {{ENV:MINICA_TRUSTED_REMOTES:[]}}
+```
+
+[config.yaml.docker](./config.yaml.docker) is a fully parameterised template —
+every setting has a `MINICA_*` variable whose default matches
+`config.yaml.example`, so it runs unmodified and each value can be overridden
+per container:
+
+```sh
+docker run -e MINICA_PORT=8443 -e MINICA_ADMIN_PASSWORD='$2b$12$...' \
+  -e MINICA_HEADER_AUTH_ENABLE=true -e MINICA_TRUSTED_REMOTES='["10.0.0.7"]' \
+  ... minica --start -c config.yaml.docker
+```
+
 ### Using LibreSSL instead of OpenSSL
 
 MiniCA shells out to the `openssl` binary, and every subcommand it uses
@@ -152,12 +184,18 @@ Caveats:
 
 Instead of Basic auth, MiniCA can trust an authenticating reverse proxy
 (Authelia, oauth2-proxy, Traefik forward-auth, ...) to identify users. In this
-mode no local account exists at all — configure `auth.headers` **instead of**
-`auth.users` (exactly one of the two must be present):
+mode no local account is needed at all. Both `auth.users` and `auth.headers`
+may be configured side by side, each with an `enabled` toggle (default true
+when the section is present); **when both are enabled, header auth wins** and
+the `users` accounts are ignored. At least one mode must be enabled.
 
 ```yaml
 auth:
+  users:
+    enabled: false               # or omit the whole section
+    list: []
   headers:
+    enabled: true
     username: Remote-User        # header carrying the authenticated user id
     group: Remote-Groups         # header carrying the group list
     admin_group: admin           # group that grants the admin role

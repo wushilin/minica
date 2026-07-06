@@ -30,14 +30,21 @@ openssl:
   # left behind by a crash); successful operations clean up their own workdir.
   reap_after_hours: 24
 
-# Authentication: configure EXACTLY ONE of `users:` (Basic auth) or `headers:`
-# (reverse-proxy header auth).
+# Authentication: `users:` (Basic auth) and `headers:` (reverse-proxy header
+# auth) can both be configured, each with an `enabled` toggle (default true
+# when the section is present). When both are enabled, header auth wins.
+# At least one mode must be enabled.
+#
+# Any value in this file may also be written as {{ENV:VAR:default}} to read it
+# from an environment variable with a fallback — see config.yaml.docker for a
+# fully parameterised template.
 #
 # Basic auth — only the bootstrap admin is configured here. All other accounts
 # (including viewers) are managed in the database via the Admin Console at
 # /minica/admin. The password may be a bcrypt hash (recommended:
 # `minica --gen-password`) or plaintext. Plaintext still works but logs a
-# warning at startup.
+# warning at startup. (`users:` may be the bare account list, as below, or an
+# object with `enabled:` and `list:` keys.)
 auth:
   users:
     - username: admin
@@ -49,8 +56,9 @@ auth:
   # headers. No local account is needed; users are managed entirely by the
   # proxy/IdP and there is no login prompt. Only enable this when MiniCA is
   # reachable exclusively through that proxy, or pin the proxy's address with
-  # trusted_remotes. To use it, REPLACE the `users:` block above with:
+  # trusted_remotes. When enabled it takes precedence over `users:` above.
   #headers:
+  #  enabled: true
   #  username: Remote-User        # header carrying the authenticated user id
   #  group: Remote-Groups         # header with the group list; accepts
   #                               # "a,b", "a;b", or a JSON array ["a","b"]
