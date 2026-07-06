@@ -229,6 +229,7 @@ async fn start_server(config: Config) -> Result<()> {
             get(move || async move { axum::response::Redirect::to(&landing_index) }),
         )
         .nest(&config.server.base_path, web::router(state))
+        .layer(axum::middleware::from_fn(web::stamp_peer_ip))
         .layer(TraceLayer::new_for_http());
     let addr = config.addr()?;
     tracing::info!(
@@ -236,7 +237,11 @@ async fn start_server(config: Config) -> Result<()> {
         config.server.base_path
     );
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 

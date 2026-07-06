@@ -9,14 +9,31 @@ use crate::{
 use anyhow::{Result, anyhow, bail};
 use axum::{
     Form, Json, Router,
-    extract::{Multipart, Path, Query, State, rejection::JsonRejection},
+    extract::{ConnectInfo, Multipart, Path, Query, Request, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
+    middleware::Next,
     response::{Html, IntoResponse, Redirect, Response},
     routing::{any, get, post, put},
 };
 use base64::Engine;
 use serde::Deserialize;
 use std::sync::Arc;
+
+/// Stamps the TCP peer IP into a synthetic request header so auth code that
+/// only sees a `HeaderMap` can enforce `trusted_remotes`. Always overwrites
+/// any inbound value — clients cannot spoof it. Runs in both auth modes; only
+/// header mode reads it.
+pub async fn stamp_peer_ip(
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let ip = peer.ip().to_canonical().to_string();
+    let value =
+        HeaderValue::from_str(&ip).unwrap_or_else(|_| HeaderValue::from_static("unknown"));
+    request.headers_mut().insert(auth::PEER_IP_HEADER, value);
+    next.run(request).await
+}
 
 pub fn router(state: Arc<AppState>) -> Router {
     let api = Router::new()
@@ -2740,3 +2757,45 @@ document.querySelectorAll('.flash-panel').forEach((panel) => {
   setTimeout(dismiss, 8000);
 });
 "#;
+
+#[cfg(test)]
+mod peer_ip_tests {
+    use super::*;
+    use axum::{
+        body::{Body, to_bytes},
+        extract::connect_info::MockConnectInfo,
+        middleware,
+        routing::get,
+    };
+    use std::net::SocketAddr;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn middleware_stamps_peer_ip_and_overwrites_spoofed_value() {
+        async fn echo_peer(headers: HeaderMap) -> String {
+            headers
+                .get(auth::PEER_IP_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("missing")
+                .to_string()
+        }
+
+        let app = Router::new()
+            .route("/peer", get(echo_peer))
+            .layer(middleware::from_fn(stamp_peer_ip))
+            .layer(MockConnectInfo(SocketAddr::from(([10, 1, 2, 3], 5555))));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/peer")
+                    .header(auth::PEER_IP_HEADER, "1.2.3.4")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("route request");
+        let body = to_bytes(response.into_body(), 1024).await.expect("read body");
+        assert_eq!(&body[..], b"10.1.2.3");
+    }
+}
