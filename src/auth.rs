@@ -1,4 +1,7 @@
-use crate::{AppState, config::Role};
+use crate::{
+    AppState,
+    config::{HeaderAuthConfig, Role},
+};
 use anyhow::{Result, bail};
 use axum::http::{HeaderMap, Method};
 use base64::Engine;
@@ -48,6 +51,43 @@ pub fn authenticate(headers: &HeaderMap, state: &AppState) -> Result<User> {
     }
 
     bail!("invalid username or password")
+}
+
+/// Parse a groups header value. Accepts a JSON array (`["a","b"]`) or a list
+/// split on `,` and `;`. Items are trimmed; empties dropped.
+fn parse_groups(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('[') {
+        if let Ok(items) = serde_json::from_str::<Vec<String>>(trimmed) {
+            return items
+                .iter()
+                .map(|item| item.trim().to_string())
+                .filter(|item| !item.is_empty())
+                .collect();
+        }
+    }
+    trimmed
+        .split([',', ';'])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// Admin group membership wins over viewer; no membership means no access.
+/// Comparison is trimmed + ASCII case-insensitive.
+fn role_for_groups(groups: &[String], config: &HeaderAuthConfig) -> Option<Role> {
+    let member_of = |name: &str| {
+        let name = name.trim();
+        groups.iter().any(|group| group.eq_ignore_ascii_case(name))
+    };
+    if member_of(&config.admin_group) {
+        Some(Role::Admin)
+    } else if member_of(&config.viewer_group) {
+        Some(Role::Viewer)
+    } else {
+        None
+    }
 }
 
 /// A stored credential is treated as a bcrypt hash when it carries a recognised
@@ -104,6 +144,69 @@ mod password_tests {
         assert!(looks_like_bcrypt(&hash));
         assert!(verify_config_password(&hash, "adminpass"));
         assert!(!verify_config_password(&hash, "wrong"));
+    }
+}
+
+#[cfg(test)]
+mod group_parsing_tests {
+    use super::*;
+    use crate::config::HeaderAuthConfig;
+
+    fn cfg() -> HeaderAuthConfig {
+        HeaderAuthConfig {
+            username: "Remote-User".to_string(),
+            group: "Remote-Groups".to_string(),
+            admin_group: "admin".to_string(),
+            viewer_group: "user".to_string(),
+            trusted_remotes: Vec::new(),
+            trusted_networks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn splits_on_comma_and_semicolon() {
+        assert_eq!(parse_groups("a,b"), vec!["a", "b"]);
+        assert_eq!(parse_groups("a;b"), vec!["a", "b"]);
+        assert_eq!(parse_groups("a, b; c"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn parses_json_array() {
+        assert_eq!(parse_groups(r#"["a","b"]"#), vec!["a", "b"]);
+        assert_eq!(parse_groups(r#"  [" a ", "b"]  "#), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn malformed_json_falls_back_to_delimiters() {
+        assert_eq!(parse_groups(r#"["a", "b"#), vec![r#"["a""#, r#""b"#]);
+    }
+
+    #[test]
+    fn drops_empty_items() {
+        assert!(parse_groups("").is_empty());
+        assert!(parse_groups(" ; , ").is_empty());
+        assert_eq!(parse_groups("a,,b;"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn admin_group_wins_over_viewer() {
+        let groups = vec!["user".to_string(), "admin".to_string()];
+        assert_eq!(role_for_groups(&groups, &cfg()), Some(Role::Admin));
+    }
+
+    #[test]
+    fn group_match_is_case_insensitive() {
+        let groups = vec!["ADMIN".to_string()];
+        assert_eq!(role_for_groups(&groups, &cfg()), Some(Role::Admin));
+        let groups = vec!["User".to_string()];
+        assert_eq!(role_for_groups(&groups, &cfg()), Some(Role::Viewer));
+    }
+
+    #[test]
+    fn unmatched_groups_map_to_no_role() {
+        let groups = vec!["ops".to_string(), "dev".to_string()];
+        assert_eq!(role_for_groups(&groups, &cfg()), None);
+        assert_eq!(role_for_groups(&[], &cfg()), None);
     }
 }
 
