@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use ipnet::IpNet;
 use serde::Deserialize;
 use std::{
     fs,
@@ -51,7 +52,88 @@ fn default_timeout_seconds() -> u64 {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct AuthConfig {
-    pub users: Vec<UserConfig>,
+    /// Basic-auth bootstrap accounts. Present (even empty) = basic-auth mode.
+    #[serde(default)]
+    pub users: Option<Vec<UserConfig>>,
+    /// Reverse-proxy header auth. Present = header mode; mutually exclusive
+    /// with `users`.
+    #[serde(default)]
+    pub headers: Option<HeaderAuthConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct HeaderAuthConfig {
+    /// Header carrying the authenticated user id.
+    #[serde(default = "default_username_header")]
+    pub username: String,
+    /// Header carrying the group list ("a,b", "a;b", or JSON ["a","b"]).
+    #[serde(default = "default_group_header")]
+    pub group: String,
+    /// Group name that grants the admin role.
+    #[serde(default = "default_admin_group")]
+    pub admin_group: String,
+    /// Group name that grants the viewer role.
+    #[serde(default = "default_viewer_group")]
+    pub viewer_group: String,
+    /// Peers (bare IPs or CIDRs) allowed to assert identity headers;
+    /// empty = trust every remote.
+    #[serde(default)]
+    pub trusted_remotes: Vec<String>,
+    /// Parsed form of `trusted_remotes`, populated by `AuthConfig::validate`.
+    #[serde(skip)]
+    pub trusted_networks: Vec<IpNet>,
+}
+
+fn default_username_header() -> String {
+    "Remote-User".to_string()
+}
+
+fn default_group_header() -> String {
+    "Remote-Groups".to_string()
+}
+
+fn default_admin_group() -> String {
+    "admin".to_string()
+}
+
+fn default_viewer_group() -> String {
+    "user".to_string()
+}
+
+impl AuthConfig {
+    /// Exactly one of `users` (basic auth) or `headers` (reverse-proxy header
+    /// auth) selects the authentication mode. Also pre-parses
+    /// `trusted_remotes` so bad entries fail at startup, not per-request.
+    pub fn validate(&mut self) -> Result<()> {
+        match (self.users.is_some(), self.headers.as_mut()) {
+            (true, Some(_)) => {
+                anyhow::bail!("auth: configure either 'users' or 'headers', not both")
+            }
+            (false, None) => anyhow::bail!(
+                "auth: configure one of 'users' (basic auth) or 'headers' (reverse-proxy header auth)"
+            ),
+            (false, Some(headers)) => {
+                headers.trusted_networks = parse_trusted_remotes(&headers.trusted_remotes)?;
+                Ok(())
+            }
+            (true, None) => Ok(()),
+        }
+    }
+}
+
+fn parse_trusted_remotes(entries: &[String]) -> Result<Vec<IpNet>> {
+    entries
+        .iter()
+        .map(|entry| {
+            let trimmed = entry.trim();
+            trimmed
+                .parse::<IpNet>()
+                .or_else(|_| trimmed.parse::<std::net::IpAddr>().map(IpNet::from))
+                .map_err(|_| {
+                    anyhow::anyhow!("auth.headers.trusted_remotes: invalid IP or CIDR: {entry}")
+                })
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -149,6 +231,10 @@ impl Config {
             .with_context(|| format!("failed to read config file {}", path.display()))?;
         let mut config: Config = serde_yaml::from_str(&text)
             .with_context(|| format!("failed to parse {}", path.display()))?;
+        config
+            .auth
+            .validate()
+            .with_context(|| format!("invalid auth config in {}", path.display()))?;
         if !config.server.base_path.starts_with('/') {
             config.server.base_path = format!("/{}", config.server.base_path);
         }
@@ -178,5 +264,75 @@ impl Config {
             .clone()
             .unwrap_or_else(|| self.runtime.folder.clone())
             .join("db.sqlite")
+    }
+}
+
+#[cfg(test)]
+mod auth_config_tests {
+    use super::*;
+
+    fn parse(yaml: &str) -> AuthConfig {
+        serde_yaml::from_str(yaml).expect("parse auth config")
+    }
+
+    #[test]
+    fn users_only_is_valid_basic_mode() {
+        let mut auth = parse("users:\n  - username: a\n    password: p\n    role: admin\n");
+        auth.validate().expect("valid");
+        assert!(auth.headers.is_none());
+    }
+
+    #[test]
+    fn headers_only_uses_defaults() {
+        let mut auth = parse("headers: {}\n");
+        auth.validate().expect("valid");
+        let headers = auth.headers.expect("headers config");
+        assert_eq!(headers.username, "Remote-User");
+        assert_eq!(headers.group, "Remote-Groups");
+        assert_eq!(headers.admin_group, "admin");
+        assert_eq!(headers.viewer_group, "user");
+        assert!(headers.trusted_networks.is_empty());
+    }
+
+    #[test]
+    fn both_users_and_headers_rejected() {
+        let mut auth = parse("users: []\nheaders: {}\n");
+        let err = auth.validate().unwrap_err().to_string();
+        assert!(err.contains("not both"), "{err}");
+    }
+
+    #[test]
+    fn neither_users_nor_headers_rejected() {
+        let mut auth = parse("{}");
+        let err = auth.validate().unwrap_err().to_string();
+        assert!(err.contains("configure one of"), "{err}");
+    }
+
+    #[test]
+    fn empty_users_list_is_valid_basic_mode() {
+        let mut auth = parse("users: []\n");
+        auth.validate().expect("valid: only DB accounts can log in");
+    }
+
+    #[test]
+    fn trusted_remotes_parse_ips_and_cidrs() {
+        let mut auth =
+            parse("headers:\n  trusted_remotes:\n    - 127.0.0.1\n    - 10.0.0.0/8\n    - '::1'\n");
+        auth.validate().expect("valid");
+        let networks = auth.headers.expect("headers config").trusted_networks;
+        assert_eq!(networks.len(), 3);
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().expect("test ip");
+        assert!(networks[0].contains(&ip("127.0.0.1")));
+        assert!(!networks[0].contains(&ip("127.0.0.2")));
+        assert!(networks[1].contains(&ip("10.9.8.7")));
+        assert!(!networks[1].contains(&ip("11.0.0.1")));
+        assert!(networks[2].contains(&ip("::1")));
+    }
+
+    #[test]
+    fn malformed_trusted_remote_is_named_in_error() {
+        let mut auth = parse("headers:\n  trusted_remotes:\n    - 10.0.0.0/33\n");
+        let err = auth.validate().unwrap_err().to_string();
+        assert!(err.contains("10.0.0.0/33"), "{err}");
     }
 }

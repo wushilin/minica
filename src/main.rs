@@ -182,7 +182,7 @@ async fn start_server(config: Config) -> Result<()> {
 
     // Bootstrap credentials may still be plaintext; warn once at startup so the
     // operator knows to replace them with bcrypt hashes (minica --gen-password).
-    for user in &config.auth.users {
+    for user in config.auth.users.as_deref().unwrap_or_default() {
         if !auth::looks_like_bcrypt(&user.password) {
             tracing::warn!(
                 username = %user.username,
@@ -287,7 +287,7 @@ mod tests {
                     reap_after_hours: 24,
                 },
                 auth: config::AuthConfig {
-                    users: vec![
+                    users: Some(vec![
                         config::UserConfig {
                             username: "admin".to_string(),
                             password: "adminpass".to_string(),
@@ -298,7 +298,8 @@ mod tests {
                             password: "viewerpass".to_string(),
                             role: config::Role::Viewer,
                         },
-                    ],
+                    ]),
+                    headers: None,
                 },
                 logging: config::LoggingConfig::default(),
             };

@@ -27,7 +27,7 @@ pub fn authenticate(headers: &HeaderMap, state: &AppState) -> Result<User> {
     // Bootstrap accounts come from the config file. Their stored password may be
     // a bcrypt hash or (legacy) plaintext; these exist so the very first admin
     // can log in and manage DB-backed users.
-    for user in &state.config.auth.users {
+    for user in state.config.auth.users.as_deref().unwrap_or_default() {
         if user.username == username && verify_config_password(&user.password, password) {
             return Ok(User {
                 username: user.username.clone(),
