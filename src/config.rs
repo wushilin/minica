@@ -119,6 +119,49 @@ impl AuthConfig {
     }
 }
 
+/// Resolve `{{ENV:NAME}}` / `{{ENV:NAME:default}}` tokens against environment
+/// variables. Runs on the raw config text after the file is read and before
+/// YAML parsing (unquoted tokens are not valid YAML), so any value in the
+/// file can be injected via the environment — handy for Docker.
+fn resolve_env_tokens(text: &str) -> Result<String> {
+    resolve_env_tokens_with(text, |name| std::env::var(name).ok())
+}
+
+fn resolve_env_tokens_with(
+    text: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<String> {
+    const OPEN: &str = "{{ENV:";
+    const CLOSE: &str = "}}";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        let token = &rest[start..];
+        let Some(end) = token.find(CLOSE) else {
+            anyhow::bail!("unterminated {{{{ENV:...}}}} token");
+        };
+        // NAME or NAME:default — the default may itself contain colons.
+        let inner = &token[OPEN.len()..end];
+        let (name, default) = match inner.split_once(':') {
+            Some((name, default)) => (name, Some(default)),
+            None => (inner, None),
+        };
+        if name.is_empty() {
+            anyhow::bail!("empty variable name in {{{{ENV:...}}}} token");
+        }
+        match lookup(name).or_else(|| default.map(ToString::to_string)) {
+            Some(value) => out.push_str(&value),
+            None => anyhow::bail!(
+                "environment variable {name} is not set and {{{{ENV:{name}}}}} has no default"
+            ),
+        }
+        rest = &token[end + CLOSE.len()..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
 fn parse_trusted_remotes(entries: &[String]) -> Result<Vec<IpNet>> {
     entries
         .iter()
@@ -227,6 +270,8 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = fs::read_to_string(path)
             .with_context(|| format!("failed to read config file {}", path.display()))?;
+        let text = resolve_env_tokens(&text)
+            .with_context(|| format!("failed to resolve {{{{ENV:...}}}} tokens in {}", path.display()))?;
         let mut config: Config = serde_yaml::from_str(&text)
             .with_context(|| format!("failed to parse {}", path.display()))?;
         config
@@ -262,6 +307,86 @@ impl Config {
             .clone()
             .unwrap_or_else(|| self.runtime.folder.clone())
             .join("db.sqlite")
+    }
+}
+
+#[cfg(test)]
+mod env_token_tests {
+    use super::*;
+
+    fn lookup(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.to_string())
+        }
+    }
+
+    #[test]
+    fn set_variable_is_substituted() {
+        let out = resolve_env_tokens_with("user: {{ENV:U:admin}}", lookup(&[("U", "alice")]))
+            .expect("resolves");
+        assert_eq!(out, "user: alice");
+    }
+
+    #[test]
+    fn unset_variable_falls_back_to_default() {
+        let out = resolve_env_tokens_with("user: {{ENV:U:admin}}", lookup(&[])).expect("resolves");
+        assert_eq!(out, "user: admin");
+    }
+
+    #[test]
+    fn default_may_be_empty_or_contain_colons() {
+        let out = resolve_env_tokens_with("x: {{ENV:A:}}", lookup(&[])).expect("resolves");
+        assert_eq!(out, "x: ");
+        let out = resolve_env_tokens_with("url: {{ENV:B:http://h:99/p}}", lookup(&[]))
+            .expect("resolves");
+        assert_eq!(out, "url: http://h:99/p");
+    }
+
+    #[test]
+    fn unset_variable_without_default_is_an_error() {
+        let err = resolve_env_tokens_with("user: {{ENV:MISSING}}", lookup(&[]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("MISSING"), "{err}");
+    }
+
+    #[test]
+    fn multiple_tokens_resolve_independently() {
+        let out = resolve_env_tokens_with(
+            "a: {{ENV:A:1}}\nb: {{ENV:B:2}}\n",
+            lookup(&[("B", "bee")]),
+        )
+        .expect("resolves");
+        assert_eq!(out, "a: 1\nb: bee\n");
+    }
+
+    #[test]
+    fn text_without_tokens_is_unchanged() {
+        let text = "plain: value\ncurly: {not-a-token}\n";
+        assert_eq!(
+            resolve_env_tokens_with(text, lookup(&[])).expect("resolves"),
+            text
+        );
+    }
+
+    #[test]
+    fn unterminated_token_is_an_error() {
+        let err = resolve_env_tokens_with("user: {{ENV:U:admin", lookup(&[]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unterminated"), "{err}");
+    }
+
+    #[test]
+    fn resolved_unquoted_token_yields_parseable_yaml() {
+        let yaml = "users:\n  - username: {{ENV:MINICA_ADMIN_USER:admin}}\n    password: p\n    role: admin\n";
+        let resolved = resolve_env_tokens_with(yaml, lookup(&[])).expect("resolves");
+        let mut auth: AuthConfig = serde_yaml::from_str(&resolved).expect("parses");
+        auth.validate().expect("valid");
+        assert_eq!(auth.users.expect("users")[0].username, "admin");
     }
 }
 
