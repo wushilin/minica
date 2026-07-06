@@ -86,9 +86,6 @@ backup-able state, real revocation, hashed credentials, and safe concurrency.
 - **No JKS / Java truststore output.** Dropping the JDK dependency also drops
   `keytool`-produced JKS keystores and truststores; downloads are PEM and
   PKCS#12. If your toolchain needs JKS, convert from the PKCS#12 bundle.
-- **No trusted-header (SSO/IAM) auth mode** yet. Authentication is HTTP Basic
-  (config bootstrap admin + bcrypt DB users). Put it behind a reverse proxy if
-  you need SSO.
 - **CRLs are not auto-refreshed on a timer.** A CRL is regenerated on
   create/import/revoke, so a quiet CA can serve a CRL past its `nextUpdate` until
   the next change.
@@ -123,6 +120,38 @@ backup-able state, real revocation, hashed credentials, and safe concurrency.
    MINICA_PASSWORD=adminpass MINICA_CA_ID=<ca-id> \
    ./mcacli cert --cn test1.example.com --hostnames a.com,b.com,10.0.0.5
    ```
+
+### Reverse-proxy (SSO) header authentication
+
+Instead of Basic auth, MiniCA can trust an authenticating reverse proxy
+(Authelia, oauth2-proxy, Traefik forward-auth, ...) to identify users. In this
+mode no local account exists at all — configure `auth.headers` **instead of**
+`auth.users` (exactly one of the two must be present):
+
+```yaml
+auth:
+  headers:
+    username: Remote-User        # header carrying the authenticated user id
+    group: Remote-Groups         # header carrying the group list
+    admin_group: admin           # group that grants the admin role
+    viewer_group: user           # group that grants the viewer role
+    # Honor identity headers only from these peers (IPs or CIDRs) — typically
+    # the upstream reverse proxy. Omit or leave empty to trust every remote.
+    #trusted_remotes:
+    #  - 127.0.0.1
+    #  - 10.0.0.0/8
+```
+
+- The group header accepts `a,b`, `a;b`, or a JSON array `["a","b"]`; group
+  names match case-insensitively. Membership in `admin_group` grants the
+  admin role, else `viewer_group` grants viewer, else access is denied (403).
+- There is no browser login prompt and no fallback to Basic auth in this mode.
+- `trusted_remotes` matches the **TCP peer** of the connection, not
+  `X-Forwarded-For` — behind a chain of proxies, list the last hop. A request
+  from an untrusted peer gets a page naming the declared identity, e.g.
+  *user 'xyz' was declared by untrusted remote 192.168.1.5*.
+- Only enable this when MiniCA is reachable exclusively through the proxy, or
+  pin the proxy with `trusted_remotes`. CSRF protection stays enabled.
 
 > **Note:** Like the original, this is intended for development and internal/test
 > environments where standing up a full enterprise PKI is overkill.

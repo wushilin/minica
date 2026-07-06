@@ -30,12 +30,34 @@ openssl:
   # left behind by a crash); successful operations clean up their own workdir.
   reap_after_hours: 24
 
-# Only the bootstrap admin is configured here. All other accounts (including
-# viewers) are managed in the database via the Admin Console at /minica/admin.
-# The password may be a bcrypt hash (recommended: `minica --gen-password`) or
-# plaintext. Plaintext still works but logs a warning at startup.
+# Authentication: configure EXACTLY ONE of `users:` (Basic auth) or `headers:`
+# (reverse-proxy header auth).
+#
+# Basic auth — only the bootstrap admin is configured here. All other accounts
+# (including viewers) are managed in the database via the Admin Console at
+# /minica/admin. The password may be a bcrypt hash (recommended:
+# `minica --gen-password`) or plaintext. Plaintext still works but logs a
+# warning at startup.
 auth:
   users:
     - username: admin
       password: adminpass
       role: admin
+
+  # Reverse-proxy header auth — trust an authenticating proxy (Authelia,
+  # oauth2-proxy, ...) in front of MiniCA to identify users via request
+  # headers. No local account is needed; users are managed entirely by the
+  # proxy/IdP and there is no login prompt. Only enable this when MiniCA is
+  # reachable exclusively through that proxy, or pin the proxy's address with
+  # trusted_remotes. To use it, REPLACE the `users:` block above with:
+  #headers:
+  #  username: Remote-User        # header carrying the authenticated user id
+  #  group: Remote-Groups         # header with the group list; accepts
+  #                               # "a,b", "a;b", or a JSON array ["a","b"]
+  #  admin_group: admin           # group that grants the admin role
+  #  viewer_group: user           # group that grants the viewer role
+  #  # Honor identity headers only from these peers (IPs or CIDRs) — typically
+  #  # the upstream reverse proxy. Omit or leave empty to trust every remote.
+  #  trusted_remotes:
+  #    - 127.0.0.1
+  #    - 10.0.0.0/8
