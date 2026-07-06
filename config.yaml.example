@@ -32,7 +32,9 @@ openssl:
 
 # Authentication: `users:` (Basic auth) and `headers:` (reverse-proxy header
 # auth) can both be configured, each with an `enabled` toggle (default true
-# when the section is present). When both are enabled, header auth wins.
+# when the section is present). When both are enabled, header identity wins
+# when present; Basic auth remains available for requests without identity
+# headers, which keeps CLI access usable alongside reverse-proxy SSO.
 # At least one mode must be enabled.
 #
 # Any value in this file may also be written as {{ENV:VAR:default}} to read it
@@ -56,7 +58,8 @@ auth:
   # headers. No local account is needed; users are managed entirely by the
   # proxy/IdP and there is no login prompt. Only enable this when MiniCA is
   # reachable exclusively through that proxy, or pin the proxy's address with
-  # trusted_remotes. When enabled it takes precedence over `users:` above.
+  # trusted_remotes. When both modes are enabled, requests with this identity
+  # header use header auth; requests without it may still use Basic auth.
   #headers:
   #  enabled: true
   #  username: Remote-User        # header carrying the authenticated user id

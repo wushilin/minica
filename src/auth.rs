@@ -20,8 +20,16 @@ pub const PEER_IP_HEADER: &str = "x-minica-peer-ip";
 
 pub fn authenticate(headers: &HeaderMap, state: &AppState) -> Result<User> {
     if let Some(header_config) = state.config.auth.active_headers() {
-        return authenticate_headers(headers, header_config);
+        if header_identity_present(headers, header_config)
+            || !state.config.auth.users.as_ref().is_some_and(|users| users.enabled)
+        {
+            return authenticate_headers(headers, header_config);
+        }
     }
+    authenticate_basic(headers, state)
+}
+
+fn authenticate_basic(headers: &HeaderMap, state: &AppState) -> Result<User> {
     let Some(value) = headers.get(axum::http::header::AUTHORIZATION) else {
         bail!("missing Authorization header");
     };
@@ -62,8 +70,7 @@ pub fn authenticate(headers: &HeaderMap, state: &AppState) -> Result<User> {
 }
 
 /// Reverse-proxy header authentication: identity is asserted by request
-/// headers injected by a trusted proxy. No local account is consulted and
-/// there is no fallback to Basic auth.
+/// headers injected by a trusted proxy. No local account is consulted.
 fn authenticate_headers(headers: &HeaderMap, config: &HeaderAuthConfig) -> Result<User> {
     let username = header_value(headers, &config.username);
     if !config.trusted_networks.is_empty() {
@@ -106,6 +113,10 @@ fn authenticate_headers(headers: &HeaderMap, config: &HeaderAuthConfig) -> Resul
             bail!("user '{username}' has no authorized group")
         }
     }
+}
+
+fn header_identity_present(headers: &HeaderMap, config: &HeaderAuthConfig) -> bool {
+    header_value(headers, &config.username).is_some()
 }
 
 /// Case-insensitive header lookup returning a trimmed, non-empty value.

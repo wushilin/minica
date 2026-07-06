@@ -121,13 +121,13 @@ backup-able state, real revocation, hashed credentials, and safe concurrency.
    ./mcacli cert --cn test1.example.com --hostnames a.com,b.com,10.0.0.5
    ```
 
-### Environment variables in the config (Docker)
+### Docker-friendly environment variables
 
 Any value in the config file may be written as `{{ENV:VAR:default}}`: it
 resolves to the environment variable `VAR` when set, otherwise to the default
 after the second colon (`{{ENV:VAR}}` with no default fails startup when the
 variable is unset). Resolution happens after the file is read and before YAML
-parsing, so tokens don't need quoting and may expand to any YAML — even lists:
+parsing, so tokens don't need quoting and may expand to any YAML value.
 
 ```yaml
 auth:
@@ -139,18 +139,102 @@ auth:
         role: admin
   headers:
     enabled: {{ENV:MINICA_HEADER_AUTH_ENABLE:false}}
-    trusted_remotes: {{ENV:MINICA_TRUSTED_REMOTES:[]}}
+    trusted_remotes:
+      - '{{ENV:MINICA_TRUSTED_REMOTE_1:-}}'
 ```
 
 [config.yaml.docker](./config.yaml.docker) is a fully parameterised template —
 every setting has a `MINICA_*` variable whose default matches
-`config.yaml.example`, so it runs unmodified and each value can be overridden
-per container:
+`config.yaml.example`, except that the container image overrides mutable paths
+under `/data`. Treat `/data` as persistent storage: use a Docker/Podman named
+volume, a bind mount, or a Kubernetes PersistentVolumeClaim. If `/data` is not
+persistent, the SQLite database and generated CA/certificate state are lost when
+the container is removed.
+
+- `/data/runtime` for runtime state
+- `/data/sqlite` for the SQLite database folder
+- `/data/logs/minica.log` for logs
+- `/data/runtime/openssl-work` for OpenSSL temporary workdirs
+
+Build the local image with Podman:
 
 ```sh
-docker run -e MINICA_PORT=8443 -e MINICA_ADMIN_PASSWORD='$2b$12$...' \
-  -e MINICA_HEADER_AUTH_ENABLE=true -e MINICA_TRUSTED_REMOTES='["10.0.0.7"]' \
-  ... minica --start -c config.yaml.docker
+docker/build.sh minica:local
+```
+
+Run it with `/data` mounted:
+
+```sh
+podman run --rm -p 9988:9988 -v minica-data:/data \
+  -e MINICA_ADMIN_PASSWORD='$2b$12$...' \
+  minica:local
+```
+
+Docker uses the same image recipe. If you prefer Docker instead of Podman:
+
+```sh
+./build.sh
+docker build -f docker/Dockerfile -t minica:local .
+docker run --rm -p 9988:9988 -v minica-data:/data \
+  -e MINICA_ADMIN_PASSWORD='$2b$12$...' \
+  minica:local
+```
+
+When MiniCA resolves environment tokens at startup, it prints each resolved
+variable to stderr. Password-like names are masked (`MINICA_ADMIN_PASSWORD ->
+a*******s`), and any set `MINICA_` variable not referenced by the loaded config
+prints a warning.
+
+Common Docker-friendly variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MINICA_HOST` | `0.0.0.0` | Server bind address. |
+| `MINICA_PORT` | `9988` | Server port. |
+| `MINICA_BASE_PATH` | `/minica` | UI/API base path. |
+| `MINICA_PUBLIC_BASE_URL` | `http://127.0.0.1:9988/minica` | External URL used in links and CRL distribution points. |
+| `MINICA_CRL_ENABLED` | `true` | Enable CRL generation and serving. |
+| `MINICA_CRL_NEXT_UPDATE_DAYS` | `30` | CRL `nextUpdate` interval. |
+| `MINICA_RUNTIME_FOLDER` | `/data/runtime` in the image | Runtime state folder. |
+| `MINICA_DB_FOLDER` | `/data/sqlite` in the image | Folder containing `db.sqlite`. |
+| `MINICA_LOG_FILE` | `/data/logs/minica.log` in the image | Log file path. |
+| `MINICA_LOG_ROTATE_SIZE_BYTES` | `10485760` | Log rotation size. |
+| `MINICA_LOG_MAX_BACKUPS` | `10` | Number of rotated log files to keep. |
+| `MINICA_LOG_COMPRESS` | `true` | Compress rotated logs. |
+| `MINICA_OPENSSL_PATH` | `/usr/bin/openssl` | OpenSSL binary path. |
+| `MINICA_OPENSSL_TIMEOUT_SECONDS` | `15` | Per-command OpenSSL timeout. |
+| `MINICA_OPENSSL_WORKING_ROOT` | `/data/runtime/openssl-work` in the image | OpenSSL temporary working root. |
+| `MINICA_OPENSSL_KEEP_FAILED_WORKDIRS` | `false` | Keep failed OpenSSL workdirs for debugging. |
+| `MINICA_OPENSSL_REAP_AFTER_HOURS` | `24` | Age threshold for cleaning abandoned OpenSSL workdirs. |
+| `MINICA_BASIC_AUTH_ENABLE` | `true` | Enable config/bootstrap Basic auth. |
+| `MINICA_ADMIN_USER` | `admin` | Bootstrap admin username. |
+| `MINICA_ADMIN_PASSWORD` | `adminpass` | Bootstrap admin password or bcrypt hash. Use `minica --gen-password`. |
+| `MINICA_ADMIN_ROLE` | `admin` | Bootstrap account role. |
+| `MINICA_HEADER_AUTH_ENABLE` | `false` | Enable reverse-proxy header auth. |
+| `MINICA_HEADER_USERNAME` | `Remote-User` | Header carrying the authenticated username. |
+| `MINICA_HEADER_GROUP` | `Remote-Groups` | Header carrying user groups. |
+| `MINICA_HEADER_ADMIN_GROUP` | `admin` | Group that grants admin role. |
+| `MINICA_HEADER_VIEWER_GROUP` | `user` | Group that grants viewer role. |
+| `MINICA_TRUSTED_REMOTE_1` ... `MINICA_TRUSTED_REMOTE_10` | `-` | Trusted reverse-proxy peers, as IPs or CIDRs. Unset slots are ignored; no trusted peers means trust every remote. |
+
+```sh
+podman run --rm -p 8443:8443 -v minica-data:/data \
+  -e MINICA_PORT=8443 \
+  -e MINICA_ADMIN_PASSWORD='$2b$12$...' \
+  -e MINICA_HEADER_AUTH_ENABLE=true \
+  -e MINICA_TRUSTED_REMOTE_1=10.0.0.7 \
+  minica:local
+```
+
+Docker equivalent:
+
+```sh
+docker run --rm -p 8443:8443 -v minica-data:/data \
+  -e MINICA_PORT=8443 \
+  -e MINICA_ADMIN_PASSWORD='$2b$12$...' \
+  -e MINICA_HEADER_AUTH_ENABLE=true \
+  -e MINICA_TRUSTED_REMOTE_1=10.0.0.7 \
+  minica:local
 ```
 
 ### Using LibreSSL instead of OpenSSL
@@ -182,12 +266,29 @@ Caveats:
 
 ### Reverse-proxy (SSO) header authentication
 
-Instead of Basic auth, MiniCA can trust an authenticating reverse proxy
-(Authelia, oauth2-proxy, Traefik forward-auth, ...) to identify users. In this
-mode no local account is needed at all. Both `auth.users` and `auth.headers`
-may be configured side by side, each with an `enabled` toggle (default true
-when the section is present); **when both are enabled, header auth wins** and
-the `users` accounts are ignored. At least one mode must be enabled.
+MiniCA can trust an authenticating reverse proxy (Authelia, oauth2-proxy,
+Traefik forward-auth, ...) to identify users via request headers. You can run
+this instead of Basic auth, or alongside Basic auth. In header-only mode no
+local account is needed at all. Both `auth.users` and `auth.headers` may be
+configured side by side, each with an `enabled` toggle (default true when the
+section is present). At least one mode must be enabled. When both are enabled,
+requests with a header-auth identity use header auth; requests without identity
+headers fall back to Basic auth, which keeps CLI access usable beside
+browser/proxy SSO.
+
+When `auth.headers.enabled` and `auth.users.enabled` are both `true`, MiniCA
+uses this order:
+
+- If the configured username header is missing or empty, Basic auth handles the
+  request.
+- If the username header is present, header auth handles the request; failed
+  trust or group checks do not fall back to Basic auth.
+- A header-auth user in `admin_group` gets admin access, even if they are also
+  in `viewer_group`.
+- A header-auth user in `viewer_group` plus any other non-admin groups gets
+  viewer access.
+- A header-auth user in neither `admin_group` nor `viewer_group`, or with no
+  group header, is denied.
 
 ```yaml
 auth:
@@ -208,9 +309,8 @@ auth:
 ```
 
 - The group header accepts `a,b`, `a;b`, or a JSON array `["a","b"]`; group
-  names match case-insensitively. Membership in `admin_group` grants the
-  admin role, else `viewer_group` grants viewer, else access is denied (403).
-- There is no browser login prompt and no fallback to Basic auth in this mode.
+  names match case-insensitively.
+- There is no browser login prompt for header-auth failures.
 - `trusted_remotes` matches the **TCP peer** of the connection, not
   `X-Forwarded-For` — behind a chain of proxies, list the last hop. A request
   from an untrusted peer gets a page naming the declared identity, e.g.

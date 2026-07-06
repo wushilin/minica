@@ -180,11 +180,12 @@ async fn start_server(config: Config) -> Result<()> {
         )
         .init();
 
-    // Enabled header auth takes precedence over basic auth.
+    // Header identity wins when present; otherwise enabled Basic auth can serve
+    // as a fallback for clients such as the CLI.
     if config.auth.active_headers().is_some() {
-        if config.auth.users.is_some() {
+        if config.auth.users.as_ref().is_some_and(|users| users.enabled) {
             tracing::info!(
-                "reverse-proxy header auth is enabled; auth.users entries are ignored"
+                "reverse-proxy header auth is enabled; Basic auth remains available when identity headers are absent"
             );
         }
     } else {
@@ -606,7 +607,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn both_enabled_uses_header_auth_not_basic() {
+    async fn both_enabled_uses_header_auth_with_basic_fallback() {
         let mut auth = header_auth(&[]);
         auth.users = Some(basic_users());
         let env = TestEnv::with_auth(auth);
@@ -619,7 +620,8 @@ mod tests {
             )
             .await;
         ok.assert_status(StatusCode::OK);
-        // basic credentials alone do not: header auth is exclusive when enabled
+        // basic credentials alone also work, which keeps CLI access usable
+        // alongside browser/proxy header auth.
         let basic_only = env
             .request_with_headers(
                 "GET",
@@ -627,7 +629,98 @@ mod tests {
                 &[("authorization", &basic_auth("admin", "adminpass"))],
             )
             .await;
-        basic_only.assert_status(StatusCode::UNAUTHORIZED);
+        basic_only.assert_status(StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn both_enabled_does_not_fallback_when_header_identity_is_rejected() {
+        let mut auth = header_auth(&[]);
+        auth.users = Some(basic_users());
+        let env = TestEnv::with_auth(auth);
+        let response = env
+            .request_with_headers(
+                "GET",
+                "/minica/api/cas",
+                &[
+                    ("Remote-User", "alice"),
+                    ("Remote-Groups", "unauthorized"),
+                    ("authorization", &basic_auth("admin", "adminpass")),
+                ],
+            )
+            .await;
+        response.assert_status(StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn both_enabled_header_admin_group_wins_over_viewer() {
+        let mut auth = header_auth(&[]);
+        auth.users = Some(basic_users());
+        let env = TestEnv::with_auth(auth);
+        let response = env
+            .request_with_headers(
+                "GET",
+                "/minica/admin",
+                &[("Remote-User", "alice"), ("Remote-Groups", "viewer;admin")],
+            )
+            .await;
+        response.assert_status(StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn both_enabled_header_viewer_group_allows_viewer_role_only() {
+        let mut auth = header_auth(&[]);
+        auth.users = Some(basic_users());
+        let env = TestEnv::with_auth(auth);
+        let list = env
+            .request_with_headers(
+                "GET",
+                "/minica/api/cas",
+                &[("Remote-User", "alice"), ("Remote-Groups", "user;other")],
+            )
+            .await;
+        list.assert_status(StatusCode::OK);
+
+        let delete = env
+            .request_with_headers(
+                "GET",
+                "/minica/admin",
+                &[("Remote-User", "alice"), ("Remote-Groups", "user;other")],
+            )
+            .await;
+        delete.assert_status(StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn both_enabled_header_identity_without_role_is_denied() {
+        let mut auth = header_auth(&[]);
+        auth.users = Some(basic_users());
+        let env = TestEnv::with_auth(auth);
+        let response = env
+            .request_with_headers(
+                "GET",
+                "/minica/api/cas",
+                &[("Remote-User", "alice")],
+            )
+            .await;
+        response.assert_status(StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn both_enabled_missing_header_identity_falls_back_to_basic() {
+        let mut auth = header_auth(&[]);
+        auth.users = Some(basic_users());
+        let env = TestEnv::with_auth(auth);
+        let response = env
+            .request_with_headers(
+                "GET",
+                "/minica/api/cas",
+                &[
+                    ("Remote-Groups", "admin"),
+                    ("authorization", &basic_auth("admin", "adminpass")),
+                ],
+            )
+            .await;
+        response.assert_status(StatusCode::OK);
     }
 
     #[tokio::test]

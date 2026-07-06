@@ -4,10 +4,9 @@
 # variable when set, otherwise to the default after the second colon. The
 # defaults reproduce config.yaml.example, so running with no environment
 # variables behaves exactly like the stock config. Resolution happens after
-# the file is read and before YAML parsing, so values may be any YAML —
-# including lists (see MINICA_TRUSTED_REMOTES).
+# the file is read and before YAML parsing, so values may be any YAML value.
 #
-#   docker run -e MINICA_PORT=8443 -e MINICA_ADMIN_PASSWORD='$2b$12$...' ...
+#   podman run -e MINICA_PORT=8443 -e MINICA_ADMIN_PASSWORD='$2b$12$...' ...
 #   minica --start -c config.yaml.docker
 
 server:
@@ -38,7 +37,8 @@ openssl:
   keep_failed_workdirs: {{ENV:MINICA_OPENSSL_KEEP_FAILED_WORKDIRS:false}}
   reap_after_hours: {{ENV:MINICA_OPENSSL_REAP_AFTER_HOURS:24}}
 
-# Both auth sections coexist; when both are enabled, header auth wins.
+# Both auth sections coexist. When both are enabled, header identity wins when
+# present; Basic auth remains available for requests without identity headers.
 auth:
   users:
     enabled: {{ENV:MINICA_BASIC_AUTH_ENABLE:true}}
@@ -49,13 +49,24 @@ auth:
 
   # Reverse-proxy header auth. Defaults to disabled: enabling it makes MiniCA
   # trust identity headers, so only turn it on behind an authenticating proxy
-  # (and preferably pin the proxy with MINICA_TRUSTED_REMOTES).
+  # (and preferably pin the proxy with MINICA_TRUSTED_REMOTE_1..10).
   headers:
     enabled: {{ENV:MINICA_HEADER_AUTH_ENABLE:false}}
     username: {{ENV:MINICA_HEADER_USERNAME:Remote-User}}
     group: {{ENV:MINICA_HEADER_GROUP:Remote-Groups}}
     admin_group: {{ENV:MINICA_HEADER_ADMIN_GROUP:admin}}
     viewer_group: {{ENV:MINICA_HEADER_VIEWER_GROUP:user}}
-    # YAML list of IPs/CIDRs, e.g. MINICA_TRUSTED_REMOTES='["127.0.0.1", "10.0.0.0/8"]'
-    # Empty list = trust every remote.
-    trusted_remotes: {{ENV:MINICA_TRUSTED_REMOTES:[]}}
+    # Up to 10 trusted peers (IP or CIDR), one env var per slot. '-' means the
+    # slot is not used; when no slot is set, every remote is trusted.
+    #   podman run -e MINICA_TRUSTED_REMOTE_1=10.0.0.7 -e MINICA_TRUSTED_REMOTE_2=172.16.0.0/12 ...
+    trusted_remotes:
+      - '{{ENV:MINICA_TRUSTED_REMOTE_1:-}}'
+      - '{{ENV:MINICA_TRUSTED_REMOTE_2:-}}'
+      - '{{ENV:MINICA_TRUSTED_REMOTE_3:-}}'
+      - '{{ENV:MINICA_TRUSTED_REMOTE_4:-}}'
+      - '{{ENV:MINICA_TRUSTED_REMOTE_5:-}}'
+      - '{{ENV:MINICA_TRUSTED_REMOTE_6:-}}'
+      - '{{ENV:MINICA_TRUSTED_REMOTE_7:-}}'
+      - '{{ENV:MINICA_TRUSTED_REMOTE_8:-}}'
+      - '{{ENV:MINICA_TRUSTED_REMOTE_9:-}}'
+      - '{{ENV:MINICA_TRUSTED_REMOTE_10:-}}'

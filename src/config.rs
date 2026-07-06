@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use ipnet::IpNet;
 use serde::Deserialize;
 use std::{
+    collections::HashSet,
     fs,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -142,9 +143,10 @@ fn default_viewer_group() -> String {
 }
 
 impl AuthConfig {
-    /// Enabled header auth wins over enabled basic auth; at least one mode
-    /// must be enabled. Also pre-parses `trusted_remotes` so bad entries fail
-    /// at startup, not per-request.
+    /// At least one auth mode must be enabled. Header auth is active when
+    /// identity headers are present; enabled Basic auth remains available as a
+    /// fallback for requests without identity headers. Also pre-parses
+    /// `trusted_remotes` so bad entries fail at startup, not per-request.
     pub fn validate(&mut self) -> Result<()> {
         if let Some(headers) = self.headers.as_mut().filter(|headers| headers.enabled) {
             headers.trusted_networks = parse_trusted_remotes(&headers.trusted_remotes)?;
@@ -178,17 +180,28 @@ impl AuthConfig {
 /// YAML parsing (unquoted tokens are not valid YAML), so any value in the
 /// file can be injected via the environment — handy for Docker.
 fn resolve_env_tokens(text: &str) -> Result<String> {
-    resolve_env_tokens_with(text, |name| std::env::var(name).ok())
+    let (resolved, used_names) = resolve_env_tokens_with_used(text, |name| std::env::var(name).ok())?;
+    warn_unused_minica_env_vars(&used_names);
+    Ok(resolved)
 }
 
+#[cfg(test)]
 fn resolve_env_tokens_with(
     text: &str,
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<String> {
+    resolve_env_tokens_with_used(text, lookup).map(|(resolved, _)| resolved)
+}
+
+fn resolve_env_tokens_with_used(
+    text: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<(String, HashSet<String>)> {
     const OPEN: &str = "{{ENV:";
     const CLOSE: &str = "}}";
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
+    let mut used_names = HashSet::new();
     while let Some(start) = rest.find(OPEN) {
         out.push_str(&rest[..start]);
         let token = &rest[start..];
@@ -204,8 +217,12 @@ fn resolve_env_tokens_with(
         if name.is_empty() {
             anyhow::bail!("empty variable name in {{{{ENV:...}}}} token");
         }
+        used_names.insert(name.to_string());
         match lookup(name).or_else(|| default.map(ToString::to_string)) {
-            Some(value) => out.push_str(&value),
+            Some(value) => {
+                eprintln!("config env {name} -> {}", mask_env_value(name, &value));
+                out.push_str(&value)
+            }
             None => anyhow::bail!(
                 "environment variable {name} is not set and {{{{ENV:{name}}}}} has no default"
             ),
@@ -213,12 +230,56 @@ fn resolve_env_tokens_with(
         rest = &token[end + CLOSE.len()..];
     }
     out.push_str(rest);
-    Ok(out)
+    Ok((out, used_names))
+}
+
+fn warn_unused_minica_env_vars(used_names: &HashSet<String>) {
+    let mut unused: Vec<String> = std::env::vars()
+        .map(|(name, _)| name)
+        .filter(|name| name.starts_with("MINICA_") && !used_names.contains(name))
+        .collect();
+    unused.sort();
+
+    for name in unused {
+        eprintln!("warning: unused MINICA_ environment variable: {name}");
+    }
+}
+
+fn mask_env_value(name: &str, value: &str) -> String {
+    if !is_sensitive_env_name(name) {
+        return value.to_string();
+    }
+
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= 2 {
+        return value.to_string();
+    }
+
+    let mut masked = String::with_capacity(value.len());
+    masked.push(chars[0]);
+    masked.extend(std::iter::repeat('*').take(chars.len() - 2));
+    masked.push(chars[chars.len() - 1]);
+    masked
+}
+
+fn is_sensitive_env_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("password")
+        || name.contains("passwword")
+        || name.contains("passwd")
+        || name.contains("passphrase")
 }
 
 fn parse_trusted_remotes(entries: &[String]) -> Result<Vec<IpNet>> {
     entries
         .iter()
+        // '-' (and empty) means "not specified" — it is the placeholder default
+        // used by env-templated configs (MINICA_TRUSTED_REMOTE_1..10 in
+        // config.yaml.docker), so unset slots drop out of the list.
+        .filter(|entry| {
+            let trimmed = entry.trim();
+            !trimmed.is_empty() && trimmed != "-"
+        })
         .map(|entry| {
             let trimmed = entry.trim();
             trimmed
@@ -418,6 +479,17 @@ mod env_token_tests {
     }
 
     #[test]
+    fn resolved_tokens_report_used_env_names() {
+        let (out, used) =
+            resolve_env_tokens_with_used("a: {{ENV:A:1}}\nb: {{ENV:B:2}}\n", lookup(&[]))
+                .expect("resolves");
+        assert_eq!(out, "a: 1\nb: 2\n");
+        assert!(used.contains("A"));
+        assert!(used.contains("B"));
+        assert_eq!(used.len(), 2);
+    }
+
+    #[test]
     fn text_without_tokens_is_unchanged() {
         let text = "plain: value\ncurly: {not-a-token}\n";
         assert_eq!(
@@ -441,6 +513,29 @@ mod env_token_tests {
         let mut auth: AuthConfig = serde_yaml::from_str(&resolved).expect("parses");
         auth.validate().expect("valid");
         assert_eq!(auth.users.expect("users").list[0].username, "admin");
+    }
+
+    #[test]
+    fn password_like_env_values_are_masked_for_logs() {
+        assert_eq!(
+            mask_env_value("MINICA_ADMIN_PASSWORD", "adminpass"),
+            "a*******s"
+        );
+        assert_eq!(mask_env_value("DB_PASSWD", "secret"), "s****t");
+        assert_eq!(mask_env_value("TLS_PASSPHRASE", "abc"), "a*c");
+        assert_eq!(mask_env_value("TYPO_PASSWWORD", "secret"), "s****t");
+    }
+
+    #[test]
+    fn non_password_env_values_are_not_masked_for_logs() {
+        assert_eq!(mask_env_value("MINICA_PORT", "9988"), "9988");
+    }
+
+    #[test]
+    fn very_short_password_like_env_values_keep_available_edges() {
+        assert_eq!(mask_env_value("PASSWORD", ""), "");
+        assert_eq!(mask_env_value("PASSWORD", "a"), "a");
+        assert_eq!(mask_env_value("PASSWORD", "ab"), "ab");
     }
 }
 
@@ -515,11 +610,11 @@ mod auth_config_tests {
         let mut auth = parse(
             "users:\n  - username: a\n    password: p\n    role: admin\nheaders:\n  trusted_remotes:\n    - 10.0.0.0/8\n",
         );
-        auth.validate().expect("valid: headers takes precedence");
+        auth.validate().expect("valid: header identity can be active");
         // headers is active (auth.rs dispatches on it) and its networks are parsed
         let headers = auth.active_headers().expect("headers active");
         assert_eq!(headers.trusted_networks.len(), 1);
-        assert!(auth.users.is_some(), "users kept but ignored at runtime");
+        assert!(auth.users.is_some(), "users kept for basic fallback");
     }
 
     #[test]
@@ -548,6 +643,30 @@ mod auth_config_tests {
         assert!(networks[1].contains(&ip("10.9.8.7")));
         assert!(!networks[1].contains(&ip("11.0.0.1")));
         assert!(networks[2].contains(&ip("::1")));
+    }
+
+    #[test]
+    fn dash_and_empty_trusted_remotes_are_ignored() {
+        // '-' is the env-template placeholder for "not specified" (see
+        // config.yaml.docker's MINICA_TRUSTED_REMOTE_1..10); empty entries are
+        // skipped too. All placeholders -> empty list -> trust everyone.
+        let mut auth = parse(
+            "headers:\n  trusted_remotes:\n    - '-'\n    - ''\n    - 10.0.0.0/8\n    - ' - '\n",
+        );
+        auth.validate().expect("valid");
+        let networks = auth.headers.expect("headers config").trusted_networks;
+        assert_eq!(networks.len(), 1);
+        assert!(networks[0].contains(&"10.1.2.3".parse::<std::net::IpAddr>().expect("test ip")));
+
+        let mut auth =
+            parse("headers:\n  trusted_remotes:\n    - '-'\n    - '-'\n");
+        auth.validate().expect("valid");
+        assert!(
+            auth.headers
+                .expect("headers config")
+                .trusted_networks
+                .is_empty()
+        );
     }
 
     #[test]
