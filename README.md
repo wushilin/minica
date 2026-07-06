@@ -121,6 +121,33 @@ backup-able state, real revocation, hashed credentials, and safe concurrency.
    ./mcacli cert --cn test1.example.com --hostnames a.com,b.com,10.0.0.5
    ```
 
+### Using LibreSSL instead of OpenSSL
+
+MiniCA shells out to the `openssl` binary, and every subcommand it uses
+(`genpkey`, `req`, `ca` — including `copy_extensions`, `-gencrl`, `-revoke`,
+`-crl_reason` — `crl`, `pkcs12 -export`, `verify`, `x509`) is also provided by
+LibreSSL; the one OpenSSL-only flag MiniCA used (`x509 -ext`) has an automatic
+fallback. To use LibreSSL, just point the config at its binary:
+
+```yaml
+openssl:
+  path: /usr/bin/openssl        # OpenBSD (LibreSSL is the system openssl)
+  # path: /usr/local/opt/libressl/bin/openssl   # Homebrew libressl
+  # path: /usr/bin/eopenssl33                   # some Linux libressl packages
+```
+
+Caveats:
+
+- **PKCS#12 encryption defaults.** LibreSSL's `pkcs12 -export` still defaults
+  to 3DES for keys and 40-bit RC2 for certificates (OpenSSL 3 uses AES-256 +
+  PBKDF2). The resulting `.p12` bundles import fine into Windows, Java, and
+  browsers, but *reading* an RC2-encrypted bundle with an OpenSSL 3.x client
+  needs its legacy provider (`openssl pkcs12 -legacy ...`).
+- Compatibility was verified against the LibreSSL manual and sources; if you
+  hit an issue with a specific LibreSSL version, set
+  `openssl.keep_failed_workdirs: true` and check the logged command that
+  failed.
+
 ### Reverse-proxy (SSO) header authentication
 
 Instead of Basic auth, MiniCA can trust an authenticating reverse proxy

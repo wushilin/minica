@@ -850,7 +850,11 @@ impl OpenSsl {
     pub fn inspect_cert_sans(&self, dir: &Path, pem: &str) -> Result<(Vec<String>, Vec<String>)> {
         tracing::debug!(workdir = %dir.display(), "inspecting certificate SANs with openssl");
         fs::write(dir.join("inspect-san.pem"), pem)?;
-        let out = self.run_ok(
+        // `x509 -ext` is an OpenSSL 1.1.1 addition that LibreSSL never adopted.
+        // If it fails (e.g. LibreSSL's "unknown option"), fall back to the full
+        // `-text` dump, which prints SAN entries in the same DNS:/IP Address:
+        // form that `parse_san_entries` scans for.
+        let out = self.run_in(
             dir,
             &[
                 "x509",
@@ -860,18 +864,15 @@ impl OpenSsl {
                 "-ext",
                 "subjectAltName",
             ],
+            Duration::from_secs(self.config.timeout_seconds),
         )?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        let mut dns = Vec::new();
-        let mut ips = Vec::new();
-        for part in text.split([',', '\n']) {
-            let part = part.trim();
-            if let Some(value) = part.strip_prefix("DNS:") {
-                dns.push(value.trim().to_string());
-            } else if let Some(value) = part.strip_prefix("IP Address:") {
-                ips.push(value.trim().to_string());
-            }
-        }
+        let text = if out.exit_code == 0 {
+            String::from_utf8_lossy(&out.stdout).to_string()
+        } else {
+            let out = self.run_ok(dir, &["x509", "-in", "inspect-san.pem", "-noout", "-text"])?;
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        let (dns, ips) = parse_san_entries(&text);
         tracing::debug!(
             dns_count = dns.len(),
             ip_count = ips.len(),
@@ -1117,6 +1118,22 @@ nsComment = "OpenSSL Generated Certificate"
     )
 }
 
+/// Extract `DNS:` and `IP Address:` SAN entries from openssl output — either
+/// the compact `x509 -ext subjectAltName` form or the full `-text` dump.
+fn parse_san_entries(text: &str) -> (Vec<String>, Vec<String>) {
+    let mut dns = Vec::new();
+    let mut ips = Vec::new();
+    for part in text.split([',', '\n']) {
+        let part = part.trim();
+        if let Some(value) = part.strip_prefix("DNS:") {
+            dns.push(value.trim().to_string());
+        } else if let Some(value) = part.strip_prefix("IP Address:") {
+            ips.push(value.trim().to_string());
+        }
+    }
+    (dns, ips)
+}
+
 fn looks_like_workdir(name: &str) -> bool {
     name.len() > 18 && name.as_bytes().get(8) == Some(&b'T') && name.contains('-')
 }
@@ -1166,6 +1183,24 @@ mod tests {
             start.elapsed() < Duration::from_secs(10),
             "timed-out child must be killed promptly, not awaited"
         );
+    }
+
+    #[test]
+    fn parse_san_entries_reads_ext_and_text_forms() {
+        // `x509 -ext subjectAltName` output
+        let ext = "X509v3 Subject Alternative Name:\n    DNS:a.example.com, DNS:b.example.com, IP Address:10.0.0.5\n";
+        let (dns, ips) = parse_san_entries(ext);
+        assert_eq!(dns, vec!["a.example.com", "b.example.com"]);
+        assert_eq!(ips, vec!["10.0.0.5"]);
+
+        // fragment of a full `x509 -text` dump (LibreSSL fallback path)
+        let text = "        X509v3 extensions:\n            X509v3 Basic Constraints:\n                CA:FALSE\n            X509v3 Subject Alternative Name:\n                DNS:a.example.com, IP Address:10.0.0.5\n    Signature Algorithm: sha512WithRSAEncryption\n";
+        let (dns, ips) = parse_san_entries(text);
+        assert_eq!(dns, vec!["a.example.com"]);
+        assert_eq!(ips, vec!["10.0.0.5"]);
+
+        let (dns, ips) = parse_san_entries("no san here\n");
+        assert!(dns.is_empty() && ips.is_empty());
     }
 
     #[test]
