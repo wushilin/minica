@@ -1511,7 +1511,7 @@ fn api_error_status(status: StatusCode, code: &str, message: &str) -> Response {
         })),
     )
         .into_response();
-    if status == StatusCode::UNAUTHORIZED {
+    if status == StatusCode::UNAUTHORIZED && basic_challenge_applies(message) {
         response.headers_mut().insert(
             header::WWW_AUTHENTICATE,
             header::HeaderValue::from_static(r#"Basic realm="MiniCA""#),
@@ -1627,7 +1627,7 @@ fn error_response(err: anyhow::Error) -> Response {
         )),
     )
         .into_response();
-    if status == StatusCode::UNAUTHORIZED {
+    if status == StatusCode::UNAUTHORIZED && basic_challenge_applies(&msg) {
         response.headers_mut().insert(
             header::WWW_AUTHENTICATE,
             header::HeaderValue::from_static(r#"Basic realm="MiniCA""#),
@@ -1640,9 +1640,13 @@ fn status_for_error_message(msg: &str) -> StatusCode {
     if msg.contains("Authorization")
         || msg.contains("invalid username or password")
         || msg.contains("Basic auth")
+        || msg.contains("request header")
     {
         StatusCode::UNAUTHORIZED
-    } else if msg.contains("admin role") {
+    } else if msg.contains("admin role")
+        || msg.contains("no authorized group")
+        || msg.contains("untrusted remote")
+    {
         StatusCode::FORBIDDEN
     } else if msg.contains("busy") {
         StatusCode::CONFLICT
@@ -1651,6 +1655,14 @@ fn status_for_error_message(msg: &str) -> StatusCode {
     } else {
         StatusCode::BAD_REQUEST
     }
+}
+
+/// The browser Basic-auth dialog is only meaningful when Basic auth produced
+/// the 401; header-mode rejections must never trigger it.
+fn basic_challenge_applies(msg: &str) -> bool {
+    msg.contains("Authorization")
+        || msg.contains("username or password")
+        || msg.contains("Basic auth")
 }
 
 fn error_code_for_status(status: StatusCode, msg: &str) -> &'static str {
@@ -2797,5 +2809,53 @@ mod peer_ip_tests {
             .expect("route request");
         let body = to_bytes(response.into_body(), 1024).await.expect("read body");
         assert_eq!(&body[..], b"10.1.2.3");
+    }
+}
+
+#[cfg(test)]
+mod error_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn header_auth_errors_map_to_statuses() {
+        assert_eq!(
+            status_for_error_message("missing or empty Remote-User request header"),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status_for_error_message("user 'alice' has no authorized group"),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status_for_error_message("user 'alice' was declared by untrusted remote 1.2.3.4"),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn basic_challenge_only_for_basic_auth_messages() {
+        assert!(basic_challenge_applies("missing Authorization header"));
+        assert!(basic_challenge_applies("invalid username or password"));
+        assert!(basic_challenge_applies("invalid Basic auth payload"));
+        assert!(!basic_challenge_applies(
+            "missing or empty Remote-User request header"
+        ));
+    }
+
+    #[test]
+    fn unauthorized_response_carries_challenge_only_for_basic() {
+        let with = api_error_status(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "missing Authorization header",
+        );
+        assert!(with.headers().contains_key(header::WWW_AUTHENTICATE));
+
+        let without = api_error_status(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "missing or empty Remote-User request header",
+        );
+        assert!(!without.headers().contains_key(header::WWW_AUTHENTICATE));
     }
 }
