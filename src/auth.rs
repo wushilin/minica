@@ -19,7 +19,7 @@ pub struct User {
 pub const PEER_IP_HEADER: &str = "x-minica-peer-ip";
 
 pub fn authenticate(headers: &HeaderMap, state: &AppState) -> Result<User> {
-    if let Some(header_config) = &state.config.auth.headers {
+    if let Some(header_config) = state.config.auth.active_headers() {
         return authenticate_headers(headers, header_config);
     }
     let Some(value) = headers.get(axum::http::header::AUTHORIZATION) else {
@@ -38,7 +38,7 @@ pub fn authenticate(headers: &HeaderMap, state: &AppState) -> Result<User> {
     // Bootstrap accounts come from the config file. Their stored password may be
     // a bcrypt hash or (legacy) plaintext; these exist so the very first admin
     // can log in and manage DB-backed users.
-    for user in state.config.auth.users.as_deref().unwrap_or_default() {
+    for user in state.config.auth.basic_users() {
         if user.username == username && verify_config_password(&user.password, password) {
             return Ok(User {
                 username: user.username.clone(),
@@ -215,6 +215,7 @@ mod group_parsing_tests {
 
     fn cfg() -> HeaderAuthConfig {
         HeaderAuthConfig {
+            enabled: true,
             username: "Remote-User".to_string(),
             group: "Remote-Groups".to_string(),
             admin_group: "admin".to_string(),
@@ -279,6 +280,7 @@ mod header_auth_tests {
 
     fn cfg() -> HeaderAuthConfig {
         HeaderAuthConfig {
+            enabled: true,
             username: "Remote-User".to_string(),
             group: "Remote-Groups".to_string(),
             admin_group: "admin".to_string(),

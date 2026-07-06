@@ -180,8 +180,8 @@ async fn start_server(config: Config) -> Result<()> {
         )
         .init();
 
-    // Header auth takes precedence over basic auth when both are configured.
-    if config.auth.headers.is_some() {
+    // Enabled header auth takes precedence over basic auth.
+    if config.auth.active_headers().is_some() {
         if config.auth.users.is_some() {
             tracing::info!(
                 "reverse-proxy header auth is enabled; auth.users entries are ignored"
@@ -191,7 +191,7 @@ async fn start_server(config: Config) -> Result<()> {
         // Bootstrap credentials may still be plaintext; warn once at startup so
         // the operator knows to replace them with bcrypt hashes
         // (minica --gen-password).
-        for user in config.auth.users.as_deref().unwrap_or_default() {
+        for user in config.auth.basic_users() {
             if !auth::looks_like_bcrypt(&user.password) {
                 tracing::warn!(
                     username = %user.username,
@@ -279,18 +279,7 @@ mod tests {
     impl TestEnv {
         fn new() -> Self {
             Self::with_auth(config::AuthConfig {
-                users: Some(vec![
-                    config::UserConfig {
-                        username: "admin".to_string(),
-                        password: "adminpass".to_string(),
-                        role: config::Role::Admin,
-                    },
-                    config::UserConfig {
-                        username: "viewer".to_string(),
-                        password: "viewerpass".to_string(),
-                        role: config::Role::Viewer,
-                    },
-                ]),
+                users: Some(basic_users()),
                 headers: None,
             })
         }
@@ -504,10 +493,29 @@ mod tests {
         }
     }
 
+    fn basic_users() -> config::UsersConfig {
+        config::UsersConfig {
+            enabled: true,
+            list: vec![
+                config::UserConfig {
+                    username: "admin".to_string(),
+                    password: "adminpass".to_string(),
+                    role: config::Role::Admin,
+                },
+                config::UserConfig {
+                    username: "viewer".to_string(),
+                    password: "viewerpass".to_string(),
+                    role: config::Role::Viewer,
+                },
+            ],
+        }
+    }
+
     fn header_auth(trusted_remotes: &[&str]) -> config::AuthConfig {
         let mut auth = config::AuthConfig {
             users: None,
             headers: Some(config::HeaderAuthConfig {
+                enabled: true,
                 username: "Remote-User".to_string(),
                 group: "Remote-Groups".to_string(),
                 admin_group: "admin".to_string(),
@@ -595,6 +603,58 @@ mod tests {
             )
             .await;
         response.assert_status(StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn both_enabled_uses_header_auth_not_basic() {
+        let mut auth = header_auth(&[]);
+        auth.users = Some(basic_users());
+        let env = TestEnv::with_auth(auth);
+        // identity headers work
+        let ok = env
+            .request_with_headers(
+                "GET",
+                "/minica/api/cas",
+                &[("Remote-User", "alice"), ("Remote-Groups", "user")],
+            )
+            .await;
+        ok.assert_status(StatusCode::OK);
+        // basic credentials alone do not: header auth is exclusive when enabled
+        let basic_only = env
+            .request_with_headers(
+                "GET",
+                "/minica/api/cas",
+                &[("authorization", &basic_auth("admin", "adminpass"))],
+            )
+            .await;
+        basic_only.assert_status(StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn disabled_headers_fall_back_to_basic_auth() {
+        let mut auth = header_auth(&[]);
+        auth.headers.as_mut().expect("headers").enabled = false;
+        auth.users = Some(basic_users());
+        let env = TestEnv::with_auth(auth);
+        // basic credentials work
+        let ok = env
+            .request_with_headers(
+                "GET",
+                "/minica/api/cas",
+                &[("authorization", &basic_auth("admin", "adminpass"))],
+            )
+            .await;
+        ok.assert_status(StatusCode::OK);
+        // identity headers alone do not, and the Basic challenge is back
+        let headers_only = env
+            .request_with_headers(
+                "GET",
+                "/minica/api/cas",
+                &[("Remote-User", "alice"), ("Remote-Groups", "user")],
+            )
+            .await;
+        headers_only.assert_status(StatusCode::UNAUTHORIZED);
+        assert!(headers_only.headers.contains_key(header::WWW_AUTHENTICATE));
     }
 
     #[tokio::test]

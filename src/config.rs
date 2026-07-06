@@ -52,17 +52,58 @@ fn default_timeout_seconds() -> u64 {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct AuthConfig {
-    /// Basic-auth bootstrap accounts. Present (even empty) = basic-auth mode.
+    /// Basic-auth section (bootstrap accounts + enabled toggle).
     #[serde(default)]
-    pub users: Option<Vec<UserConfig>>,
-    /// Reverse-proxy header auth. Present = header mode; mutually exclusive
-    /// with `users`.
+    pub users: Option<UsersConfig>,
+    /// Reverse-proxy header auth. When present and enabled it wins over
+    /// basic auth, so both sections can coexist in one config template.
     #[serde(default)]
     pub headers: Option<HeaderAuthConfig>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+/// Basic-auth section: an `enabled` toggle plus the bootstrap account list.
+/// Accepts either the object form (`enabled:` + `list:`) or, for backward
+/// compatibility, a bare account list (which implies `enabled: true`).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(from = "UsersConfigRepr")]
+pub struct UsersConfig {
+    pub enabled: bool,
+    pub list: Vec<UserConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum UsersConfigRepr {
+    List(Vec<UserConfig>),
+    Object {
+        #[serde(default = "default_true")]
+        enabled: bool,
+        #[serde(default)]
+        list: Vec<UserConfig>,
+    },
+}
+
+impl From<UsersConfigRepr> for UsersConfig {
+    fn from(repr: UsersConfigRepr) -> Self {
+        match repr {
+            UsersConfigRepr::List(list) => Self {
+                enabled: true,
+                list,
+            },
+            UsersConfigRepr::Object { enabled, list } => Self { enabled, list },
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct HeaderAuthConfig {
+    /// Toggle for this mode; on by default when the section is present.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     /// Header carrying the authenticated user id.
     #[serde(default = "default_username_header")]
     pub username: String,
@@ -101,21 +142,34 @@ fn default_viewer_group() -> String {
 }
 
 impl AuthConfig {
-    /// `headers` (reverse-proxy header auth) takes precedence when defined;
-    /// otherwise `users` (basic auth) applies. At least one must be present.
-    /// Also pre-parses `trusted_remotes` so bad entries fail at startup, not
-    /// per-request.
+    /// Enabled header auth wins over enabled basic auth; at least one mode
+    /// must be enabled. Also pre-parses `trusted_remotes` so bad entries fail
+    /// at startup, not per-request.
     pub fn validate(&mut self) -> Result<()> {
-        match (self.users.is_some(), self.headers.as_mut()) {
-            (_, Some(headers)) => {
-                headers.trusted_networks = parse_trusted_remotes(&headers.trusted_remotes)?;
-                Ok(())
-            }
-            (true, None) => Ok(()),
-            (false, None) => anyhow::bail!(
-                "auth: configure one of 'users' (basic auth) or 'headers' (reverse-proxy header auth)"
-            ),
+        if let Some(headers) = self.headers.as_mut().filter(|headers| headers.enabled) {
+            headers.trusted_networks = parse_trusted_remotes(&headers.trusted_remotes)?;
+            return Ok(());
         }
+        if self.users.as_ref().is_some_and(|users| users.enabled) {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "auth: no authentication mode enabled — enable 'users' (basic auth) or 'headers' (reverse-proxy header auth)"
+        )
+    }
+
+    /// The header-auth config when that mode is active (present and enabled).
+    pub fn active_headers(&self) -> Option<&HeaderAuthConfig> {
+        self.headers.as_ref().filter(|headers| headers.enabled)
+    }
+
+    /// Bootstrap accounts for basic auth; empty when disabled or absent.
+    pub fn basic_users(&self) -> &[UserConfig] {
+        self.users
+            .as_ref()
+            .filter(|users| users.enabled)
+            .map(|users| users.list.as_slice())
+            .unwrap_or_default()
     }
 }
 
@@ -386,7 +440,7 @@ mod env_token_tests {
         let resolved = resolve_env_tokens_with(yaml, lookup(&[])).expect("resolves");
         let mut auth: AuthConfig = serde_yaml::from_str(&resolved).expect("parses");
         auth.validate().expect("valid");
-        assert_eq!(auth.users.expect("users")[0].username, "admin");
+        assert_eq!(auth.users.expect("users").list[0].username, "admin");
     }
 }
 
@@ -403,6 +457,45 @@ mod auth_config_tests {
         let mut auth = parse("users:\n  - username: a\n    password: p\n    role: admin\n");
         auth.validate().expect("valid");
         assert!(auth.headers.is_none());
+        // legacy bare-list form implies enabled
+        assert_eq!(auth.basic_users().len(), 1);
+        let users = auth.users.expect("users");
+        assert!(users.enabled);
+        assert_eq!(users.list.len(), 1);
+    }
+
+    #[test]
+    fn users_object_form_with_enabled_and_list() {
+        let mut auth = parse(
+            "users:\n  enabled: true\n  list:\n    - username: a\n      password: p\n      role: admin\n",
+        );
+        auth.validate().expect("valid");
+        assert_eq!(auth.basic_users().len(), 1);
+    }
+
+    #[test]
+    fn disabled_users_without_headers_rejected() {
+        let mut auth = parse("users:\n  enabled: false\n  list: []\n");
+        let err = auth.validate().unwrap_err().to_string();
+        assert!(err.contains("no authentication mode enabled"), "{err}");
+        assert!(auth.basic_users().is_empty());
+    }
+
+    #[test]
+    fn disabled_headers_fall_back_to_users() {
+        let mut auth = parse(
+            "users:\n  - username: a\n    password: p\n    role: admin\nheaders:\n  enabled: false\n",
+        );
+        auth.validate().expect("valid: basic auth active");
+        assert!(auth.active_headers().is_none(), "disabled headers inert");
+        assert_eq!(auth.basic_users().len(), 1);
+    }
+
+    #[test]
+    fn both_disabled_rejected() {
+        let mut auth = parse("users:\n  enabled: false\nheaders:\n  enabled: false\n");
+        let err = auth.validate().unwrap_err().to_string();
+        assert!(err.contains("no authentication mode enabled"), "{err}");
     }
 
     #[test]
@@ -418,16 +511,14 @@ mod auth_config_tests {
     }
 
     #[test]
-    fn both_present_prefers_headers() {
+    fn both_enabled_prefers_headers() {
         let mut auth = parse(
             "users:\n  - username: a\n    password: p\n    role: admin\nheaders:\n  trusted_remotes:\n    - 10.0.0.0/8\n",
         );
         auth.validate().expect("valid: headers takes precedence");
-        // headers stays active (auth.rs dispatches on it) and its networks are parsed
-        assert_eq!(
-            auth.headers.expect("headers config").trusted_networks.len(),
-            1
-        );
+        // headers is active (auth.rs dispatches on it) and its networks are parsed
+        let headers = auth.active_headers().expect("headers active");
+        assert_eq!(headers.trusted_networks.len(), 1);
         assert!(auth.users.is_some(), "users kept but ignored at runtime");
     }
 
@@ -435,7 +526,7 @@ mod auth_config_tests {
     fn neither_users_nor_headers_rejected() {
         let mut auth = parse("{}");
         let err = auth.validate().unwrap_err().to_string();
-        assert!(err.contains("configure one of"), "{err}");
+        assert!(err.contains("no authentication mode enabled"), "{err}");
     }
 
     #[test]
