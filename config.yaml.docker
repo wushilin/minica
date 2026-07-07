@@ -2,9 +2,11 @@
 #
 # Every value is a {{ENV:VAR:default}} token: it resolves to the environment
 # variable when set, otherwise to the default after the second colon. The
-# defaults reproduce config.yaml.example, so running with no environment
-# variables behaves exactly like the stock config. Resolution happens after
-# the file is read and before YAML parsing, so values may be any YAML value.
+# default is trimmed, may contain colons, and percent escapes are decoded on a
+# best-effort basis. The defaults reproduce config.yaml.example, so running
+# with no environment variables behaves exactly like the stock config.
+# Resolution happens after the file is read and before YAML parsing, so values
+# may be any YAML value.
 #
 #   podman run -e MINICA_PORT=8443 -e MINICA_ADMIN_PASSWORD='$2b$12$...' ...
 #   minica --start -c config.yaml.docker

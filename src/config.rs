@@ -178,18 +178,16 @@ impl AuthConfig {
 /// Resolve `{{ENV:NAME}}` / `{{ENV:NAME:default}}` tokens against environment
 /// variables. Runs on the raw config text after the file is read and before
 /// YAML parsing (unquoted tokens are not valid YAML), so any value in the
-/// file can be injected via the environment — handy for Docker.
+/// file can be injected via the environment -- handy for Docker.
 fn resolve_env_tokens(text: &str) -> Result<String> {
-    let (resolved, used_names) = resolve_env_tokens_with_used(text, |name| std::env::var(name).ok())?;
+    let (resolved, used_names) =
+        resolve_env_tokens_with_used(text, |name| std::env::var(name).ok())?;
     warn_unused_minica_env_vars(&used_names);
     Ok(resolved)
 }
 
 #[cfg(test)]
-fn resolve_env_tokens_with(
-    text: &str,
-    lookup: impl Fn(&str) -> Option<String>,
-) -> Result<String> {
+fn resolve_env_tokens_with(text: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<String> {
     resolve_env_tokens_with_used(text, lookup).map(|(resolved, _)| resolved)
 }
 
@@ -208,29 +206,62 @@ fn resolve_env_tokens_with_used(
         let Some(end) = token.find(CLOSE) else {
             anyhow::bail!("unterminated {{{{ENV:...}}}} token");
         };
-        // NAME or NAME:default — the default may itself contain colons.
+        // NAME or NAME:default. The default may itself contain colons and is
+        // percent-decoded so awkward values like "}}" can be written safely.
         let inner = &token[OPEN.len()..end];
         let (name, default) = match inner.split_once(':') {
-            Some((name, default)) => (name, Some(default)),
-            None => (inner, None),
+            Some((name, default)) => (name.trim(), Some(url_decode_best_effort(default.trim()))),
+            None => (inner.trim(), None),
         };
         if name.is_empty() {
             anyhow::bail!("empty variable name in {{{{ENV:...}}}} token");
         }
         used_names.insert(name.to_string());
-        match lookup(name).or_else(|| default.map(ToString::to_string)) {
-            Some(value) => {
-                eprintln!("config env {name} -> {}", mask_env_value(name, &value));
-                out.push_str(&value)
-            }
-            None => anyhow::bail!(
-                "environment variable {name} is not set and {{{{ENV:{name}}}}} has no default"
-            ),
+        let value = lookup(name).or(default).unwrap_or_default();
+        if value.is_empty() {
+            eprintln!("config env {name} -> <empty>");
+        } else {
+            eprintln!("config env {name} -> {}", mask_env_value(name, &value));
         }
+        out.push_str(&value);
         rest = &token[end + CLOSE.len()..];
     }
     out.push_str(rest);
     Ok((out, used_names))
+}
+
+fn url_decode_best_effort(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut changed = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            {
+                decoded.push((high << 4) | low);
+                changed = true;
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    if !changed {
+        return value.to_string();
+    }
+    String::from_utf8(decoded).unwrap_or_else(|_| value.to_string())
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn warn_unused_minica_env_vars(used_names: &HashSet<String>) {
@@ -385,8 +416,12 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = fs::read_to_string(path)
             .with_context(|| format!("failed to read config file {}", path.display()))?;
-        let text = resolve_env_tokens(&text)
-            .with_context(|| format!("failed to resolve {{{{ENV:...}}}} tokens in {}", path.display()))?;
+        let text = resolve_env_tokens(&text).with_context(|| {
+            format!(
+                "failed to resolve {{{{ENV:...}}}} tokens in {}",
+                path.display()
+            )
+        })?;
         let mut config: Config = serde_yaml::from_str(&text)
             .with_context(|| format!("failed to parse {}", path.display()))?;
         config
@@ -455,26 +490,43 @@ mod env_token_tests {
     fn default_may_be_empty_or_contain_colons() {
         let out = resolve_env_tokens_with("x: {{ENV:A:}}", lookup(&[])).expect("resolves");
         assert_eq!(out, "x: ");
-        let out = resolve_env_tokens_with("url: {{ENV:B:http://h:99/p}}", lookup(&[]))
-            .expect("resolves");
+        let out =
+            resolve_env_tokens_with("url: {{ENV:B:http://h:99/p}}", lookup(&[])).expect("resolves");
         assert_eq!(out, "url: http://h:99/p");
     }
 
     #[test]
-    fn unset_variable_without_default_is_an_error() {
-        let err = resolve_env_tokens_with("user: {{ENV:MISSING}}", lookup(&[]))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("MISSING"), "{err}");
+    fn unset_variable_without_default_resolves_to_empty() {
+        let out = resolve_env_tokens_with("user: {{ENV:MISSING}}", lookup(&[])).expect("resolves");
+        assert_eq!(out, "user: ");
+    }
+
+    #[test]
+    fn names_and_defaults_are_trimmed() {
+        let out =
+            resolve_env_tokens_with("x: {{ENV: A :  fallback  }}", lookup(&[])).expect("resolves");
+        assert_eq!(out, "x: fallback");
+
+        let out = resolve_env_tokens_with("x: {{ENV: A :  fallback  }}", lookup(&[("A", "set")]))
+            .expect("resolves");
+        assert_eq!(out, "x: set");
+    }
+
+    #[test]
+    fn default_is_percent_decoded_best_effort() {
+        let out = resolve_env_tokens_with("x: {{ENV:A:a%3Ab%20%7D%7D}} trailing", lookup(&[]))
+            .expect("resolves");
+        assert_eq!(out, "x: a:b }} trailing");
+
+        let out = resolve_env_tokens_with("x: {{ENV:A:%ZZ%7D}}", lookup(&[])).expect("resolves");
+        assert_eq!(out, "x: %ZZ}");
     }
 
     #[test]
     fn multiple_tokens_resolve_independently() {
-        let out = resolve_env_tokens_with(
-            "a: {{ENV:A:1}}\nb: {{ENV:B:2}}\n",
-            lookup(&[("B", "bee")]),
-        )
-        .expect("resolves");
+        let out =
+            resolve_env_tokens_with("a: {{ENV:A:1}}\nb: {{ENV:B:2}}\n", lookup(&[("B", "bee")]))
+                .expect("resolves");
         assert_eq!(out, "a: 1\nb: bee\n");
     }
 
@@ -610,7 +662,8 @@ mod auth_config_tests {
         let mut auth = parse(
             "users:\n  - username: a\n    password: p\n    role: admin\nheaders:\n  trusted_remotes:\n    - 10.0.0.0/8\n",
         );
-        auth.validate().expect("valid: header identity can be active");
+        auth.validate()
+            .expect("valid: header identity can be active");
         // headers is active (auth.rs dispatches on it) and its networks are parsed
         let headers = auth.active_headers().expect("headers active");
         assert_eq!(headers.trusted_networks.len(), 1);
@@ -658,15 +711,13 @@ mod auth_config_tests {
         assert_eq!(networks.len(), 1);
         assert!(networks[0].contains(&"10.1.2.3".parse::<std::net::IpAddr>().expect("test ip")));
 
-        let mut auth =
-            parse("headers:\n  trusted_remotes:\n    - '-'\n    - '-'\n");
+        let mut auth = parse("headers:\n  trusted_remotes:\n    - '-'\n    - '-'\n");
         auth.validate().expect("valid");
-        assert!(
-            auth.headers
-                .expect("headers config")
-                .trusted_networks
-                .is_empty()
-        );
+        assert!(auth
+            .headers
+            .expect("headers config")
+            .trusted_networks
+            .is_empty());
     }
 
     #[test]

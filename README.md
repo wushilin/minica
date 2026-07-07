@@ -125,9 +125,12 @@ backup-able state, real revocation, hashed credentials, and safe concurrency.
 
 Any value in the config file may be written as `{{ENV:VAR:default}}`: it
 resolves to the environment variable `VAR` when set, otherwise to the default
-after the second colon (`{{ENV:VAR}}` with no default fails startup when the
-variable is unset). Resolution happens after the file is read and before YAML
-parsing, so tokens don't need quoting and may expand to any YAML value.
+after the second colon. `{{ENV:VAR}}` with no default resolves to an empty
+string when the variable is unset. Variable names and fallback values are
+trimmed, fallback values may contain colons, and percent escapes in fallbacks
+are decoded on a best-effort basis, so `}}` can be written as `%7D%7D`.
+Resolution happens after the file is read and before YAML parsing, so tokens
+don't need quoting and may expand to any YAML value.
 
 ```yaml
 auth:
