@@ -206,15 +206,24 @@ fn resolve_env_tokens_with_used(
         let Some(end) = token.find(CLOSE) else {
             anyhow::bail!("unterminated {{{{ENV:...}}}} token");
         };
-        // NAME or NAME:default. The default may itself contain colons and is
-        // percent-decoded so awkward values like "}}" can be written safely.
+        // NAME or NAME:default. The default may itself contain colons and
+        // supports only strict %HH percent escapes, so awkward values like
+        // "}}" can be written safely without form-style '+' decoding.
         let inner = &token[OPEN.len()..end];
         let (name, default) = match inner.split_once(':') {
-            Some((name, default)) => (name.trim(), Some(url_decode_best_effort(default.trim()))),
+            Some((name, default)) => (
+                name.trim(),
+                Some(percent_decode_best_effort(default.trim())),
+            ),
             None => (inner.trim(), None),
         };
         if name.is_empty() {
             anyhow::bail!("empty variable name in {{{{ENV:...}}}} token");
+        }
+        if !is_valid_env_name(name) {
+            anyhow::bail!(
+                "invalid variable name {name:?} in {{{{ENV:...}}}} token; use [A-Za-z_][A-Za-z0-9_]*"
+            );
         }
         used_names.insert(name.to_string());
         let value = lookup(name).or(default).unwrap_or_default();
@@ -230,7 +239,7 @@ fn resolve_env_tokens_with_used(
     Ok((out, used_names))
 }
 
-fn url_decode_best_effort(value: &str) -> String {
+fn percent_decode_best_effort(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut changed = false;
@@ -262,6 +271,17 @@ fn hex_value(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
+}
+
+fn is_valid_env_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() && first != b'_' {
+        return false;
+    }
+    bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 fn warn_unused_minica_env_vars(used_names: &HashSet<String>) {
@@ -513,13 +533,36 @@ mod env_token_tests {
     }
 
     #[test]
-    fn default_is_percent_decoded_best_effort() {
+    fn names_follow_shell_env_var_shape() {
+        let out =
+            resolve_env_tokens_with("a: {{ENV:_A1:one}}\nb: {{ENV:lower_case:two}}", lookup(&[]))
+                .expect("resolves");
+        assert_eq!(out, "a: one\nb: two");
+
+        for token in [
+            "{{ENV:1BAD:default}}",
+            "{{ENV:BAD-NAME:default}}",
+            "{{ENV:BAD.NAME:default}}",
+            "{{ENV:BAD NAME:default}}",
+        ] {
+            let err = resolve_env_tokens_with(token, lookup(&[]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("invalid variable name"), "{err}");
+        }
+    }
+
+    #[test]
+    fn default_percent_decodes_strict_hex_escapes_only() {
         let out = resolve_env_tokens_with("x: {{ENV:A:a%3Ab%20%7D%7D}} trailing", lookup(&[]))
             .expect("resolves");
         assert_eq!(out, "x: a:b }} trailing");
 
         let out = resolve_env_tokens_with("x: {{ENV:A:%ZZ%7D}}", lookup(&[])).expect("resolves");
         assert_eq!(out, "x: %ZZ}");
+
+        let out = resolve_env_tokens_with("x: {{ENV:A:a+b%2Bc}}", lookup(&[])).expect("resolves");
+        assert_eq!(out, "x: a+b+c");
     }
 
     #[test]

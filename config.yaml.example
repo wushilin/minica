@@ -39,9 +39,10 @@ openssl:
 #
 # Any value in this file may also be written as {{ENV:VAR:default}} to read it
 # from an environment variable with a fallback; {{ENV:VAR}} resolves to empty
-# when unset. Names/fallbacks are trimmed, and fallback percent escapes are
-# decoded on a best-effort basis. See config.yaml.docker for a fully
-# parameterised template.
+# when unset. Names/fallbacks are trimmed, and names must match
+# [A-Za-z_][A-Za-z0-9_]*. Fallback percent escapes are decoded on a best-effort
+# basis. Only strict %HH hex escapes are decoded; '+' stays '+'. See
+# config.yaml.docker for a fully parameterised template.
 #
 # Basic auth — only the bootstrap admin is configured here. All other accounts
 # (including viewers) are managed in the database via the Admin Console at

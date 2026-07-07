@@ -127,10 +127,12 @@ Any value in the config file may be written as `{{ENV:VAR:default}}`: it
 resolves to the environment variable `VAR` when set, otherwise to the default
 after the second colon. `{{ENV:VAR}}` with no default resolves to an empty
 string when the variable is unset. Variable names and fallback values are
-trimmed, fallback values may contain colons, and percent escapes in fallbacks
-are decoded on a best-effort basis, so `}}` can be written as `%7D%7D`.
-Resolution happens after the file is read and before YAML parsing, so tokens
-don't need quoting and may expand to any YAML value.
+trimmed. Variable names must match `[A-Za-z_][A-Za-z0-9_]*`. Fallback values
+may contain colons, and percent escapes in fallbacks are decoded on a
+best-effort basis, so `}}` can be written as `%7D%7D`. Only strict `%HH` hex
+escapes are decoded; `+` is left as a literal plus. Resolution happens after
+the file is read and before YAML parsing, so tokens don't need quoting and may
+expand to any YAML value.
 
 ```yaml
 auth:
