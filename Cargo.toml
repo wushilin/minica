@@ -1,6 +1,6 @@
 [package]
 name = "minica"
-version = "1.0.5"
+version = "1.1.0"
 edition = "2024"
 
 [dependencies]
@@ -14,7 +14,6 @@ cookie = "0.18"
 flate2 = "1.1"
 hex = "0.4"
 ipnet = "2"
-libc = "0.2.186"
 rand = "0.9"
 rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -29,3 +28,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.11", features = ["v4", "serde"] }
 zip = "2.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.186"

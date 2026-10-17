@@ -4,3 +4,4 @@ logs/
 cli/mcacli
 dist/
 docker/.test-out/
+.claude/worktrees/

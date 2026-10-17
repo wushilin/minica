@@ -1,0 +1,172 @@
+# Build MiniCA (server + mcacli) for Linux, macOS, Windows and FreeBSD on
+# x86_64 and aarch64. Every push and PR runs tests and builds all targets.
+# A push to main whose Cargo.toml version has no matching v<version> tag yet
+# also publishes a GitHub Release with the archives, so bumping the version
+# is all it takes to cut a release.
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          release=false
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" == refs/heads/main ]] &&
+             ! git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+            release=true
+          fi
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "version $version, release $release"
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cli/go.mod
+      - run: cargo test --locked
+      - run: go vet ./... && go test ./...
+        working-directory: cli
+
+  build:
+    needs: version
+    name: build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64,   os: ubuntu-latest,     target: x86_64-unknown-linux-musl,  goos: linux,   goarch: amd64 }
+          - { name: linux-aarch64,  os: ubuntu-24.04-arm,  target: aarch64-unknown-linux-musl, goos: linux,   goarch: arm64 }
+          - { name: macos-x86_64,   os: macos-latest,      target: x86_64-apple-darwin,        goos: darwin,  goarch: amd64 }
+          - { name: macos-aarch64,  os: macos-latest,      target: aarch64-apple-darwin,       goos: darwin,  goarch: arm64 }
+          - { name: windows-x86_64, os: windows-latest,    target: x86_64-pc-windows-msvc,     goos: windows, goarch: amd64, exe: .exe }
+          - { name: windows-aarch64, os: windows-latest,   target: aarch64-pc-windows-msvc,    goos: windows, goarch: arm64, exe: .exe }
+          - { name: freebsd-x86_64, os: ubuntu-latest,     target: x86_64-unknown-freebsd,     goos: freebsd, goarch: amd64, freebsd: amd64 }
+          - { name: freebsd-aarch64, os: ubuntu-latest,    target: aarch64-unknown-freebsd,    goos: freebsd, goarch: arm64, freebsd: aarch64 }
+    env:
+      STAGE: minica-${{ needs.version.outputs.version }}-${{ matrix.name }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      # The CLI is pure Go, so it cross-compiles from any host.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cli/go.mod
+          cache-dependency-path: cli/go.mod
+      - name: Build mcacli
+        working-directory: cli
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -trimpath -ldflags "-s -w" -o "../$STAGE/mcacli${{ matrix.exe }}" .
+
+      - name: Install Rust
+        if: ${{ !matrix.freebsd }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ !matrix.freebsd }}
+        with:
+          key: ${{ matrix.target }}
+      - name: Install musl tools
+        if: contains(matrix.target, 'linux-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build minica
+        if: ${{ !matrix.freebsd }}
+        run: |
+          if [[ "${{ matrix.target }}" == *linux-musl ]]; then
+            export CC_$(echo "${{ matrix.target }}" | tr - _)=musl-gcc
+          fi
+          cargo build --locked --release --target ${{ matrix.target }}
+          cp "target/${{ matrix.target }}/release/minica${{ matrix.exe }}" "$STAGE/"
+
+      # Rust has no hosted cross toolchain for aarch64 FreeBSD, so both FreeBSD
+      # targets build natively in a VM, using the rust package from pkg.
+      - name: Build minica (FreeBSD VM)
+        if: ${{ matrix.freebsd }}
+        uses: vmactions/freebsd-vm@v1
+        with:
+          arch: ${{ matrix.freebsd }}
+          usesh: true
+          prepare: |
+            sed -i '' 's/quarterly/latest/' /etc/pkg/FreeBSD.conf
+            pkg install -y rust
+          run: |
+            set -e
+            cargo build --locked --release
+            cp target/release/minica "$STAGE/"
+          envs: STAGE
+
+      - name: Package
+        run: |
+          cp README.md config.yaml.example "$STAGE/"
+          mkdir -p dist
+          if [[ -n "${{ matrix.exe }}" ]]; then
+            7z a "dist/$STAGE.zip" "$STAGE" >/dev/null
+          else
+            chmod +x "$STAGE/minica" "$STAGE/mcacli"
+            tar -czf "dist/$STAGE.tar.gz" "$STAGE"
+          fi
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.STAGE }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: [version, test, build]
+    if: needs.version.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          gh release create "v$VERSION" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "v$VERSION" \
+            --generate-notes
