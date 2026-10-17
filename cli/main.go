@@ -6,7 +6,8 @@
 //
 // It first checks whether a certificate with the requested common name already
 // exists under the CA; if so it downloads that certificate (renewing it for 365
-// days first when it expires within a year), otherwise it creates a new one.
+// days first when it expires within 30 days), otherwise it creates a new one.
+// A revoked existing certificate is an error: it is neither renewed nor saved.
 // Either way it saves the cert, key, PKCS#12 bundle, the bundle password, and
 // the issuing CA certificate to disk.
 //
@@ -28,6 +29,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -40,9 +43,14 @@ const (
 
 	msPerDay = int64(86_400_000)
 	// On the reuse path, renew when the existing certificate expires within
-	// this many days, re-issuing it for renewDays days.
-	renewWithinDays = int64(365)
+	// this many days, re-issuing it for renewDays days. The threshold must stay
+	// well below renewDays: a renewal restarts validity at "now" for renewDays
+	// days, so a threshold >= renewDays would renew again on every run.
+	renewWithinDays = int64(30)
 	renewDays       = 365
+
+	// maxResponseBytes caps how much of any server response body is read.
+	maxResponseBytes = 64 << 20
 )
 
 // timeNowMs returns the current time in milliseconds since the Unix epoch,
@@ -73,9 +81,12 @@ func usage() {
 
 Checks whether a certificate with the requested common name already exists under
 the CA: if it does, that certificate is downloaded (and first renewed for 365
-days when it expires within a year); otherwise a new one is created. Either way
+days when it expires within 30 days); otherwise a new one is created. Either way
 the certificate, private key, PKCS#12 bundle, the bundle password, and the
-issuing CA certificate are saved to disk.
+issuing CA certificate are saved to disk. A revoked existing certificate is an
+error (it is not renewed or downloaded). When reusing, explicitly requested
+fields (--hostnames, --org, --key-profile, ...) that differ from the existing
+certificate are reported as warnings; the existing certificate is kept as-is.
 
 USAGE:
   minica cert [flags]
@@ -96,10 +107,14 @@ location with MINICA_CONFIG. Example ~/.minica:
   MINICA_USER=admin
   MINICA_KEY_PROFILE=ecdsa:secp384r1
 
+Prefer MINICA_PASSWORD in the environment or in ~/.minica (chmod 600; a warning
+is printed if a ~/.minica holding a password is group/world accessible) over
+--password, which is visible to other local users in the process list.
+
 CONNECTION (required; flag or env only, never prompted)
   --url            MINICA_URL        Base URL incl. base path, e.g. http://host:9988/minica
   --user           MINICA_USER       Username (must be an admin to create certs)
-  --password       MINICA_PASSWORD   Password
+  --password       MINICA_PASSWORD   Password (prefer the env var / ~/.minica)
   --ca             MINICA_CA_ID      Target CA id
 
 CERTIFICATE FIELDS (flag or env; prompted otherwise)
@@ -122,6 +137,7 @@ CERTIFICATE FIELDS (flag or env; prompted otherwise)
 OUTPUT / BEHAVIOR (flag or env only, never prompted)
   --out-dir        MINICA_OUT_DIR        ./certs            Directory to write files into
   --insecure       MINICA_INSECURE       (off)              Skip TLS certificate verification
+                                                            (env: true/false/1/0)
   -y, --non-interactive                                     Use flags/env/defaults without prompting
   -h, --help                                                Show this help
 
@@ -130,7 +146,11 @@ OUTPUT FILES (with prefix "test1")
   test1.key            private key
   test1.p12            PKCS#12 bundle
   test1.p12.password   PKCS#12 password
-  CA.pem               issuing CA certificate
+  CA.pem               issuing CA certificate (a warning is printed when an
+                       existing CA.pem with different content is replaced)
+
+Files are written atomically (temp file + rename). Secret files (.key, .p12,
+.p12.password) are 0600, certificates 0644; a missing --out-dir is created 0700.
 
 EXAMPLE
   MINICA_URL=http://host:9988/minica MINICA_USER=admin MINICA_PASSWORD=secret \
@@ -246,7 +266,8 @@ func runCert(args []string) error {
 
 	in := bufio.NewReader(os.Stdin)
 	ask := func(label, flagVal, envKey, def string) string {
-		// flag wins, then env (file > os), then prompt (whose default is env-or-built-in).
+		// flag wins, then env (process env > ~/.minica), then prompt (whose
+		// default is env-or-built-in).
 		if flagVal != "" {
 			return flagVal
 		}
@@ -283,11 +304,21 @@ func runCert(args []string) error {
 		return fmt.Errorf("commonName is required")
 	}
 
-	client := newClient(user, password, f.insecure || getEnv("MINICA_INSECURE") != "")
+	insecure := f.insecure
+	if v := strings.TrimSpace(getEnv("MINICA_INSECURE")); v != "" && !insecure {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("invalid MINICA_INSECURE %q: expected true/false/1/0", v)
+		}
+		insecure = b
+	}
+	warnPlainHTTP(url)
+	client := newClient(user, password, insecure)
 
 	// Output name and directory resolution, shared by the reuse and create
-	// paths. Name: flag > prompt (default sanitized CN) > env > "cert". Dir:
-	// flag > env > "./certs".
+	// paths. Name: flag > env (MINICA_NAME, offered as the prompt default) >
+	// sanitized CN (the prompt default otherwise) > "cert". Dir: flag > env >
+	// "./certs".
 	resolveOutPrefix := func() string {
 		outPrefix := f.name
 		if outPrefix == "" {
@@ -318,12 +349,25 @@ func runCert(args []string) error {
 		fmt.Fprintf(os.Stderr, "Certificate %q already exists in this CA; downloading.\n", commonName)
 		fmt.Printf("Cert Id is: %s\n", existingID)
 
-		// Renew before downloading if the existing certificate is within a year
-		// of expiry, so the downloaded artifacts carry the renewed validity. A
+		// Renew before downloading if the existing certificate is close to
+		// expiry, so the downloaded artifacts carry the renewed validity. A
 		// failed renewal is not fatal: warn and download the current cert.
 		existing, err := client.getCert(url, caID, existingID)
 		if err != nil {
 			return err
+		}
+		// A revoked certificate must not be deployed (relying parties checking
+		// the CRL would reject it) and the server refuses to renew it.
+		if existing.RevokedAt != nil {
+			reason := ""
+			if existing.RevocationReason != nil && *existing.RevocationReason != "" {
+				reason = fmt.Sprintf(" (reason: %s)", *existing.RevocationReason)
+			}
+			return fmt.Errorf("certificate %q (id %s) was revoked at %s%s; refusing to renew or download it. Use a different common name, or remove the revoked certificate on the server first",
+				commonName, existingID, time.UnixMilli(*existing.RevokedAt).UTC().Format(time.RFC3339), reason)
+		}
+		for _, w := range reuseMismatches(f, getEnv, existing) {
+			fmt.Fprintf(os.Stderr, "warning: %s\n", w)
 		}
 		if needsRenew(existing.IssueTime, existing.ValidDays, timeNowMs()) {
 			remaining := (existing.IssueTime + existing.ValidDays*msPerDay - timeNowMs()) / msPerDay
@@ -445,13 +489,15 @@ func runCert(args []string) error {
 // sensitivity of each file: the certificate and CA cert are world-readable
 // (0644); the key, PKCS#12 bundle, and its password are owner-only (0600).
 func saveBundle(outDir, prefix string, certPEM, keyPEM, p12, p12pw, caPEM []byte) ([]string, error) {
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
+	// MkdirAll only applies the mode to directories it creates, so an existing
+	// output directory keeps whatever permissions the operator gave it.
+	if err := os.MkdirAll(outDir, 0o700); err != nil {
 		return nil, err
 	}
 	written := []string{}
 	write := func(name string, data []byte, mode os.FileMode) error {
 		p := filepath.Join(outDir, name)
-		if err := os.WriteFile(p, data, mode); err != nil {
+		if err := writeFileAtomic(p, data, mode); err != nil {
 			return fmt.Errorf("writing %s: %w", p, err)
 		}
 		written = append(written, name)
@@ -469,10 +515,182 @@ func saveBundle(outDir, prefix string, certPEM, keyPEM, p12, p12pw, caPEM []byte
 	if err := write(prefix+".p12.password", p12pw, 0o600); err != nil {
 		return nil, err
 	}
+	// CA.pem keeps its fixed name for compatibility; warn when it replaces a
+	// different CA's certificate (several CAs sharing one out-dir).
+	caPath := filepath.Join(outDir, "CA.pem")
+	if old, err := os.ReadFile(caPath); err == nil && !bytes.Equal(bytes.TrimSpace(old), bytes.TrimSpace(caPEM)) {
+		fmt.Fprintf(os.Stderr, "warning: replacing %s, which held a different CA certificate; use a separate --out-dir per CA to keep both\n", caPath)
+	}
 	if err := write("CA.pem", caPEM, 0o644); err != nil {
 		return nil, err
 	}
 	return written, nil
+}
+
+// writeFileAtomic writes data to path via a temporary file in the same
+// directory, which is synced, given exactly the requested mode, and renamed
+// over path. Unlike os.WriteFile, the mode also applies when path already
+// exists, and readers never observe a partially written file.
+func writeFileAtomic(path string, data []byte, mode os.FileMode) (err error) {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		if err != nil {
+			tmp.Close()
+			os.Remove(tmpName)
+		}
+	}()
+	// CreateTemp opens the file 0600, so secret content is never exposed
+	// before the final mode is set.
+	if err = tmp.Chmod(mode); err != nil {
+		return err
+	}
+	if _, err = tmp.Write(data); err != nil {
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	if err = os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	// Best-effort: persist the rename itself.
+	if d, derr := os.Open(dir); derr == nil {
+		_ = d.Sync()
+		d.Close()
+	}
+	return nil
+}
+
+// warnPlainHTTP warns on stderr when credentials would be sent over plain
+// HTTP to a non-loopback host.
+func warnPlainHTTP(rawURL string) {
+	u, err := url.Parse(rawURL)
+	if err != nil || !strings.EqualFold(u.Scheme, "http") {
+		return
+	}
+	host := u.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "warning: %s uses plain http://; the username and password (and downloaded private keys) are sent unencrypted\n", rawURL)
+}
+
+// reuseMismatches compares the certificate fields the user explicitly set
+// (by flag, environment, or ~/.minica) with an existing certificate that is
+// about to be reused, returning one human-readable line per difference. The
+// existing certificate is never modified, so these values are ignored.
+func reuseMismatches(f *flags, getEnv func(string) string, existing *certificate) []string {
+	explicit := func(flagVal, envKey string) (string, bool) {
+		if flagVal != "" {
+			return flagVal, true
+		}
+		if v := getEnv(envKey); v != "" {
+			return v, true
+		}
+		return "", false
+	}
+	const prefix = "existing certificate is reused as-is: "
+	var out []string
+	note := func(what, want, have string) {
+		out = append(out, fmt.Sprintf("%srequested %s %q differs from existing %q", prefix, what, want, have))
+	}
+
+	if hn, ok := explicit(f.hostnames, "MINICA_HOSTNAMES"); ok {
+		dns, ips := splitHostnames(hn)
+		// The server always includes the common name as a DNS SAN.
+		wantDNS := normSet(append(dns, existing.CommonName), strings.ToLower)
+		haveDNS := normSet(existing.DNSList, strings.ToLower)
+		wantIP := normSet(ips, normIP)
+		haveIP := normSet(existing.IPList, normIP)
+		if !equalSets(wantDNS, haveDNS) || !equalSets(wantIP, haveIP) {
+			out = append(out, fmt.Sprintf("%srequested SANs [%s] differ from existing [%s]", prefix,
+				strings.Join(append(sortedKeys(wantDNS), sortedKeys(wantIP)...), ","),
+				strings.Join(append(sortedKeys(haveDNS), sortedKeys(haveIP)...), ",")))
+		}
+	}
+	strFields := []struct {
+		what, flagVal, envKey, have string
+		fold                        bool
+	}{
+		{"key profile", f.keyProfile, "MINICA_KEY_PROFILE", existing.KeyProfile, true},
+		{"digest", f.digest, "MINICA_DIGEST", existing.DigestAlgorithm, true},
+		{"country", f.country, "MINICA_COUNTRY", existing.CountryCode, true},
+		{"state", f.state, "MINICA_STATE", existing.State, false},
+		{"city", f.city, "MINICA_CITY", existing.City, false},
+		{"organization", f.org, "MINICA_ORG", existing.Organization, false},
+		{"organization unit", f.orgUnit, "MINICA_ORG_UNIT", existing.OrganizationUnit, false},
+	}
+	for _, sf := range strFields {
+		want, ok := explicit(sf.flagVal, sf.envKey)
+		if !ok {
+			continue
+		}
+		want = strings.TrimSpace(want)
+		have := strings.TrimSpace(sf.have)
+		if want == have || (sf.fold && strings.EqualFold(want, have)) {
+			continue
+		}
+		note(sf.what, want, have)
+	}
+	if d, ok := explicit(f.days, "MINICA_DAYS"); ok {
+		d = strings.TrimSpace(d)
+		if n, err := strconv.ParseInt(d, 10, 64); err != nil || n != existing.ValidDays {
+			note("valid days", d, strconv.FormatInt(existing.ValidDays, 10))
+		}
+	}
+	if _, ok := explicit(f.p12Password, "MINICA_P12_PASSWORD"); ok {
+		out = append(out, prefix+"the requested PKCS#12 password is ignored; the existing bundle and its password are downloaded")
+	}
+	return out
+}
+
+func normIP(s string) string {
+	if ip := net.ParseIP(strings.TrimSpace(s)); ip != nil {
+		return ip.String()
+	}
+	return strings.TrimSpace(s)
+}
+
+func normSet(items []string, norm func(string) string) map[string]bool {
+	m := map[string]bool{}
+	for _, it := range items {
+		if v := norm(strings.TrimSpace(it)); v != "" {
+			m[v] = true
+		}
+	}
+	return m
+}
+
+func equalSets(a, b map[string]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if !b[k] {
+			return false
+		}
+	}
+	return true
+}
+
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // splitHostnames classifies a comma-separated list into DNS names and IPs.
@@ -532,6 +750,8 @@ func loadEnvFile(path string) (map[string]string, error) {
 		}
 		return nil, fmt.Errorf("reading %s: %w", path, err)
 	}
+	// out is a map, so the deferred check sees the fully parsed values.
+	defer warnLoosePerms(path, out)
 	for n, raw := range strings.Split(string(data), "\n") {
 		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -554,6 +774,24 @@ func loadEnvFile(path string) (map[string]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// warnLoosePerms warns on stderr when the ~/.minica file holds a password but
+// is accessible to group or other users. It never fails the run.
+func warnLoosePerms(path string, values map[string]string) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	if values["MINICA_PASSWORD"] == "" && values["MINICA_P12_PASSWORD"] == "" {
+		return
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+	if perm := st.Mode().Perm(); perm&0o077 != 0 {
+		fmt.Fprintf(os.Stderr, "warning: %s contains a password but has mode %04o (group/other accessible); run: chmod 600 %s\n", path, perm, path)
+	}
 }
 
 func prompt(in *bufio.Reader, label, def string) string {
@@ -596,11 +834,37 @@ func newClient(user, password string, insecure bool) *client {
 }
 
 type certificate struct {
-	ID        string `json:"id"`
-	CertPEM   string `json:"cert_pem"`
-	KeyPEM    string `json:"key_pem"`
-	IssueTime int64  `json:"issue_time"`
-	ValidDays int64  `json:"valid_days"`
+	ID               string   `json:"id"`
+	CommonName       string   `json:"common_name"`
+	CountryCode      string   `json:"country_code"`
+	State            string   `json:"state"`
+	City             string   `json:"city"`
+	Organization     string   `json:"organization"`
+	OrganizationUnit string   `json:"organization_unit"`
+	DNSList          []string `json:"dns_list"`
+	IPList           []string `json:"ip_list"`
+	KeyProfile       string   `json:"key_profile"`
+	DigestAlgorithm  string   `json:"digest_algorithm"`
+	CertPEM          string   `json:"cert_pem"`
+	KeyPEM           string   `json:"key_pem"`
+	IssueTime        int64    `json:"issue_time"`
+	ValidDays        int64    `json:"valid_days"`
+	// RevokedAt is the revocation time in ms since the epoch; nil when the
+	// certificate is not revoked.
+	RevokedAt        *int64  `json:"revoked_at"`
+	RevocationReason *string `json:"revocation_reason"`
+}
+
+// readBody reads a response body, capped at maxResponseBytes.
+func readBody(r io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, maxResponseBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
+	if len(data) > maxResponseBytes {
+		return nil, fmt.Errorf("response exceeds %d bytes", maxResponseBytes)
+	}
+	return data, nil
 }
 
 type envelope struct {
@@ -636,7 +900,10 @@ func (c *client) createCert(baseURL, caID string, body map[string]any) (*certifi
 		return nil, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, err := readBody(resp.Body)
+	if err != nil {
+		return nil, err
+	}
 
 	var env envelope
 	if err := json.Unmarshal(raw, &env); err != nil {
@@ -672,7 +939,10 @@ func (c *client) getCert(baseURL, caID, certID string) (*certificate, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, err := readBody(resp.Body)
+	if err != nil {
+		return nil, err
+	}
 	var env envelope
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return nil, fmt.Errorf("unexpected response (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(raw)))
@@ -707,7 +977,10 @@ func (c *client) renewCert(baseURL, caID, certID string, days int) error {
 		return err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, err := readBody(resp.Body)
+	if err != nil {
+		return err
+	}
 	var env envelope
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return fmt.Errorf("unexpected response (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(raw)))
@@ -736,7 +1009,10 @@ func (c *client) findCertIDByCN(baseURL, caID, cn string) (string, bool, error) 
 		return "", false, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, err := readBody(resp.Body)
+	if err != nil {
+		return "", false, err
+	}
 	if resp.StatusCode == http.StatusNotFound {
 		return "", false, nil
 	}
@@ -775,7 +1051,7 @@ func (c *client) download(baseURL, path string) ([]byte, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	data, err := readBody(resp.Body)
 	if err != nil {
 		return nil, err
 	}

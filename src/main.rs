@@ -126,6 +126,40 @@ fn prompt_line(prompt: &str) -> Result<String> {
     Ok(line.trim_end_matches(['\n', '\r']).to_string())
 }
 
+/// Turns off echo when stdin is a terminal, returning the settings to restore.
+#[cfg(unix)]
+fn disable_echo() -> Option<libc::termios> {
+    let fd = libc::STDIN_FILENO;
+    unsafe {
+        if libc::isatty(fd) != 1 {
+            return None;
+        }
+        let mut term: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut term) != 0 {
+            return None;
+        }
+        let original = term;
+        term.c_lflag &= !libc::ECHO;
+        (libc::tcsetattr(fd, libc::TCSANOW, &term) == 0).then_some(original)
+    }
+}
+
+#[cfg(unix)]
+fn restore_echo(original: libc::termios) {
+    unsafe {
+        libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &original);
+    }
+}
+
+// Echo suppression is Unix-only; elsewhere the secret is read as typed.
+#[cfg(not(unix))]
+fn disable_echo() -> Option<()> {
+    None
+}
+
+#[cfg(not(unix))]
+fn restore_echo(_: ()) {}
+
 /// Prompt on stderr and read a secret from stdin without echoing it. Echo is
 /// only suppressed when stdin is a terminal; piped input is read normally.
 fn prompt_secret(prompt: &str) -> Result<String> {
@@ -134,28 +168,13 @@ fn prompt_secret(prompt: &str) -> Result<String> {
     std::io::stderr().flush()?;
 
     // Disable terminal echo for the duration of the read, restoring it after.
-    let fd = libc::STDIN_FILENO;
-    let mut saved: Option<libc::termios> = None;
-    unsafe {
-        if libc::isatty(fd) == 1 {
-            let mut term: libc::termios = std::mem::zeroed();
-            if libc::tcgetattr(fd, &mut term) == 0 {
-                let original = term;
-                term.c_lflag &= !libc::ECHO;
-                if libc::tcsetattr(fd, libc::TCSANOW, &term) == 0 {
-                    saved = Some(original);
-                }
-            }
-        }
-    }
+    let saved = disable_echo();
 
     let mut line = String::new();
     let read = std::io::stdin().read_line(&mut line);
 
     if let Some(original) = saved {
-        unsafe {
-            libc::tcsetattr(fd, libc::TCSANOW, &original);
-        }
+        restore_echo(original);
         // The user's Enter wasn't echoed; move to a fresh line.
         eprintln!();
     }
@@ -182,23 +201,39 @@ async fn start_server(config: Config) -> Result<()> {
 
     // Header identity wins when present; otherwise enabled Basic auth can serve
     // as a fallback for clients such as the CLI.
-    if config.auth.active_headers().is_some() {
+    if let Some(headers) = config.auth.active_headers() {
         if config.auth.users.as_ref().is_some_and(|users| users.enabled) {
             tracing::info!(
                 "reverse-proxy header auth is enabled; Basic auth remains available when identity headers are absent"
             );
         }
-    } else {
-        // Bootstrap credentials may still be plaintext; warn once at startup so
-        // the operator knows to replace them with bcrypt hashes
-        // (minica --gen-password).
-        for user in config.auth.basic_users() {
-            if !auth::looks_like_bcrypt(&user.password) {
-                tracing::warn!(
-                    username = %user.username,
-                    "bootstrap password stored in plaintext; replace it with a bcrypt hash via `minica --gen-password`"
-                );
-            }
+        if headers.trusted_networks.is_empty() {
+            // Only reachable with the explicit trust_all_remotes opt-in.
+            tracing::warn!(
+                "SECURITY WARNING: header auth trusts identity headers from EVERY remote \
+                 (auth.headers.trust_all_remotes: true). Any client that can reach MiniCA directly \
+                 can impersonate any user, including admins. Pin your proxy with auth.headers.trusted_remotes."
+            );
+        }
+    }
+    // Bootstrap credentials may still be plaintext; warn once at startup so the
+    // operator knows to replace them with bcrypt hashes (minica --gen-password).
+    // This applies whenever Basic auth is enabled, including as a fallback
+    // next to header auth.
+    for user in config.auth.basic_users() {
+        if !auth::looks_like_bcrypt(&user.password) {
+            tracing::warn!(
+                username = %user.username,
+                "bootstrap password stored in plaintext; replace it with a bcrypt hash via `minica --gen-password`"
+            );
+        }
+        if auth::verify_config_password(&user.password, DEFAULT_ADMIN_PASSWORD) {
+            tracing::warn!(
+                username = %user.username,
+                "SECURITY WARNING: bootstrap user still uses the shipped default password \"{DEFAULT_ADMIN_PASSWORD}\"; \
+                 set MINICA_ADMIN_PASSWORD (Docker template) or change auth.users in the config, ideally to a \
+                 bcrypt hash from `minica --gen-password`"
+            );
         }
     }
 
@@ -222,24 +257,14 @@ async fn start_server(config: Config) -> Result<()> {
         openssl,
         config.public_base_url.clone(),
         config.crl.clone(),
-    );
+    )
+    .with_reserved_usernames(config.auth.basic_users().iter().map(|u| u.username.clone()));
     let state = Arc::new(AppState {
         config: config.clone(),
         service,
     });
 
-    let landing = format!("{}/cas", config.server.base_path);
-    let landing_index = landing.clone();
-    let app = Router::new()
-        .route(
-            "/",
-            get(move || async move { axum::response::Redirect::to(&landing) }),
-        )
-        .route(
-            "/index.html",
-            get(move || async move { axum::response::Redirect::to(&landing_index) }),
-        )
-        .nest(&config.server.base_path, web::router(state))
+    let app = app_router(&config, state)
         .layer(axum::middleware::from_fn(web::stamp_peer_ip))
         .layer(TraceLayer::new_for_http());
     let addr = config.addr()?;
@@ -254,6 +279,33 @@ async fn start_server(config: Config) -> Result<()> {
     )
     .await?;
     Ok(())
+}
+
+/// The shipped bootstrap password from config.yaml.example / config.yaml.docker.
+const DEFAULT_ADMIN_PASSWORD: &str = "adminpass";
+
+/// Mounts the web router under `server.base_path` plus root-level redirects to
+/// the landing page. A root base path (normalised to "") is merged instead of
+/// nested, because `Router::nest` panics on "/" and the web router already
+/// serves "/" itself.
+fn app_router(config: &Config, state: Arc<AppState>) -> Router {
+    let base = config.server.base_path.as_str();
+    let landing = format!("{base}/cas");
+    let landing_index = landing.clone();
+    let router = Router::new().route(
+        "/index.html",
+        get(move || async move { axum::response::Redirect::to(&landing_index) }),
+    );
+    if base.is_empty() {
+        router.merge(web::router(state))
+    } else {
+        router
+            .route(
+                "/",
+                get(move || async move { axum::response::Redirect::to(&landing) }),
+            )
+            .nest(base, web::router(state))
+    }
 }
 
 #[cfg(test)]
@@ -286,6 +338,10 @@ mod tests {
         }
 
         fn with_auth(auth: config::AuthConfig) -> Self {
+            Self::with_auth_and_base(auth, "/minica")
+        }
+
+        fn with_auth_and_base(auth: config::AuthConfig, base_path: &str) -> Self {
             let root = std::env::temp_dir().join(format!("minica-rust-test-{}", Uuid::new_v4()));
             fs::create_dir_all(root.join("runtime")).expect("create test runtime");
             fs::create_dir_all(root.join("openssl-work")).expect("create openssl work root");
@@ -294,7 +350,8 @@ mod tests {
                 server: config::ServerConfig {
                     host: "127.0.0.1".to_string(),
                     port: 0,
-                    base_path: "/minica".to_string(),
+                    base_path: base_path.to_string(),
+                    secure_cookies: false,
                 },
                 public_base_url: Some("http://localhost/minica".to_string()),
                 crl: config::CrlConfig::default(),
@@ -325,7 +382,7 @@ mod tests {
                     config.crl.clone(),
                 ),
             });
-            let app = Router::new().nest(&config.server.base_path, web::router(state));
+            let app = app_router(&config, state);
 
             Self { root, app }
         }
@@ -522,6 +579,8 @@ mod tests {
                 admin_group: "admin".to_string(),
                 viewer_group: "user".to_string(),
                 trusted_remotes: trusted_remotes.iter().map(ToString::to_string).collect(),
+                // tests with no trusted list exercise the explicit opt-in
+                trust_all_remotes: trusted_remotes.is_empty(),
                 trusted_networks: Vec::new(),
             }),
         };
@@ -748,6 +807,150 @@ mod tests {
             .await;
         headers_only.assert_status(StatusCode::UNAUTHORIZED);
         assert!(headers_only.headers.contains_key(header::WWW_AUTHENTICATE));
+    }
+
+    #[tokio::test]
+    async fn root_base_path_mounts_without_double_slashes() {
+        // Config::load normalises "/" (and "") to "", which TestEnv bypasses.
+        {
+            let env = TestEnv::with_auth_and_base(
+                config::AuthConfig {
+                    users: Some(basic_users()),
+                    headers: None,
+                },
+                "",
+            );
+            let home = env.request_with_headers("GET", "/", &[]).await;
+            assert!(home.status.is_redirection(), "{}", home.status);
+            assert_eq!(home.header(header::LOCATION), "/cas");
+
+            let index = env.request_with_headers("GET", "/index.html", &[]).await;
+            assert_eq!(index.header(header::LOCATION), "/cas");
+
+            let page = env
+                .request_with_headers(
+                    "GET",
+                    "/cas",
+                    &[("authorization", &basic_auth("admin", "adminpass"))],
+                )
+                .await;
+            page.assert_status(StatusCode::OK);
+            let html = page.text();
+            assert!(html.contains(r#"href="/cas""#), "{html}");
+            assert!(!html.contains("//cas"), "{html}");
+            let cookie = page.header(header::SET_COOKIE);
+            assert!(cookie.contains("Path=/;"), "{cookie}");
+
+            let csrf = env
+                .send("GET", "/api/csrf", None, None, None, Body::empty())
+                .await;
+            csrf.assert_status(StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn csrf_cookie_uses_base_path_and_rejects_forged_cookie_values() {
+        let env = TestEnv::new();
+        let fresh = env
+            .send("GET", "/minica/api/csrf", None, None, None, Body::empty())
+            .await;
+        let cookie = fresh.header(header::SET_COOKIE).to_string();
+        assert!(cookie.contains("Path=/minica;"), "{cookie}");
+        assert!(cookie.contains("HttpOnly"), "{cookie}");
+
+        // A malformed client cookie is not echoed back; a fresh token is minted.
+        let forged = env
+            .request_with_headers(
+                "GET",
+                "/minica/api/csrf",
+                &[("cookie", "minica_csrf=x\"; Domain=evil")],
+            )
+            .await;
+        let token = forged.json()["token"].as_str().expect("token").to_string();
+        assert!(auth::is_valid_csrf_token(&token), "{token}");
+        assert!(!forged.header(header::SET_COOKIE).contains("evil"));
+
+        // A well-formed existing token is kept.
+        let kept = env
+            .request_with_headers(
+                "GET",
+                "/minica/api/csrf",
+                &[("cookie", "minica_csrf=0123456789abcdef0123456789abcdef")],
+            )
+            .await;
+        assert_eq!(kept.json()["token"], "0123456789abcdef0123456789abcdef");
+    }
+
+    #[tokio::test]
+    async fn empty_csrf_token_is_rejected() {
+        let env = TestEnv::new();
+        let response = env
+            .request_with_headers(
+                "DELETE",
+                "/minica/api/cas/whatever",
+                &[
+                    ("authorization", &basic_auth("admin", "adminpass")),
+                    ("cookie", "minica_csrf="),
+                    ("x-csrf-token", ""),
+                ],
+            )
+            .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+        assert_eq!(response.api_envelope()["error"]["code"], "csrf_invalid");
+
+        let form = env
+            .send(
+                "POST",
+                "/minica/cas/whatever/delete",
+                Some(("admin", "adminpass")),
+                None,
+                Some("application/x-www-form-urlencoded"),
+                Body::from("_csrf="),
+            )
+            .await;
+        form.assert_status(StatusCode::BAD_REQUEST);
+        assert!(form.text().contains("CSRF"), "{}", form.text());
+    }
+
+    #[tokio::test]
+    async fn backup_restore_accepts_bodies_over_two_megabytes() {
+        let env = TestEnv::new();
+        let csrf = env.get_csrf().await;
+        // 3 MiB of YAML comment: past axum's 2 MiB default, so the request must
+        // reach the service (which rejects it as an invalid backup) instead of
+        // being cut off with 413.
+        let body = format!("# {}\n", "x".repeat(3 * 1024 * 1024));
+        let response = env
+            .send(
+                "POST",
+                "/minica/api/backup/restore",
+                Some(("admin", "adminpass")),
+                Some(&csrf),
+                Some("application/x-yaml"),
+                Body::from(body),
+            )
+            .await;
+        assert_ne!(response.status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn malformed_multipart_restore_surfaces_the_parse_error() {
+        let env = TestEnv::new();
+        let csrf = env.get_csrf().await;
+        let response = env
+            .send(
+                "POST",
+                "/minica/admin/backup/restore",
+                Some(("admin", "adminpass")),
+                Some(&csrf),
+                Some("multipart/form-data; boundary=XYZ"),
+                Body::from("this is not a multipart body"),
+            )
+            .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let text = response.text();
+        assert!(text.contains("could not read backup upload"), "{text}");
+        assert!(!text.contains("choose a backup YAML file"), "{text}");
     }
 
     #[tokio::test]

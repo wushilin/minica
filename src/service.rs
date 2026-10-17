@@ -1,11 +1,14 @@
 use crate::{
     config::{CrlConfig, Role},
-    db::{CaMeta, CaSecrets, CertMeta, CertSecrets, Db, SCHEMA_VERSION, UserRecord},
+    db::{
+        BackupCaRow, BackupCertRow, BackupSnapshot, CaMeta, CaSecrets, CertMeta, CertSecrets, Db,
+        SCHEMA_VERSION, UserRecord,
+    },
     models::{
         Certificate, CertificateAuthority, CreateCaRequest, CreateCertRequest, CreateUserRequest,
         ImportCaRequest, ImportCertRequest, InspectResponse, UserView,
     },
-    openssl::{OpenSsl, create_subject, random_password},
+    openssl::{OpenSsl, create_subject, normalize_digest, random_password},
 };
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -22,6 +25,9 @@ pub struct AppService {
     openssl: OpenSsl,
     public_base_url: Option<String>,
     crl: CrlConfig,
+    /// Usernames of the config-file (bootstrap) accounts. DB users may not
+    /// reuse them, or the two accounts would shadow each other at login.
+    reserved_usernames: Vec<String>,
 }
 
 pub enum Download {
@@ -111,6 +117,9 @@ pub struct BackupCaSecrets {
     pub crl_der_b64: String,
     #[serde(default)]
     pub crl_updated_at: i64,
+    /// Absent in backups made before CRL numbering; restores as "start at 1".
+    #[serde(default)]
+    pub crlnumber_txt_b64: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -165,7 +174,19 @@ impl AppService {
             openssl,
             public_base_url,
             crl,
+            reserved_usernames: Vec::new(),
         }
+    }
+
+    /// Registers the bootstrap (config-file) usernames so `create_user`
+    /// refuses DB accounts with the same name.
+    pub fn with_reserved_usernames<I, S>(mut self, usernames: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.reserved_usernames = usernames.into_iter().map(Into::into).collect();
+        self
     }
 
     pub fn db(&self) -> &Db {
@@ -219,6 +240,8 @@ impl AppService {
         );
         validate_days(req.valid_days)?;
         let key = key_spec(&req.key_profile)?;
+        let digest = normalize_digest(&req.digest_algorithm)?;
+        validate_password(req.password.as_deref())?;
         self.ensure_unique_ca_common_name(&req.common_name)?;
         let subject = create_subject(
             &req.common_name,
@@ -231,15 +254,16 @@ impl AppService {
         let password = req.password.unwrap_or_else(random_password);
         let id = short_id();
         let work = self.openssl.workdir()?;
-        let secrets = self.openssl.create_ca_files(
+        let mut secrets = self.openssl.create_ca_files(
             work.path(),
             &subject,
             req.valid_days,
-            &req.digest_algorithm,
+            &digest,
             &key.algorithm,
             &key.attributes,
             &password,
         )?;
+        self.attach_initial_crl(&mut secrets)?;
         let meta = CaMeta {
             id: id.clone(),
             common_name: req.common_name,
@@ -252,18 +276,10 @@ impl AppService {
             issue_time: Utc::now().timestamp_millis(),
             valid_days: req.valid_days,
             key_profile: key.profile,
-            digest_algorithm: req.digest_algorithm.to_lowercase(),
+            digest_algorithm: digest,
         };
         self.db.insert_ca(&meta, &secrets)?;
         let ca = self.db.get_ca(&id)?;
-        if self.crl.enabled {
-            let work = self.openssl.workdir()?;
-            let refresh =
-                self.openssl
-                    .generate_crl(work.path(), &secrets, self.crl.next_update_days)?;
-            self.db
-                .update_ca_crl(&id, &refresh.crl_der, &refresh.index_txt)?;
-        }
         tracing::info!(
             ca_id = %id,
             common_name = %ca.common_name,
@@ -282,6 +298,7 @@ impl AppService {
             key_pem_bytes = req.key_pem.len(),
             "importing certificate authority"
         );
+        validate_password(req.password.as_deref())?;
         let id = short_id();
         let password = req.password.unwrap_or_else(random_password);
         let work = self.openssl.workdir()?;
@@ -292,11 +309,7 @@ impl AppService {
             .openssl
             .inspect_cert_text(work.path(), &req.cert_pem)
             .unwrap_or_default();
-        let subject_text = info
-            .iter()
-            .find(|(k, _)| k == "subject")
-            .map(|(_, v)| v.clone())
-            .unwrap_or_else(|| "Imported CA".to_string());
+        let subject_text = self.subject_for_parsing(work.path(), &req.cert_pem, &info);
         let common_name =
             parse_subject_part(&subject_text, "CN").unwrap_or_else(|| "Imported CA".to_string());
         self.ensure_unique_ca_common_name(&common_name)?;
@@ -315,7 +328,8 @@ impl AppService {
             &city,
             &organization_unit,
         )?;
-        let secrets = self.openssl.finish_ca_files(work.path(), &password)?;
+        let mut secrets = self.openssl.finish_ca_files(work.path(), &password)?;
+        self.attach_initial_crl(&mut secrets)?;
         let meta = CaMeta {
             id: id.clone(),
             common_name,
@@ -333,14 +347,6 @@ impl AppService {
         };
         self.db.insert_ca(&meta, &secrets)?;
         let ca = self.db.get_ca(&id)?;
-        if self.crl.enabled {
-            let work = self.openssl.workdir()?;
-            let refresh =
-                self.openssl
-                    .generate_crl(work.path(), &secrets, self.crl.next_update_days)?;
-            self.db
-                .update_ca_crl(&id, &refresh.crl_der, &refresh.index_txt)?;
-        }
         tracing::info!(
             ca_id = %id,
             common_name = %ca.common_name,
@@ -384,16 +390,20 @@ impl AppService {
         }
         let reason = normalize_revocation_reason(reason)?;
         tracing::warn!(ca_id = %ca_id, cert_id = %cert_id, reason = %reason, "revoking certificate");
-        let _cert = self.db.get_cert(ca_id, cert_id)?;
-        if _cert.revoked_at.is_some() {
+        if self.db.get_cert(ca_id, cert_id)?.revoked_at.is_some() {
             bail!("certificate is already revoked");
         }
-        let ca_secrets = self.db.get_ca_secrets(ca_id)?;
-        let cert_secrets = self.db.get_cert_secrets(ca_id, cert_id)?;
         let owner = Uuid::new_v4().to_string();
         self.db.acquire_ca_lock(ca_id, &owner, 120_000)?;
         let revoked_at = Utc::now().timestamp_millis();
         let result = (|| -> Result<Certificate> {
+            // Read the CA's openssl state only once the signing lock is held,
+            // so a concurrent issue/revoke cannot be overwritten with stale data.
+            if self.db.get_cert(ca_id, cert_id)?.revoked_at.is_some() {
+                bail!("certificate is already revoked");
+            }
+            let ca_secrets = self.db.get_ca_secrets(ca_id)?;
+            let cert_secrets = self.db.get_cert_secrets(ca_id, cert_id)?;
             let work = self.openssl.workdir()?;
             let refresh = self.openssl.revoke_cert_files(
                 work.path(),
@@ -408,7 +418,7 @@ impl AppService {
                 &reason,
                 revoked_at,
                 (&refresh.index_txt, &refresh.serial_txt),
-                &refresh.crl_der,
+                (&refresh.crl_der, &refresh.crlnumber_txt),
                 &owner,
             )?;
             self.db.get_cert(ca_id, cert_id)
@@ -449,14 +459,39 @@ impl AppService {
         );
         validate_days(req.valid_days)?;
         let key = key_spec(&req.key_profile)?;
-        for ip in &req.ip_list {
-            ip.parse::<std::net::IpAddr>()
-                .with_context(|| format!("invalid IP SAN: {ip}"))?;
+        let digest = normalize_digest(&req.digest_algorithm)?;
+        validate_password(req.password.as_deref())?;
+        let ip_list = req
+            .ip_list
+            .iter()
+            .map(|ip| ip.trim())
+            .filter(|ip| !ip.is_empty())
+            .map(|ip| {
+                ip.parse::<std::net::IpAddr>()
+                    .map(|ip| ip.to_string())
+                    .map_err(|_| anyhow::anyhow!("invalid IP SAN: {ip:?}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // Every DNS SAN is strictly validated: these values are written into
+        // an openssl config file, where `$`/newlines would otherwise expand
+        // environment variables or inject extra SAN entries.
+        let mut dns_list: Vec<String> = Vec::new();
+        if is_valid_dns_name(&req.common_name) {
+            dns_list.push(req.common_name.clone());
+        }
+        for dns in req.dns_list.iter().map(|dns| dns.trim()) {
+            if dns.is_empty() {
+                continue;
+            }
+            validate_dns_name(dns)?;
+            if !dns_list.iter().any(|known| known.eq_ignore_ascii_case(dns)) {
+                dns_list.push(dns.to_string());
+            }
         }
         self.ensure_unique_cert_common_name(ca_id, &req.common_name)?;
-        let _ca = self.db.get_ca(ca_id)?;
-        let ca_secrets = self.db.get_ca_secrets(ca_id)?;
-        let crl_url = self.crl_url(ca_id);
+        let ca = self.db.get_ca(ca_id)?;
+        let valid_days = self.clamp_to_ca_validity(&ca.cert_pem, req.valid_days)?;
+        let crl_url = self.issuing_crl_url(ca_id)?;
         let subject = create_subject(
             &req.common_name,
             &req.country_code,
@@ -469,6 +504,8 @@ impl AppService {
         let owner = Uuid::new_v4().to_string();
         self.db.acquire_ca_lock(ca_id, &owner, 120_000)?;
         let result = (|| -> Result<Certificate> {
+            // CA state is read under the lock so it cannot be stale.
+            let ca_secrets = self.db.get_ca_secrets(ca_id)?;
             let work = self.openssl.workdir()?;
             let password = req.password.clone().unwrap_or_else(random_password);
             let (secrets, index_txt, serial_txt) = self.openssl.create_cert_files(
@@ -476,22 +513,16 @@ impl AppService {
                 &ca_secrets,
                 &subject,
                 &req.common_name,
-                req.valid_days,
-                &req.digest_algorithm,
+                valid_days,
+                &digest,
                 &key.algorithm,
                 &key.attributes,
-                &req.dns_list,
-                &req.ip_list,
+                &dns_list,
+                &ip_list,
                 &password,
                 crl_url.as_deref(),
                 self.crl.next_update_days,
             )?;
-            let mut dns_list = vec![req.common_name.clone()];
-            for dns in &req.dns_list {
-                if !dns_list.contains(dns) {
-                    dns_list.push(dns.clone());
-                }
-            }
             let meta = CertMeta {
                 id: cert_id.clone(),
                 ca_id: ca_id.to_string(),
@@ -503,16 +534,20 @@ impl AppService {
                 organization_unit: req.organization_unit.clone(),
                 subject,
                 issue_time: Utc::now().timestamp_millis(),
-                valid_days: req.valid_days,
-                dns_list,
-                ip_list: req.ip_list.clone(),
+                valid_days,
+                dns_list: dns_list.clone(),
+                ip_list: ip_list.clone(),
                 key_profile: key.profile,
-                digest_algorithm: req.digest_algorithm.to_lowercase(),
+                digest_algorithm: digest.clone(),
                 revoked_at: None,
                 revocation_reason: None,
             };
-            self.db
-                .insert_cert_with_state(&meta, &secrets, (&index_txt, &serial_txt), &owner)?;
+            self.db.insert_cert_with_state(
+                &meta,
+                &secrets,
+                Some((&index_txt, &serial_txt)),
+                &owner,
+            )?;
             self.db.get_cert(ca_id, &cert_id)
         })();
         if result.is_err() {
@@ -541,8 +576,8 @@ impl AppService {
             key_pem_bytes = req.key_pem.len(),
             "importing certificate"
         );
+        validate_password(req.password.as_deref())?;
         let _ca = self.db.get_ca(ca_id)?;
-        let ca_secrets = self.db.get_ca_secrets(ca_id)?;
         let cert_id = short_id();
         let owner = Uuid::new_v4().to_string();
         let work = self.openssl.workdir()?;
@@ -552,6 +587,7 @@ impl AppService {
             .context("imported certificate PEM is not a valid certificate")?;
         self.db.acquire_ca_lock(ca_id, &owner, 120_000)?;
         let result = (|| -> Result<Certificate> {
+            let ca_secrets = self.db.get_ca_secrets(ca_id)?;
             let password = req.password.clone().unwrap_or_else(random_password);
             let secrets = self
                 .openssl
@@ -568,7 +604,7 @@ impl AppService {
                         err
                     }
                 })?;
-            let subject_text = info_value(&info, "subject").unwrap_or_default();
+            let subject_text = self.subject_for_parsing(work.path(), &req.cert_pem, &info);
             let common_name = parse_subject_part(&subject_text, "CN")
                 .unwrap_or_else(|| "Imported Certificate".to_string());
             self.ensure_unique_cert_common_name(ca_id, &common_name)?;
@@ -587,7 +623,10 @@ impl AppService {
                 .openssl
                 .inspect_cert_text(work.path(), &req.cert_pem)
                 .unwrap_or_default();
-            if !dns_list.contains(&common_name) {
+            // Stored lists are ';'-joined, so drop entries that would corrupt
+            // them (only possible with unusual imported certificates).
+            dns_list.retain(|dns| !dns.contains(';') && !dns.chars().any(char::is_control));
+            if is_valid_dns_name(&common_name) && !dns_list.contains(&common_name) {
                 dns_list.insert(0, common_name.clone());
             }
             let not_before = info_value(&info, "notBefore")
@@ -625,12 +664,10 @@ impl AppService {
                 revoked_at: None,
                 revocation_reason: None,
             };
-            self.db.insert_cert_with_state(
-                &meta,
-                &secrets,
-                (&ca_secrets.index_txt, &ca_secrets.serial_txt),
-                &owner,
-            )?;
+            // Importing does not sign anything, so the CA's index/serial
+            // state is left untouched.
+            self.db
+                .insert_cert_with_state(&meta, &secrets, None, &owner)?;
             self.db.get_cert(ca_id, &cert_id)
         })();
         if result.is_err() {
@@ -656,27 +693,46 @@ impl AppService {
         tracing::info!(ca_id = %ca_id, cert_id = %cert_id, days, "renewing certificate");
         validate_days(days)?;
         let cert = self.db.get_cert(ca_id, cert_id)?;
+        if cert.revoked_at.is_some() {
+            // Renewal reuses the key; a revoked (possibly compromised) key
+            // must not be re-certified.
+            bail!("certificate is revoked and cannot be renewed; issue a new certificate instead");
+        }
+        let ca = self.db.get_ca(ca_id)?;
+        let requested_days = days;
+        let days = self.clamp_to_ca_validity(&ca.cert_pem, days)?;
         let now = Utc::now().timestamp_millis();
         let current_expiry = cert.issue_time + cert.valid_days * 86_400_000;
         let proposed_expiry = now + days * 86_400_000;
         if proposed_expiry <= current_expiry {
+            if days < requested_days {
+                bail!(
+                    "renewal would not extend the certificate expiry: the CA certificate expires first"
+                );
+            }
             let min_days = ((current_expiry - now).max(0) / 86_400_000) + 1;
             bail!(
                 "renewal would not extend the certificate expiry; choose at least {min_days} days"
             );
         }
-        let ca_secrets = self.db.get_ca_secrets(ca_id)?;
-        let cert_secrets = self.db.get_cert_secrets(ca_id, cert_id)?;
-        let crl_url = self.crl_url(ca_id);
+        // Imported certificates may carry a digest we don't sign with; fall
+        // back to the historical default.
+        let digest =
+            normalize_digest(&cert.digest_algorithm).unwrap_or_else(|_| "sha512".to_string());
+        let crl_url = self.issuing_crl_url(ca_id)?;
         let owner = Uuid::new_v4().to_string();
         self.db.acquire_ca_lock(ca_id, &owner, 120_000)?;
         let result = (|| -> Result<Certificate> {
+            // CA state is read under the lock so it cannot be stale.
+            let ca_secrets = self.db.get_ca_secrets(ca_id)?;
+            let cert_secrets = self.db.get_cert_secrets(ca_id, cert_id)?;
             let work = self.openssl.workdir()?;
             let (cert_pem, pkcs12, bundle, index_txt) = self.openssl.renew_cert_files(
                 work.path(),
                 &ca_secrets,
                 &cert_secrets,
                 days,
+                &digest,
                 crl_url.as_deref(),
                 self.crl.next_update_days,
             )?;
@@ -834,17 +890,14 @@ impl AppService {
     #[tracing::instrument(skip(self), err, fields(span_id = %span_id()))]
     pub fn export_backup_yaml(&self) -> Result<String> {
         tracing::info!("exporting backup YAML");
-        let users: Vec<BackupUser> = self
-            .db
-            .list_users()?
-            .into_iter()
-            .map(BackupUser::from)
-            .collect();
+        // One consistent snapshot (single lock + read transaction).
+        let snapshot = self.db.backup_snapshot()?;
+        let users: Vec<BackupUser> = snapshot.users.into_iter().map(BackupUser::from).collect();
         let user_count = users.len();
         let mut cas_out = Vec::new();
-        for ca in self.db.list_backup_cas()? {
+        for (ca, certs) in snapshot.cas {
             let mut certs_out = Vec::new();
-            for cert in self.db.list_backup_certs(&ca.meta.id)? {
+            for cert in certs {
                 certs_out.push(BackupCert {
                     meta: BackupCertMeta {
                         id: cert.meta.id,
@@ -920,9 +973,6 @@ impl AppService {
     pub fn import_backup_yaml(&self, yaml: &str) -> Result<()> {
         tracing::warn!(bytes = yaml.len(), "importing backup YAML");
         let outcome = (|| -> Result<(usize, usize, usize)> {
-            if !self.db.is_empty()? {
-                bail!("backup restore requires an empty database");
-            }
             let backup: BackupFile =
                 serde_yaml::from_str(yaml).context("failed to parse backup YAML")?;
             if backup.format_version != BACKUP_FORMAT_VERSION {
@@ -947,75 +997,10 @@ impl AppService {
                 cert_count,
                 "parsed backup YAML"
             );
-            for user in backup.users {
-                tracing::info!(user_id = %user.id, username = %user.username, role = %user.role, "restoring backup user");
-                self.db.insert_user_restore(
-                    &user.id,
-                    &user.username,
-                    &user.password_hash,
-                    &user.role,
-                    user.created_at,
-                )?;
-            }
-            for ca in backup.certificate_authorities {
-                tracing::info!(ca_id = %ca.meta.id, common_name = %ca.meta.common_name, deleted = ca.meta.deleted, cert_count = ca.certificates.len(), "restoring backup certificate authority");
-                let meta = CaMeta {
-                    id: ca.meta.id.clone(),
-                    common_name: ca.meta.common_name,
-                    country_code: ca.meta.country_code,
-                    state: ca.meta.state,
-                    city: ca.meta.city,
-                    organization: ca.meta.organization,
-                    organization_unit: ca.meta.organization_unit,
-                    subject: ca.meta.subject,
-                    issue_time: ca.meta.issue_time,
-                    valid_days: ca.meta.valid_days,
-                    key_profile: ca.meta.key_profile,
-                    digest_algorithm: ca.meta.digest_algorithm,
-                };
-                self.db.insert_ca_restore_full(
-                    &meta,
-                    &ca.secrets.try_into()?,
-                    ca.meta.deleted,
-                    ca.meta.created_at,
-                    ca.meta.updated_at,
-                )?;
-                for cert in ca.certificates {
-                    tracing::info!(
-                        ca_id = %cert.meta.ca_id,
-                        cert_id = %cert.meta.id,
-                        common_name = %cert.meta.common_name,
-                        deleted = cert.meta.deleted,
-                        "restoring backup certificate"
-                    );
-                    let meta = CertMeta {
-                        id: cert.meta.id,
-                        ca_id: cert.meta.ca_id,
-                        common_name: cert.meta.common_name,
-                        country_code: cert.meta.country_code,
-                        state: cert.meta.state,
-                        city: cert.meta.city,
-                        organization: cert.meta.organization,
-                        organization_unit: cert.meta.organization_unit,
-                        subject: cert.meta.subject,
-                        issue_time: cert.meta.issue_time,
-                        valid_days: cert.meta.valid_days,
-                        dns_list: cert.meta.dns_list,
-                        ip_list: cert.meta.ip_list,
-                        key_profile: cert.meta.key_profile,
-                        digest_algorithm: cert.meta.digest_algorithm,
-                        revoked_at: cert.meta.revoked_at,
-                        revocation_reason: cert.meta.revocation_reason,
-                    };
-                    self.db.insert_cert_restore_full(
-                        &meta,
-                        &cert.secrets.try_into()?,
-                        cert.meta.deleted,
-                        cert.meta.created_at,
-                        cert.meta.updated_at,
-                    )?;
-                }
-            }
+            // Validate and decode everything up front, then restore in a
+            // single transaction (which also re-checks the DB is empty).
+            let snapshot = backup_to_snapshot(backup)?;
+            self.db.restore_backup(&snapshot)?;
             Ok((user_count, ca_count, cert_count))
         })();
         match outcome {
@@ -1105,6 +1090,13 @@ impl AppService {
         }
         let role = Role::parse(&req.role).context("role must be 'admin' or 'viewer'")?;
         tracing::info!(username = %username, role = %role.as_str(), "creating user");
+        if self
+            .reserved_usernames
+            .iter()
+            .any(|reserved| reserved == username)
+        {
+            bail!("username is reserved by a bootstrap account: {username}");
+        }
         if self.db.find_user(username)?.is_some() {
             bail!("username already exists: {username}");
         }
@@ -1154,6 +1146,75 @@ impl AppService {
         self.public_base_url
             .as_ref()
             .map(|base| format!("{}/crl/{ca_id}", base.trim_end_matches('/')))
+    }
+
+    /// The CRL distribution point to embed in a newly signed certificate,
+    /// validated because it is written into the openssl config file.
+    fn issuing_crl_url(&self, ca_id: &str) -> Result<Option<String>> {
+        let Some(url) = self.crl_url(ca_id) else {
+            return Ok(None);
+        };
+        validate_crl_url(&url)?;
+        Ok(Some(url))
+    }
+
+    /// Generates the CA's first (empty) CRL before the CA row is inserted, so
+    /// a CRL failure cannot leave behind a CA that reported an error.
+    fn attach_initial_crl(&self, secrets: &mut CaSecrets) -> Result<()> {
+        if !self.crl.enabled {
+            return Ok(());
+        }
+        let work = self.openssl.workdir()?;
+        let refresh = self
+            .openssl
+            .generate_crl(work.path(), secrets, self.crl.next_update_days)?;
+        secrets.crl_der = refresh.crl_der;
+        secrets.index_txt = refresh.index_txt;
+        secrets.crlnumber_txt = refresh.crlnumber_txt;
+        secrets.crl_updated_at = Utc::now().timestamp_millis();
+        Ok(())
+    }
+
+    /// Caps a leaf validity so it never outlives the issuing CA certificate.
+    /// Returns the effective number of days (recorded as the cert's
+    /// `valid_days`).
+    fn clamp_to_ca_validity(&self, ca_cert_pem: &str, days: i64) -> Result<i64> {
+        let work = self.openssl.workdir()?;
+        let info = self.openssl.inspect_cert(work.path(), ca_cert_pem)?;
+        let Some(not_after) = info_value(&info, "notAfter").and_then(|v| parse_openssl_date(&v))
+        else {
+            tracing::warn!("could not read CA notAfter; leaf validity not clamped");
+            return Ok(days);
+        };
+        let max_days = (not_after - Utc::now().timestamp_millis()) / 86_400_000;
+        if max_days < 1 {
+            bail!("the CA certificate expires within a day; it can no longer issue certificates");
+        }
+        if days > max_days {
+            tracing::warn!(
+                requested_days = days,
+                effective_days = max_days,
+                "clamping certificate validity to the CA certificate's expiry"
+            );
+            return Ok(max_days);
+        }
+        Ok(days)
+    }
+
+    /// The subject of `pem` in a form `parse_subject_part` can split safely:
+    /// RFC 2253 escaping when available, else openssl's default rendering.
+    fn subject_for_parsing(
+        &self,
+        dir: &std::path::Path,
+        pem: &str,
+        info: &[(String, String)],
+    ) -> String {
+        self.openssl
+            .inspect_cert_subject_rfc2253(dir, pem)
+            .ok()
+            .filter(|subject| !subject.is_empty())
+            .or_else(|| info_value(info, "subject"))
+            .unwrap_or_default()
     }
 
     fn with_ca_crl_url(&self, mut ca: CertificateAuthority) -> CertificateAuthority {
@@ -1207,6 +1268,7 @@ impl From<CaSecrets> for BackupCaSecrets {
             serial_txt_b64: b64(&value.serial_txt),
             crl_der_b64: b64(&value.crl_der),
             crl_updated_at: value.crl_updated_at,
+            crlnumber_txt_b64: b64(&value.crlnumber_txt),
         }
     }
 }
@@ -1240,6 +1302,7 @@ impl TryFrom<BackupCaSecrets> for CaSecrets {
                 b64d(&value.crl_der_b64)?
             },
             crl_updated_at: value.crl_updated_at,
+            crlnumber_txt: b64d(&value.crlnumber_txt_b64)?,
         })
     }
 }
@@ -1469,16 +1532,325 @@ fn parse_signature_digest(text: &str) -> Option<String> {
     None
 }
 
+/// Finds the first `key=value` attribute of a distinguished name. Splits only
+/// on unescaped ',' and '+' (RFC 2253), so values such as `O=Acme\, Inc` or
+/// `CN=a\+b` stay intact; escapes (`\,` and `\XX` hex) are decoded.
 fn parse_subject_part(subject: &str, key: &str) -> Option<String> {
-    for part in subject.split(',') {
-        let part = part.trim();
-        if let Some((k, v)) = part.split_once('=') {
-            if k.trim() == key {
-                return Some(v.trim().to_string());
-            }
+    for part in split_unescaped(subject, &[',', '+']) {
+        let mut pieces = split_unescaped(&part, &['=']).into_iter();
+        let Some(k) = pieces.next() else {
+            continue;
+        };
+        let value = pieces.collect::<Vec<_>>().join("=");
+        if k.trim() == key {
+            return Some(unescape_dn_value(value.trim()));
         }
     }
     None
+}
+
+/// Splits on unescaped separator characters, keeping escape sequences intact
+/// in the pieces for later decoding.
+fn split_unescaped(input: &str, separators: &[char]) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for ch in input.chars() {
+        if escaped {
+            current.push('\\');
+            current.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if separators.contains(&ch) {
+            parts.push(std::mem::take(&mut current));
+        } else {
+            current.push(ch);
+        }
+    }
+    if escaped {
+        current.push('\\');
+    }
+    parts.push(current);
+    parts
+}
+
+/// Decodes RFC 2253 value escapes: `\X` is a literal X, `\XX` a hex byte.
+fn unescape_dn_value(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            let hex = bytes
+                .get(i + 1..i + 3)
+                .and_then(|pair| std::str::from_utf8(pair).ok())
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok());
+            if let Some(byte) = hex {
+                out.push(byte);
+                i += 3;
+            } else {
+                out.push(bytes[i + 1]);
+                i += 2;
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// True for a DNS name `validate_dns_name` accepts.
+fn is_valid_dns_name(name: &str) -> bool {
+    validate_dns_name(name).is_ok()
+}
+
+/// Strict DNS SAN validation: LDH labels of 1-63 characters (no leading or
+/// trailing '-'), an optional leading `*.` wildcard label, at most 253
+/// characters, and a non-numeric last label (so IPs go in the IP list).
+/// Anything else — whitespace, control characters, `$`, `\`, `=`, quotes —
+/// is rejected before it can reach an openssl config file.
+fn validate_dns_name(name: &str) -> Result<()> {
+    let invalid = |why: &str| anyhow::anyhow!("invalid DNS name {name:?}: {why}");
+    if name.is_empty() || name.len() > 253 {
+        return Err(invalid("must be 1-253 characters"));
+    }
+    let host = name.strip_prefix("*.").unwrap_or(name);
+    if host.is_empty() {
+        return Err(invalid("wildcard needs a domain after '*.'"));
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    for label in &labels {
+        if label.is_empty() || label.len() > 63 {
+            return Err(invalid("each label must be 1-63 characters"));
+        }
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err(invalid(
+                "only letters, digits and '-' are allowed (plus a leading '*.' wildcard)",
+            ));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(invalid("labels must not start or end with '-'"));
+        }
+    }
+    if labels
+        .last()
+        .is_some_and(|label| label.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err(invalid("looks like an IP address; put it in the IP list"));
+    }
+    Ok(())
+}
+
+/// PKCS#12 passwords are handed to openssl through a file whose first line
+/// is the password, so line breaks (and other control characters) cannot be
+/// represented and are rejected.
+fn validate_password(password: Option<&str>) -> Result<()> {
+    if password.is_some_and(|p| p.chars().any(char::is_control)) {
+        bail!("password must not contain control characters or newlines");
+    }
+    Ok(())
+}
+
+/// The CRL URL is embedded in an openssl config file as `URI:<url>`; allow
+/// only http(s) URLs made of printable ASCII without whitespace, quotes,
+/// backslashes or commas (a comma would start another GeneralName).
+fn validate_crl_url(url: &str) -> Result<()> {
+    let lower = url.to_ascii_lowercase();
+    let scheme_ok = lower.starts_with("http://") || lower.starts_with("https://");
+    let chars_ok = url
+        .chars()
+        .all(|c| c.is_ascii_graphic() && !matches!(c, '"' | '\'' | '\\' | ',' | '<' | '>' | '`'));
+    if !scheme_ok || !chars_ok {
+        bail!(
+            "invalid CRL URL {url:?}: public_base_url must be an http(s) URL without whitespace, quotes, backslashes or commas"
+        );
+    }
+    Ok(())
+}
+
+/// Validates an untrusted backup and decodes it into rows ready for a single
+/// restore transaction.
+fn backup_to_snapshot(backup: BackupFile) -> Result<BackupSnapshot> {
+    let mut snapshot = BackupSnapshot::default();
+    for user in backup.users {
+        let role = Role::parse(&user.role).with_context(|| {
+            format!(
+                "backup user {:?} has unknown role {:?}",
+                user.username, user.role
+            )
+        })?;
+        if user.username.trim().is_empty() || user.username.chars().any(char::is_control) {
+            bail!("backup user {:?} has an invalid username", user.id);
+        }
+        snapshot.users.push(UserRecord {
+            id: user.id,
+            username: user.username,
+            password_hash: user.password_hash,
+            role: role.as_str().to_string(),
+            created_at: user.created_at,
+        });
+    }
+    for ca in backup.certificate_authorities {
+        let ca_id = ca.meta.id.clone();
+        validate_backup_id(&ca_id)?;
+        let secrets: CaSecrets = ca
+            .secrets
+            .try_into()
+            .with_context(|| format!("backup CA {ca_id} has invalid base64 data"))?;
+        require_pem(
+            &secrets.cert_pem,
+            &["CERTIFICATE"],
+            &format!("CA {ca_id} certificate"),
+        )?;
+        require_pem(
+            &secrets.key_pem,
+            &["PRIVATE KEY"],
+            &format!("CA {ca_id} private key"),
+        )?;
+        require_hex_state(&secrets.serial_txt, false, &format!("CA {ca_id} serial"))?;
+        require_hex_state(
+            &secrets.crlnumber_txt,
+            true,
+            &format!("CA {ca_id} CRL number"),
+        )?;
+        let mut certs = Vec::new();
+        for cert in ca.certificates {
+            let cert_id = cert.meta.id.clone();
+            validate_backup_id(&cert_id)?;
+            if cert.meta.ca_id != ca_id {
+                bail!(
+                    "backup certificate {cert_id} claims CA {} but is listed under CA {ca_id}",
+                    cert.meta.ca_id
+                );
+            }
+            for entry in cert.meta.dns_list.iter().chain(&cert.meta.ip_list) {
+                if entry.contains(';') || entry.chars().any(char::is_control) {
+                    bail!("backup certificate {cert_id} has an invalid SAN entry {entry:?}");
+                }
+            }
+            if let Some(reason) = cert.meta.revocation_reason.as_deref() {
+                normalize_revocation_reason(reason).with_context(|| {
+                    format!("backup certificate {cert_id} has an invalid revocation reason")
+                })?;
+            }
+            let cert_secrets: CertSecrets = cert
+                .secrets
+                .try_into()
+                .with_context(|| format!("backup certificate {cert_id} has invalid base64 data"))?;
+            let label = format!("certificate {cert_id}");
+            require_pem(&cert_secrets.cert_pem, &["CERTIFICATE"], &label)?;
+            require_pem(
+                &cert_secrets.key_pem,
+                &["PRIVATE KEY"],
+                &format!("{label} private key"),
+            )?;
+            require_pem(
+                &cert_secrets.csr_pem,
+                &["CERTIFICATE REQUEST"],
+                &format!("{label} CSR"),
+            )?;
+            certs.push(BackupCertRow {
+                meta: CertMeta {
+                    id: cert.meta.id,
+                    ca_id: cert.meta.ca_id,
+                    common_name: cert.meta.common_name,
+                    country_code: cert.meta.country_code,
+                    state: cert.meta.state,
+                    city: cert.meta.city,
+                    organization: cert.meta.organization,
+                    organization_unit: cert.meta.organization_unit,
+                    subject: cert.meta.subject,
+                    issue_time: cert.meta.issue_time,
+                    valid_days: cert.meta.valid_days,
+                    dns_list: cert.meta.dns_list,
+                    ip_list: cert.meta.ip_list,
+                    key_profile: cert.meta.key_profile,
+                    digest_algorithm: cert.meta.digest_algorithm,
+                    revoked_at: cert.meta.revoked_at,
+                    revocation_reason: cert.meta.revocation_reason.clone(),
+                },
+                secrets: cert_secrets,
+                deleted: cert.meta.deleted,
+                revoked_at: cert.meta.revoked_at,
+                revocation_reason: cert.meta.revocation_reason,
+                created_at: cert.meta.created_at,
+                updated_at: cert.meta.updated_at,
+            });
+        }
+        snapshot.cas.push((
+            BackupCaRow {
+                meta: CaMeta {
+                    id: ca.meta.id,
+                    common_name: ca.meta.common_name,
+                    country_code: ca.meta.country_code,
+                    state: ca.meta.state,
+                    city: ca.meta.city,
+                    organization: ca.meta.organization,
+                    organization_unit: ca.meta.organization_unit,
+                    subject: ca.meta.subject,
+                    issue_time: ca.meta.issue_time,
+                    valid_days: ca.meta.valid_days,
+                    key_profile: ca.meta.key_profile,
+                    digest_algorithm: ca.meta.digest_algorithm,
+                },
+                secrets,
+                deleted: ca.meta.deleted,
+                created_at: ca.meta.created_at,
+                updated_at: ca.meta.updated_at,
+            },
+            certs,
+        ));
+    }
+    Ok(snapshot)
+}
+
+/// Ids end up in URLs and download file names; accept only what `short_id`
+/// produces (plus '-'/'_').
+fn validate_backup_id(id: &str) -> Result<()> {
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        bail!("backup contains an invalid id {id:?}");
+    }
+    Ok(())
+}
+
+/// Requires a PEM block whose BEGIN line ends with one of `labels` (so
+/// "PRIVATE KEY" also accepts "RSA PRIVATE KEY" / "EC PRIVATE KEY").
+fn require_pem(bytes: &[u8], labels: &[&str], what: &str) -> Result<()> {
+    let text = String::from_utf8_lossy(bytes);
+    let ok = text.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("-----BEGIN ")
+            && labels
+                .iter()
+                .any(|label| line.ends_with(&format!("{label}-----")))
+    });
+    if !ok {
+        bail!("backup {what} is not a PEM {}", labels.join("/"));
+    }
+    Ok(())
+}
+
+/// openssl serial / crlnumber files hold a single hex number.
+fn require_hex_state(bytes: &[u8], allow_empty: bool, what: &str) -> Result<()> {
+    let text = String::from_utf8_lossy(bytes);
+    let value = text.trim();
+    if value.is_empty() && allow_empty {
+        return Ok(());
+    }
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("backup {what} is not a hex number");
+    }
+    Ok(())
 }
 
 fn info_value(info: &[(String, String)], key: &str) -> Option<String> {
@@ -1491,4 +1863,422 @@ fn parse_openssl_date(value: &str) -> Option<i64> {
     NaiveDateTime::parse_from_str(value.trim(), "%b %e %H:%M:%S %Y GMT")
         .ok()
         .map(|dt| Utc.from_utc_datetime(&dt).timestamp_millis())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::OpenSslConfig;
+    use std::path::PathBuf;
+
+    fn temp_service() -> (AppService, PathBuf) {
+        let root = std::env::temp_dir().join(format!("minica-service-test-{}", Uuid::new_v4()));
+        let db = Db::open(&root.join("db/db.sqlite")).expect("open temp db");
+        let openssl = OpenSsl::new(OpenSslConfig {
+            path: PathBuf::from("/usr/bin/openssl"),
+            timeout_seconds: 60,
+            working_root: root.join("work"),
+            keep_failed_workdirs: false,
+            reap_after_hours: 24,
+        });
+        let service = AppService::new(
+            db,
+            openssl,
+            Some("http://localhost/minica".to_string()),
+            CrlConfig::default(),
+        );
+        (service, root)
+    }
+
+    fn ca_request(common_name: &str, valid_days: i64) -> CreateCaRequest {
+        CreateCaRequest {
+            common_name: common_name.to_string(),
+            country_code: "SG".to_string(),
+            state: String::new(),
+            city: String::new(),
+            organization: "Org".to_string(),
+            organization_unit: String::new(),
+            valid_days,
+            digest_algorithm: "sha256".to_string(),
+            key_profile: "ecdsa:prime256v1".to_string(),
+            password: None,
+        }
+    }
+
+    fn cert_request(common_name: &str, valid_days: i64, dns: &[&str]) -> CreateCertRequest {
+        CreateCertRequest {
+            common_name: common_name.to_string(),
+            country_code: "SG".to_string(),
+            state: String::new(),
+            city: String::new(),
+            organization: "Org".to_string(),
+            organization_unit: String::new(),
+            valid_days,
+            digest_algorithm: "sha384".to_string(),
+            key_profile: "ecdsa:prime256v1".to_string(),
+            password: None,
+            dns_list: dns.iter().map(|d| d.to_string()).collect(),
+            ip_list: vec!["10.0.0.7".to_string()],
+        }
+    }
+
+    fn openssl_text(service: &AppService, args: &[&str], input: (&str, &[u8])) -> String {
+        let work = service.openssl.workdir().unwrap();
+        fs::write(work.path().join(input.0), input.1).unwrap();
+        let out = service
+            .openssl
+            .run_in(work.path(), args, std::time::Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(out.exit_code, 0, "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    #[test]
+    fn dns_validation_is_strict() {
+        for good in [
+            "example.com",
+            "a-b.example.com",
+            "*.example.com",
+            "localhost",
+            "x1.internal",
+        ] {
+            assert!(validate_dns_name(good).is_ok(), "{good} should be valid");
+        }
+        for bad in [
+            "",
+            "a..b",
+            "-a.com",
+            "a-.com",
+            "*.",
+            "a.*.com",
+            "a b.com",
+            "a\nDNS.9 = evil.com",
+            "a${ENV::HOME}.com",
+            "a\\b.com",
+            "a=b.com",
+            "a\"b.com",
+            "10.0.0.1",
+            "under_score.com",
+            &"a".repeat(64),
+            &format!("{}.com", vec!["a".repeat(60); 5].join(".")),
+        ] {
+            assert!(
+                validate_dns_name(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn crl_url_and_password_validation() {
+        assert!(validate_crl_url("https://ca.example.com/minica/crl/abc").is_ok());
+        assert!(validate_crl_url("http://localhost:8080/crl/x?y=1").is_ok());
+        for bad in [
+            "ftp://x/crl",
+            "http://x/crl y",
+            "http://x/crl\nDNS:evil",
+            "http://x/a,DNS:evil",
+            "http://x/\"q",
+        ] {
+            assert!(validate_crl_url(bad).is_err(), "{bad:?} should be rejected");
+        }
+        assert!(validate_password(None).is_ok());
+        assert!(validate_password(Some("p@ss word")).is_ok());
+        assert!(validate_password(Some("a\nb")).is_err());
+    }
+
+    #[test]
+    fn parse_subject_part_handles_rfc2253_escapes() {
+        let subject = r"C=SG,ST=S\, x,O=Org\, Inc\+y,OU=u1+OU=u2,CN=n=1";
+        assert_eq!(parse_subject_part(subject, "C").as_deref(), Some("SG"));
+        assert_eq!(parse_subject_part(subject, "ST").as_deref(), Some("S, x"));
+        assert_eq!(
+            parse_subject_part(subject, "O").as_deref(),
+            Some("Org, Inc+y")
+        );
+        assert_eq!(parse_subject_part(subject, "OU").as_deref(), Some("u1"));
+        assert_eq!(parse_subject_part(subject, "CN").as_deref(), Some("n=1"));
+        assert_eq!(
+            parse_subject_part(r"CN=caf\C3\A9", "CN").as_deref(),
+            Some("café")
+        );
+        assert_eq!(
+            parse_subject_part("C = SG, O = Org", "O").as_deref(),
+            Some("Org")
+        );
+        assert_eq!(parse_subject_part(subject, "L"), None);
+    }
+
+    fn backup_yaml_fixture() -> BackupFile {
+        let pem = |label: &str| {
+            b64(format!("-----BEGIN {label}-----\nAA==\n-----END {label}-----\n").as_bytes())
+        };
+        BackupFile {
+            format_version: BACKUP_FORMAT_VERSION,
+            app_version: String::new(),
+            schema_version: SCHEMA_VERSION,
+            app: "minica-rust".to_string(),
+            exported_at: 0,
+            warning: String::new(),
+            users: vec![BackupUser {
+                id: "u1".to_string(),
+                username: "alice".to_string(),
+                password_hash: "$2b$12$x".to_string(),
+                role: "viewer".to_string(),
+                created_at: 0,
+            }],
+            certificate_authorities: vec![BackupCa {
+                meta: BackupCaMeta {
+                    id: "ca1".to_string(),
+                    common_name: "CA".to_string(),
+                    country_code: "SG".to_string(),
+                    state: String::new(),
+                    city: String::new(),
+                    organization: "Org".to_string(),
+                    organization_unit: String::new(),
+                    subject: "/CN=CA".to_string(),
+                    issue_time: 0,
+                    valid_days: 1,
+                    key_profile: "rsa:2048".to_string(),
+                    digest_algorithm: "sha256".to_string(),
+                    deleted: false,
+                    created_at: 0,
+                    updated_at: 0,
+                },
+                secrets: BackupCaSecrets {
+                    cert_pem_b64: pem("CERTIFICATE"),
+                    key_pem_b64: pem("EC PRIVATE KEY"),
+                    pkcs12_b64: String::new(),
+                    password_b64: String::new(),
+                    index_txt_b64: String::new(),
+                    serial_txt_b64: b64(b"3A5F\n"),
+                    crl_der_b64: String::new(),
+                    crl_updated_at: 0,
+                    // Pre-CRL-number backups have no such field.
+                    crlnumber_txt_b64: String::new(),
+                },
+                certificates: vec![BackupCert {
+                    meta: BackupCertMeta {
+                        id: "c1".to_string(),
+                        ca_id: "ca1".to_string(),
+                        common_name: "web".to_string(),
+                        country_code: "SG".to_string(),
+                        state: String::new(),
+                        city: String::new(),
+                        organization: "Org".to_string(),
+                        organization_unit: String::new(),
+                        subject: "/CN=web".to_string(),
+                        issue_time: 0,
+                        valid_days: 1,
+                        dns_list: vec!["web".to_string()],
+                        ip_list: Vec::new(),
+                        key_profile: "rsa:2048".to_string(),
+                        digest_algorithm: "sha256".to_string(),
+                        revoked_at: None,
+                        revocation_reason: None,
+                        deleted: false,
+                        created_at: 0,
+                        updated_at: 0,
+                    },
+                    secrets: BackupCertSecrets {
+                        cert_pem_b64: pem("CERTIFICATE"),
+                        key_pem_b64: pem("PRIVATE KEY"),
+                        csr_pem_b64: pem("CERTIFICATE REQUEST"),
+                        pkcs12_b64: String::new(),
+                        password_b64: String::new(),
+                        bundle_zip_b64: String::new(),
+                    },
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn backup_validation_rejects_untrusted_input() {
+        assert!(backup_to_snapshot(backup_yaml_fixture()).is_ok());
+
+        let mut backup = backup_yaml_fixture();
+        backup.certificate_authorities[0].certificates[0].meta.ca_id = "other".to_string();
+        assert!(
+            backup_to_snapshot(backup).is_err(),
+            "cert under the wrong CA"
+        );
+
+        let mut backup = backup_yaml_fixture();
+        backup.users[0].role = "superuser".to_string();
+        assert!(backup_to_snapshot(backup).is_err(), "unknown role");
+
+        let mut backup = backup_yaml_fixture();
+        backup.certificate_authorities[0].secrets.key_pem_b64 = b64(b"not a key");
+        assert!(backup_to_snapshot(backup).is_err(), "bad key PEM");
+
+        let mut backup = backup_yaml_fixture();
+        backup.certificate_authorities[0].certificates[0]
+            .meta
+            .dns_list = vec!["a;b".to_string()];
+        assert!(backup_to_snapshot(backup).is_err(), "list separator in SAN");
+
+        let mut backup = backup_yaml_fixture();
+        backup.certificate_authorities[0].secrets.serial_txt_b64 = b64(b"zz");
+        assert!(backup_to_snapshot(backup).is_err(), "non-hex serial");
+
+        // An older backup without the crlnumber field still parses.
+        let yaml = serde_yaml::to_string(&backup_yaml_fixture())
+            .unwrap()
+            .lines()
+            .filter(|line| !line.contains("crlnumber_txt_b64"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!yaml.contains("crlnumber_txt_b64"));
+        let parsed: BackupFile = serde_yaml::from_str(&yaml).unwrap();
+        assert!(backup_to_snapshot(parsed).is_ok());
+    }
+
+    #[test]
+    fn create_user_rejects_bootstrap_username() {
+        let (service, root) = temp_service();
+        let service = service.with_reserved_usernames(["admin"]);
+        let err = service
+            .create_user(CreateUserRequest {
+                username: "admin".to_string(),
+                password: "secret123".to_string(),
+                role: "viewer".to_string(),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reserved"), "{err}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn certificate_lifecycle_hardening() {
+        let (service, root) = temp_service();
+        assert!(
+            service
+                .create_ca(CreateCaRequest {
+                    digest_algorithm: "md5".to_string(),
+                    ..ca_request("bad digest", 30)
+                })
+                .is_err()
+        );
+        let ca = service.create_ca(ca_request("Hardening CA", 30)).unwrap();
+
+        // New CA: random positive serial, and a v2 CRL carrying a CRL number.
+        let secrets = service.db.get_ca_secrets(&ca.id).unwrap();
+        let serial = String::from_utf8_lossy(&secrets.serial_txt)
+            .trim()
+            .to_string();
+        assert_eq!(serial.len(), 32, "{serial}");
+        assert_ne!(serial, "00");
+        let crl = openssl_text(
+            &service,
+            &["crl", "-inform", "DER", "-in", "c.crl", "-noout", "-text"],
+            ("c.crl", &secrets.crl_der),
+        );
+        assert!(
+            crl.contains("Version 2") && crl.contains("CRL Number"),
+            "{crl}"
+        );
+
+        // Injection attempts are rejected before reaching openssl.
+        for dns in ["a\nDNS.9 = evil.com", "${ENV::HOME}.example.com"] {
+            let err = service
+                .create_cert(&ca.id, cert_request("leaf.example.com", 10, &[dns]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("invalid DNS name"), "{err}");
+        }
+        assert!(
+            service
+                .create_cert(&ca.id, cert_request("leaf\n", 10, &[]))
+                .is_err()
+        );
+
+        // Leaf validity is clamped to the CA's expiry; -md is honoured.
+        let cert = service
+            .create_cert(
+                &ca.id,
+                cert_request("leaf.example.com", 400, &["alt.example.com"]),
+            )
+            .unwrap();
+        assert!(cert.valid_days < 30, "valid_days {}", cert.valid_days);
+        assert_eq!(cert.dns_list, vec!["leaf.example.com", "alt.example.com"]);
+        let text = openssl_text(
+            &service,
+            &["x509", "-in", "c.pem", "-noout", "-text"],
+            ("c.pem", cert.cert_pem.as_bytes()),
+        );
+        assert!(text.contains("ecdsa-with-SHA384"), "{text}");
+
+        // Renewal keeps SANs (imported certs too) and reissues a new serial.
+        let renewed = service.renew_cert(&ca.id, &cert.id, 29).unwrap();
+        assert_ne!(renewed.cert_pem, cert.cert_pem);
+        service.delete_cert(&ca.id, &cert.id).unwrap();
+        let imported = service
+            .import_cert(
+                &ca.id,
+                ImportCertRequest {
+                    cert_pem: renewed.cert_pem.clone(),
+                    key_pem: renewed.key_pem.clone(),
+                    password: None,
+                },
+            )
+            .unwrap();
+        let renewed_import = service.renew_cert(&ca.id, &imported.id, 29).unwrap();
+        let sans = openssl_text(
+            &service,
+            &["x509", "-in", "c.pem", "-noout", "-ext", "subjectAltName"],
+            ("c.pem", renewed_import.cert_pem.as_bytes()),
+        );
+        assert!(
+            sans.contains("DNS:alt.example.com") && sans.contains("10.0.0.7"),
+            "{sans}"
+        );
+        // A mismatched key is reported as such.
+        let other = service
+            .create_cert(&ca.id, cert_request("other.example.com", 10, &[]))
+            .unwrap();
+        let err = service
+            .import_cert(
+                &ca.id,
+                ImportCertRequest {
+                    cert_pem: renewed.cert_pem.clone(),
+                    key_pem: other.key_pem.clone(),
+                    password: None,
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not match"), "{err}");
+
+        // Revoking revokes every serial issued for the same subject, and a
+        // revoked certificate cannot be renewed.
+        service
+            .revoke_cert(&ca.id, &imported.id, "keyCompromise")
+            .unwrap();
+        let index = String::from_utf8_lossy(&service.db.get_ca_secrets(&ca.id).unwrap().index_txt)
+            .to_string();
+        let leaf_lines: Vec<&str> = index
+            .lines()
+            .filter(|l| l.ends_with("CN=leaf.example.com"))
+            .collect();
+        assert!(leaf_lines.len() >= 3, "{index}");
+        assert!(leaf_lines.iter().all(|l| l.starts_with('R')), "{index}");
+        let err = service
+            .renew_cert(&ca.id, &imported.id, 29)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("revoked"), "{err}");
+        assert!(
+            service
+                .get_cert(&ca.id, &imported.id)
+                .unwrap()
+                .revoked_at
+                .is_some()
+        );
+
+        // Restoring the original from trash would duplicate the active CN.
+        assert!(service.restore_cert(&ca.id, &cert.id).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
 }

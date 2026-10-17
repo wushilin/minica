@@ -24,12 +24,27 @@ pub struct CrlRefresh {
     pub crl_der: Vec<u8>,
     pub index_txt: Vec<u8>,
     pub serial_txt: Vec<u8>,
+    pub crlnumber_txt: Vec<u8>,
 }
 
 pub struct WorkDir {
     path: PathBuf,
     keep: bool,
+    /// Keep the directory on drop only if an openssl command failed in it
+    /// (`keep_failed_workdirs`); successful workdirs are always removed.
+    keep_failed: bool,
 }
+
+/// Marker dropped into a workdir by `run_ok` when an openssl command fails, so
+/// `WorkDir`'s destructor can tell failed workdirs from successful ones.
+const FAILED_MARKER: &str = ".openssl-failed";
+
+/// Starting value of a CA's `crlnumber` file (hex, as openssl expects).
+pub const INITIAL_CRL_NUMBER: &[u8] = b"01\n";
+
+/// Digests accepted for CA and leaf signing. Anything else is rejected before
+/// it can be turned into an openssl flag.
+pub const SUPPORTED_DIGESTS: [&str; 3] = ["sha256", "sha384", "sha512"];
 
 pub struct CommandResult {
     pub stdout: Vec<u8>,
@@ -80,6 +95,8 @@ impl ChildGuard {
                 }
             }
         }
+        #[cfg(not(unix))]
+        let _ = grace;
         // Forceful: SIGKILL, then reap so no zombie is left behind.
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -195,17 +212,22 @@ impl OpenSsl {
             .map(char::from)
             .collect();
         let path = self.config.working_root.join(format!("{stamp}-{suffix}"));
-        fs::create_dir(&path)?;
-        let path = path.canonicalize()?;
+        // Create the directory owner-only from the start rather than chmod'ing
+        // it afterwards, so key material is never briefly world-readable.
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
         }
+        builder.create(&path)?;
+        let path = path.canonicalize()?;
         tracing::debug!(workdir = %path.display(), "created openssl workdir");
         Ok(WorkDir {
             path,
-            keep: self.config.keep_failed_workdirs,
+            keep: false,
+            keep_failed: self.config.keep_failed_workdirs,
         })
     }
 
@@ -329,6 +351,7 @@ impl OpenSsl {
             algorithm,
             "creating certificate authority files with openssl"
         );
+        let digest = normalize_digest(digest)?;
         self.generate_key(dir, "ca-key.pem", algorithm, options)?;
         self.run_ok(
             dir,
@@ -341,7 +364,7 @@ impl OpenSsl {
                 &valid_days.to_string(),
                 "-key",
                 "ca-key.pem",
-                &format!("-{}", normalize_digest(digest)),
+                &format!("-{digest}"),
                 "-out",
                 "ca-cert.pem",
                 "-subj",
@@ -353,6 +376,7 @@ impl OpenSsl {
 
     pub fn finish_ca_files(&self, dir: &Path, password: &str) -> Result<CaSecrets> {
         tracing::debug!(workdir = %dir.display(), "creating certificate authority PKCS12 and state files");
+        let passout = write_pass_file(dir, "ca-p12.pass", password.as_bytes())?;
         self.run_ok(
             dir,
             &[
@@ -365,12 +389,19 @@ impl OpenSsl {
                 "-inkey",
                 "ca-key.pem",
                 "-passout",
-                &format!("pass:{password}"),
+                &passout,
             ],
         )?;
-        fs::write(dir.join("password.txt"), password)?;
-        fs::write(dir.join("index.txt"), b"")?;
-        fs::write(dir.join("serial.txt"), b"00")?;
+        write_secret(&dir.join("password.txt"), password.as_bytes())?;
+        write_secret(&dir.join("index.txt"), b"")?;
+        // RFC 5280 wants positive, unpredictable serials. A random 128-bit
+        // start also keeps an imported CA from re-issuing serials it already
+        // used elsewhere.
+        write_secret(
+            &dir.join("serial.txt"),
+            format!("{}\n", random_serial_hex()).as_bytes(),
+        )?;
+        write_secret(&dir.join("crlnumber.txt"), INITIAL_CRL_NUMBER)?;
         let secrets = CaSecrets {
             cert_pem: fs::read(dir.join("ca-cert.pem"))?,
             key_pem: fs::read(dir.join("ca-key.pem"))?,
@@ -380,6 +411,7 @@ impl OpenSsl {
             serial_txt: fs::read(dir.join("serial.txt"))?,
             crl_der: Vec::new(),
             crl_updated_at: 0,
+            crlnumber_txt: fs::read(dir.join("crlnumber.txt"))?,
         };
         tracing::info!(
             cert_bytes = secrets.cert_pem.len(),
@@ -417,6 +449,7 @@ impl OpenSsl {
             ip_count = ip_list.len(),
             "creating certificate files with openssl"
         );
+        let digest = normalize_digest(digest)?;
         export_ca_state(dir, ca)?;
         fs::create_dir_all(dir.join("certs"))?;
         let cert_dir = dir.join("cert");
@@ -427,7 +460,7 @@ impl OpenSsl {
         )?;
         fs::write(
             dir.join("openssl-cert.conf"),
-            cert_config(common_name, dns_list, ip_list),
+            cert_config(dns_list, ip_list),
         )?;
         self.generate_key(dir, "cert/cert.key", algorithm, options)?;
         self.run_ok(
@@ -439,7 +472,7 @@ impl OpenSsl {
                 "-new",
                 "-key",
                 "cert/cert.key",
-                &format!("-{}", normalize_digest(digest)),
+                &format!("-{digest}"),
                 "-nodes",
                 "-out",
                 "cert/cert.csr",
@@ -457,6 +490,8 @@ impl OpenSsl {
                 "openssl-ca.conf",
                 "-days",
                 &valid_days.to_string(),
+                "-md",
+                &digest,
                 "-batch",
                 "-policy",
                 "signing_policy",
@@ -469,6 +504,7 @@ impl OpenSsl {
                 "cert/cert.csr",
             ],
         )?;
+        let passout = write_pass_file(dir, "cert-p12.pass", password.as_bytes())?;
         self.run_ok(
             dir,
             &[
@@ -481,10 +517,10 @@ impl OpenSsl {
                 "-inkey",
                 "cert/cert.key",
                 "-passout",
-                &format!("pass:{password}"),
+                &passout,
             ],
         )?;
-        fs::write(cert_dir.join("password.txt"), password)?;
+        write_secret(&cert_dir.join("password.txt"), password.as_bytes())?;
         let secrets = read_cert_secrets(&cert_dir, dir)?;
         let index_txt = fs::read(dir.join("index.txt"))?;
         let serial_txt = fs::read(dir.join("serial.txt"))?;
@@ -555,16 +591,23 @@ impl OpenSsl {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn renew_cert_files(
         &self,
         dir: &Path,
         ca: &CaSecrets,
         cert: &CertSecrets,
         valid_days: i64,
+        digest: &str,
         crl_url: Option<&str>,
         crl_days: i64,
     ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
-        tracing::info!(valid_days, "renewing certificate files with openssl");
+        tracing::info!(
+            valid_days,
+            digest,
+            "renewing certificate files with openssl"
+        );
+        let digest = normalize_digest(digest)?;
         export_ca_state(dir, ca)?;
         fs::create_dir_all(dir.join("certs"))?;
         fs::write(
@@ -573,9 +616,8 @@ impl OpenSsl {
         )?;
         let cert_dir = dir.join("cert");
         fs::create_dir(&cert_dir)?;
-        fs::write(cert_dir.join("cert.key"), &cert.key_pem)?;
+        write_secret(&cert_dir.join("cert.key"), &cert.key_pem)?;
         fs::write(cert_dir.join("cert.csr"), &cert.csr_pem)?;
-        let password = String::from_utf8_lossy(&cert.password).to_string();
         self.run_ok(
             dir,
             &[
@@ -584,6 +626,8 @@ impl OpenSsl {
                 "openssl-ca.conf",
                 "-days",
                 &valid_days.to_string(),
+                "-md",
+                &digest,
                 "-batch",
                 "-policy",
                 "signing_policy",
@@ -596,6 +640,7 @@ impl OpenSsl {
                 "cert/cert.csr",
             ],
         )?;
+        let passout = write_pass_file(dir, "cert-p12.pass", &cert.password)?;
         self.run_ok(
             dir,
             &[
@@ -608,10 +653,10 @@ impl OpenSsl {
                 "-inkey",
                 "cert/cert.key",
                 "-passout",
-                &format!("pass:{password}"),
+                &passout,
             ],
         )?;
-        fs::write(cert_dir.join("password.txt"), &cert.password)?;
+        write_secret(&cert_dir.join("password.txt"), &cert.password)?;
         let cert_pem = fs::read(cert_dir.join("cert.pem"))?;
         let pkcs12 = fs::read(cert_dir.join("cert.p12"))?;
         let bundle = create_bundle(&cert_dir, dir)?;
@@ -657,11 +702,7 @@ impl OpenSsl {
                 "DER",
             ],
         )?;
-        let refresh = CrlRefresh {
-            crl_der: fs::read(dir.join("ca.crl"))?,
-            index_txt: fs::read(dir.join("index.txt"))?,
-            serial_txt: fs::read(dir.join("serial.txt"))?,
-        };
+        let refresh = read_crl_refresh(dir)?;
         tracing::info!(
             crl_bytes = refresh.crl_der.len(),
             index_bytes = refresh.index_txt.len(),
@@ -695,6 +736,24 @@ impl OpenSsl {
                 reason,
             ],
         )?;
+        // Renewal reissues the same key under a new serial, leaving the earlier
+        // serials 'V' in index.txt. Revoke those too so the old certificates
+        // cannot outlive the revocation of the current one.
+        let serial_out = self.run_ok(dir, &["x509", "-in", "revoke.pem", "-noout", "-serial"])?;
+        let serial = String::from_utf8_lossy(&serial_out.stdout)
+            .trim()
+            .trim_start_matches("serial=")
+            .to_string();
+        let index = fs::read_to_string(dir.join("index.txt"))?;
+        let (index, extra_revoked) = revoke_superseded_index_entries(&index, &serial);
+        if extra_revoked > 0 {
+            write_secret(&dir.join("index.txt"), index.as_bytes())?;
+            tracing::warn!(
+                serial = %serial,
+                extra_revoked,
+                "also revoked earlier serials issued for the same certificate"
+            );
+        }
         self.run_ok(
             dir,
             &[
@@ -718,11 +777,7 @@ impl OpenSsl {
                 "DER",
             ],
         )?;
-        let refresh = CrlRefresh {
-            crl_der: fs::read(dir.join("ca.crl"))?,
-            index_txt: fs::read(dir.join("index.txt"))?,
-            serial_txt: fs::read(dir.join("serial.txt"))?,
-        };
+        let refresh = read_crl_refresh(dir)?;
         tracing::info!(
             reason,
             crl_bytes = refresh.crl_der.len(),
@@ -745,23 +800,51 @@ impl OpenSsl {
         let cert_dir = dir.join("cert");
         fs::create_dir(&cert_dir)?;
         fs::write(cert_dir.join("cert.pem"), cert_pem.as_bytes())?;
-        fs::write(cert_dir.join("cert.key"), key_pem.as_bytes())?;
+        write_secret(&cert_dir.join("cert.key"), key_pem.as_bytes())?;
         self.run_ok(dir, &["verify", "-CAfile", "ca-cert.pem", "cert/cert.pem"])
             .context("imported certificate was not issued by this CA")?;
-        self.run_ok(
-            dir,
-            &[
-                "x509",
-                "-x509toreq",
+        // `x509 -x509toreq -signkey` happily signs with a mismatched key, so
+        // compare the public keys explicitly.
+        let key_pub = self
+            .run_ok(dir, &["pkey", "-in", "cert/cert.key", "-pubout"])
+            .context("imported private key could not be read")?;
+        let cert_pub = self.run_ok(dir, &["x509", "-in", "cert/cert.pem", "-noout", "-pubkey"])?;
+        if String::from_utf8_lossy(&key_pub.stdout).trim()
+            != String::from_utf8_lossy(&cert_pub.stdout).trim()
+        {
+            bail!("imported private key does not match the certificate");
+        }
+        // `-copy_extensions copyall` (OpenSSL 3) carries the SANs into the CSR
+        // so renewals keep them; older openssl/LibreSSL lack the option, so
+        // fall back to the plain conversion there.
+        let to_req = |copy: bool| {
+            let mut args = vec!["x509", "-x509toreq"];
+            if copy {
+                args.extend(["-copy_extensions", "copyall"]);
+            }
+            args.extend([
                 "-in",
                 "cert/cert.pem",
                 "-signkey",
                 "cert/cert.key",
                 "-out",
                 "cert/cert.csr",
-            ],
-        )
-        .context("imported private key does not match the certificate")?;
+            ]);
+            args
+        };
+        let copied = self.run_in(
+            dir,
+            &to_req(true),
+            Duration::from_secs(self.config.timeout_seconds),
+        )?;
+        if copied.exit_code != 0 {
+            tracing::warn!(
+                "openssl x509 -copy_extensions failed; imported certificate renewals will not keep SANs"
+            );
+            self.run_ok(dir, &to_req(false))
+                .context("failed to derive a CSR from the imported certificate")?;
+        }
+        let passout = write_pass_file(dir, "cert-p12.pass", password.as_bytes())?;
         self.run_ok(
             dir,
             &[
@@ -774,10 +857,10 @@ impl OpenSsl {
                 "-inkey",
                 "cert/cert.key",
                 "-passout",
-                &format!("pass:{password}"),
+                &passout,
             ],
         )?;
-        fs::write(cert_dir.join("password.txt"), password)?;
+        write_secret(&cert_dir.join("password.txt"), password.as_bytes())?;
         let secrets = read_cert_secrets(&cert_dir, dir)?;
         tracing::info!(
             cert_bytes = secrets.cert_pem.len(),
@@ -825,6 +908,32 @@ impl OpenSsl {
         let text = String::from_utf8_lossy(&out.stdout).to_string();
         tracing::debug!(bytes = text.len(), "inspected certificate text");
         Ok(text)
+    }
+
+    /// The certificate subject in escaped RFC 2253 syntax (kept in DER order),
+    /// so values containing ',' '+' or '=' can be split unambiguously.
+    pub fn inspect_cert_subject_rfc2253(&self, dir: &Path, pem: &str) -> Result<String> {
+        tracing::debug!(workdir = %dir.display(), "inspecting certificate subject with openssl");
+        fs::write(dir.join("inspect-subject.pem"), pem)?;
+        let out = self.run_ok(
+            dir,
+            &[
+                "x509",
+                "-in",
+                "inspect-subject.pem",
+                "-noout",
+                "-subject",
+                "-nameopt",
+                "RFC2253,-esc_msb,-dn_rev",
+            ],
+        )?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let text = text.trim();
+        Ok(text
+            .strip_prefix("subject=")
+            .unwrap_or(text)
+            .trim()
+            .to_string())
     }
 
     pub fn inspect_cert_purposes(&self, dir: &Path, pem: &str) -> Result<Vec<(String, String)>> {
@@ -884,6 +993,8 @@ impl OpenSsl {
     fn run_ok(&self, cwd: &Path, args: &[&str]) -> Result<CommandResult> {
         let result = self.run_in(cwd, args, Duration::from_secs(self.config.timeout_seconds))?;
         if result.exit_code != 0 {
+            // Flag the workdir so `keep_failed_workdirs` retains it.
+            let _ = fs::write(cwd.join(FAILED_MARKER), args.first().copied().unwrap_or(""));
             bail!(
                 "openssl {} failed: {}",
                 args.first().copied().unwrap_or(""),
@@ -906,7 +1017,8 @@ impl WorkDir {
 
 impl Drop for WorkDir {
     fn drop(&mut self) {
-        if !self.keep {
+        let failed = self.path.join(FAILED_MARKER).exists();
+        if !(self.keep || (self.keep_failed && failed)) {
             match fs::remove_dir_all(&self.path) {
                 Ok(_) => tracing::debug!(workdir = %self.path.display(), "removed openssl workdir"),
                 Err(err) => tracing::warn!(
@@ -946,6 +1058,18 @@ pub fn create_subject(
     if organization.trim().is_empty() {
         bail!("organization is required");
     }
+    for (label, value) in [
+        ("common name", common_name),
+        ("country code", country_code),
+        ("organization", organization),
+        ("state", state),
+        ("city", city),
+        ("organization unit", organization_unit),
+    ] {
+        if value.chars().any(char::is_control) {
+            bail!("{label} must not contain control characters or newlines");
+        }
+    }
     let mut subject = format!("/C={}", escape_subject(country_code));
     if !state.trim().is_empty() {
         subject.push_str(&format!("/ST={}", escape_subject(state)));
@@ -961,20 +1085,154 @@ pub fn create_subject(
     Ok(subject)
 }
 
+/// Escapes a value for `openssl -subj`. Besides the `/` RDN separator, `+`
+/// starts a multi-valued RDN (always enabled in OpenSSL 3) and `=` separates
+/// type from value, so all of them are backslash-escaped.
 fn escape_subject(input: &str) -> String {
-    input.replace('\\', "\\\\").replace('/', "\\/")
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if matches!(ch, '\\' | '/' | '+' | '=') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
-fn normalize_digest(input: &str) -> String {
-    input.trim().trim_start_matches('-').to_lowercase()
+/// Normalizes a digest name ("SHA-512", "-sha512", " sha512 ") and rejects
+/// anything outside `SUPPORTED_DIGESTS`, since the result becomes an openssl
+/// command-line flag.
+pub fn normalize_digest(input: &str) -> Result<String> {
+    let normalized = input
+        .trim()
+        .trim_start_matches('-')
+        .replace('-', "")
+        .to_ascii_lowercase();
+    if SUPPORTED_DIGESTS.contains(&normalized.as_str()) {
+        Ok(normalized)
+    } else {
+        bail!(
+            "digest algorithm must be one of {}",
+            SUPPORTED_DIGESTS.join(", ")
+        )
+    }
+}
+
+/// A random positive 128-bit serial in hex: the first byte is kept below
+/// 0x80 (positive in DER) and non-zero (no leading-zero ambiguity).
+pub fn random_serial_hex() -> String {
+    let mut bytes: [u8; 16] = rand::rng().random();
+    bytes[0] &= 0x7f;
+    if bytes[0] == 0 {
+        bytes[0] = 0x01;
+    }
+    hex::encode_upper(bytes)
+}
+
+/// Writes a file readable only by the owner (key material, passwords, CA
+/// state), instead of relying on the process umask.
+fn write_secret(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.write_all(bytes)?;
+    Ok(())
+}
+
+/// Writes a password for openssl's `file:` source and returns the argument.
+/// Passing `pass:<secret>` would expose it in the process list. openssl reads
+/// the first line, so a trailing newline keeps an empty password valid.
+fn write_pass_file(dir: &Path, name: &str, password: &[u8]) -> Result<String> {
+    if password.iter().any(|b| matches!(b, b'\n' | b'\r')) {
+        bail!("password must not contain newlines");
+    }
+    let mut content = password.to_vec();
+    content.push(b'\n');
+    write_secret(&dir.join(name), &content)?;
+    Ok(format!("file:{name}"))
 }
 
 fn export_ca_state(dir: &Path, ca: &CaSecrets) -> Result<()> {
     fs::write(dir.join("ca-cert.pem"), &ca.cert_pem)?;
-    fs::write(dir.join("ca-key.pem"), &ca.key_pem)?;
-    fs::write(dir.join("index.txt"), &ca.index_txt)?;
-    fs::write(dir.join("serial.txt"), &ca.serial_txt)?;
+    write_secret(&dir.join("ca-key.pem"), &ca.key_pem)?;
+    write_secret(&dir.join("index.txt"), &ca.index_txt)?;
+    write_secret(&dir.join("serial.txt"), &ca.serial_txt)?;
+    // CAs created before CRL numbering have no stored crlnumber; start at 1.
+    let crlnumber: &[u8] = if ca.crlnumber_txt.iter().all(u8::is_ascii_whitespace) {
+        INITIAL_CRL_NUMBER
+    } else {
+        &ca.crlnumber_txt
+    };
+    write_secret(&dir.join("crlnumber.txt"), crlnumber)?;
     Ok(())
+}
+
+fn read_crl_refresh(dir: &Path) -> Result<CrlRefresh> {
+    Ok(CrlRefresh {
+        crl_der: fs::read(dir.join("ca.crl"))?,
+        index_txt: fs::read(dir.join("index.txt"))?,
+        serial_txt: fs::read(dir.join("serial.txt"))?,
+        crlnumber_txt: fs::read(dir.join("crlnumber.txt"))?,
+    })
+}
+
+/// After `ca -revoke` marked `serial` as 'R', marks every other still-valid
+/// index.txt entry with the same subject DN as revoked too, copying the
+/// revocation date/reason. Renewals reuse the subject (and key) under a new
+/// serial, and active certificate CNs are unique per CA, so the subject is
+/// what ties a certificate's serial history together. Returns the new index
+/// text and how many extra entries were revoked.
+fn revoke_superseded_index_entries(index: &str, serial: &str) -> (String, usize) {
+    fn same_serial(a: &str, b: &str) -> bool {
+        a.trim_start_matches('0')
+            .eq_ignore_ascii_case(b.trim_start_matches('0'))
+    }
+    let lines: Vec<&str> = index.lines().collect();
+    let revoked = lines.iter().find_map(|line| {
+        let fields: Vec<&str> = line.split('\t').collect();
+        (fields.len() >= 6 && fields[0] == "R" && same_serial(fields[3], serial))
+            .then(|| (fields[2].to_string(), fields[5..].join("\t")))
+    });
+    let Some((revocation, subject)) = revoked else {
+        return (index.to_string(), 0);
+    };
+    let mut count = 0;
+    let mut out = String::with_capacity(index.len());
+    for line in lines {
+        let mut fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() >= 6 && fields[0] == "V" && fields[5..].join("\t") == subject {
+            fields[0] = "R";
+            fields[2] = &revocation;
+            count += 1;
+            out.push_str(&fields.join("\t"));
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    (out, count)
+}
+
+/// Escapes a value written into a generated openssl config file. Backslash
+/// makes the next character literal, which neutralizes `$` variable expansion
+/// (e.g. `${ENV::SECRET}`), `#` comments and quotes. Newlines cannot be
+/// escaped and must be rejected by input validation before this point.
+fn conf_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | '$' | '#' | '"' | '\'') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn read_cert_secrets(cert_dir: &Path, ca_dir: &Path) -> Result<CertSecrets> {
@@ -1008,10 +1266,12 @@ fn create_bundle(cert_dir: &Path, ca_dir: &Path) -> Result<Vec<u8>> {
 }
 
 fn ca_config(base: &Path, crl_days: i64, crl_url: Option<&str>) -> String {
-    let base = base.display();
+    // Every interpolated value is escaped so the config parser never expands
+    // `$` references or comments from it; callers validate against newlines.
+    let base = conf_escape(&base.display().to_string());
     let crl_extension = crl_url
         .filter(|value| !value.trim().is_empty())
-        .map(|value| format!("crlDistributionPoints = URI:{value}\n"))
+        .map(|value| format!("crlDistributionPoints = URI:{}\n", conf_escape(value)))
         .unwrap_or_default();
     format!(
         r#"[ ca ]
@@ -1028,9 +1288,14 @@ private_key = $base_dir/ca-key.pem
 new_certs_dir = $base_dir/certs
 database = $base_dir/index.txt
 serial = $base_dir/serial.txt
+crlnumber = $base_dir/crlnumber.txt
+crl_extensions = crl_extensions
 x509_extensions = ca_extensions
 email_in_dn = no
 copy_extensions = copy
+
+[ crl_extensions ]
+authorityKeyIdentifier = keyid:always
 
 [ req ]
 default_bits = 4096
@@ -1073,25 +1338,29 @@ extendedKeyUsage = clientAuth, emailProtection, serverAuth
     )
 }
 
-fn cert_config(common_name: &str, dns_list: &[String], ip_list: &[String]) -> String {
-    let mut all_dns = vec![common_name.to_string()];
-    for dns in dns_list {
-        if dns != common_name {
-            all_dns.push(dns.clone());
-        }
-    }
-    let dns = all_dns
+/// Request config for a leaf CSR. `dns_list` is the complete DNS SAN list
+/// (the service decides whether the CN is included). The subject always comes
+/// from `-subj`, so no subject values are written here.
+fn cert_config(dns_list: &[String], ip_list: &[String]) -> String {
+    let dns = dns_list
         .iter()
         .enumerate()
-        .map(|(i, v)| format!("DNS.{} = {}", i + 1, v))
+        .map(|(i, v)| format!("DNS.{} = {}", i + 1, conf_escape(v)))
         .collect::<Vec<_>>()
         .join("\n");
     let ips = ip_list
         .iter()
         .enumerate()
-        .map(|(i, v)| format!("IP.{} = {}", i + 1, v))
+        .map(|(i, v)| format!("IP.{} = {}", i + 1, conf_escape(v)))
         .collect::<Vec<_>>()
         .join("\n");
+    // An empty alternate_names section is an openssl error, so omit the SAN
+    // extension entirely when there is nothing to put in it.
+    let san = if dns_list.is_empty() && ip_list.is_empty() {
+        ""
+    } else {
+        "subjectAltName = @alternate_names\n"
+    };
     format!(
         r#"[ req ]
 default_bits = 4096
@@ -1101,15 +1370,13 @@ string_mask = utf8only
 
 [ server_distinguished_name ]
 commonName = Common Name
-commonName_default = {common_name}
 
 [ server_req_extensions ]
 subjectKeyIdentifier = hash
 basicConstraints = CA:FALSE
 keyUsage = digitalSignature, keyEncipherment, keyAgreement, nonRepudiation
 extendedKeyUsage = critical, serverAuth, clientAuth
-subjectAltName = @alternate_names
-nsComment = "OpenSSL Generated Certificate"
+{san}nsComment = "OpenSSL Generated Certificate"
 
 [ alternate_names ]
 {dns}
@@ -1119,11 +1386,23 @@ nsComment = "OpenSSL Generated Certificate"
 }
 
 /// Extract `DNS:` and `IP Address:` SAN entries from openssl output — either
-/// the compact `x509 -ext subjectAltName` form or the full `-text` dump.
+/// the compact `x509 -ext subjectAltName` form or the full `-text` dump. Only
+/// the value line following the "Subject Alternative Name:" header is read,
+/// so `DNS:` entries of other extensions (e.g. name constraints) are ignored.
 fn parse_san_entries(text: &str) -> (Vec<String>, Vec<String>) {
     let mut dns = Vec::new();
     let mut ips = Vec::new();
-    for part in text.split([',', '\n']) {
+    let mut lines = text.lines();
+    let values = loop {
+        match lines.next() {
+            Some(line) if line.contains("Subject Alternative Name:") => {
+                break lines.next().unwrap_or_default();
+            }
+            Some(_) => continue,
+            None => return (dns, ips),
+        }
+    };
+    for part in values.split(',') {
         let part = part.trim();
         if let Some(value) = part.strip_prefix("DNS:") {
             dns.push(value.trim().to_string());
@@ -1225,5 +1504,154 @@ mod tests {
                 "pass:*****".to_string(),
             ]
         );
+    }
+
+    fn real_openssl(keep_failed_workdirs: bool) -> OpenSsl {
+        OpenSsl::new(OpenSslConfig {
+            path: PathBuf::from("/usr/bin/openssl"),
+            timeout_seconds: 30,
+            working_root: std::env::temp_dir().join("minica-openssl-unit"),
+            keep_failed_workdirs,
+            reap_after_hours: 24,
+        })
+    }
+
+    #[test]
+    fn escape_subject_blocks_multi_valued_rdn_injection() {
+        assert_eq!(escape_subject(r"a/b\c+CN=d"), r"a\/b\\c\+CN\=d");
+        let subject = create_subject("foo+CN=bar", "SG", "Org", "", "", "").unwrap();
+        assert_eq!(subject, r"/C=SG/O=Org/CN=foo\+CN\=bar");
+        assert!(create_subject("foo\nbar", "SG", "Org", "", "", "").is_err());
+        assert!(create_subject("foo", "SG", "Org\r", "", "", "").is_err());
+        assert!(create_subject("foo", "SG", "Org", "", "x\u{0}", "").is_err());
+    }
+
+    #[test]
+    fn normalize_digest_allows_only_sha2_family() {
+        assert_eq!(normalize_digest("SHA-512").unwrap(), "sha512");
+        assert_eq!(normalize_digest(" -sha256 ").unwrap(), "sha256");
+        assert_eq!(normalize_digest("sha384").unwrap(), "sha384");
+        for bad in ["md5", "sha1", "", "sha256 -engine x", "config"] {
+            assert!(normalize_digest(bad).is_err(), "{bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn random_serial_is_positive_128_bit_hex() {
+        for _ in 0..200 {
+            let serial = random_serial_hex();
+            assert_eq!(serial.len(), 32);
+            let first = u8::from_str_radix(&serial[..2], 16).unwrap();
+            assert!(first > 0 && first < 0x80, "bad first byte in {serial}");
+        }
+        assert_ne!(random_serial_hex(), random_serial_hex());
+    }
+
+    #[test]
+    fn conf_escape_neutralizes_variable_expansion_end_to_end() {
+        assert_eq!(conf_escape(r#"a${ENV::X}#"'\"#), r#"a\${ENV::X}\#\"\'\\"#);
+        // Feed an injection attempt through the generated config to openssl
+        // and check the SAN comes out literally instead of expanded.
+        let openssl = real_openssl(false);
+        let work = openssl.workdir().unwrap();
+        let dir = work.path();
+        fs::write(
+            dir.join("openssl-cert.conf"),
+            cert_config(&["a${ENV::HOME}b".to_string()], &["10.0.0.1".to_string()]),
+        )
+        .unwrap();
+        openssl
+            .generate_key(dir, "k.pem", "ecdsa", &serde_json::json!({}))
+            .unwrap();
+        openssl
+            .run_ok(
+                dir,
+                &[
+                    "req",
+                    "-config",
+                    "openssl-cert.conf",
+                    "-new",
+                    "-key",
+                    "k.pem",
+                    "-subj",
+                    "/CN=x",
+                    "-out",
+                    "r.csr",
+                ],
+            )
+            .unwrap();
+        let text = openssl
+            .run_ok(dir, &["req", "-in", "r.csr", "-noout", "-text"])
+            .unwrap();
+        let text = String::from_utf8_lossy(&text.stdout);
+        assert!(text.contains("DNS:a${ENV::HOME}b"), "{text}");
+        assert!(text.contains("IP Address:10.0.0.1"));
+        // No SAN entries at all: the extension is omitted instead of empty.
+        assert!(!cert_config(&[], &[]).contains("subjectAltName"));
+    }
+
+    #[test]
+    fn revoke_superseded_index_entries_revokes_same_subject_only() {
+        let index = "V\t271121115248Z\t\t0A\tunknown\t/CN=leaf\n\
+                     R\t261027115248Z\t261017115248Z,keyCompromise\t0B\tunknown\t/CN=leaf\n\
+                     V\t261027115248Z\t\t0C\tunknown\t/CN=other\n";
+        let (out, count) = revoke_superseded_index_entries(index, "0b");
+        assert_eq!(count, 1);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines[0],
+            "R\t271121115248Z\t261017115248Z,keyCompromise\t0A\tunknown\t/CN=leaf"
+        );
+        assert!(lines[2].starts_with("V\t"));
+        // Unknown serial: nothing changes.
+        let (same, none) = revoke_superseded_index_entries(index, "FF");
+        assert_eq!((same.as_str(), none), (index, 0));
+    }
+
+    #[test]
+    fn parse_san_entries_ignores_name_constraints() {
+        let text = "            X509v3 Name Constraints: critical\n                Permitted:\n                  DNS:corp.example\n            X509v3 Subject Alternative Name: critical\n                DNS:a.example.com, IP Address:10.0.0.5\n";
+        let (dns, ips) = parse_san_entries(text);
+        assert_eq!(dns, vec!["a.example.com"]);
+        assert_eq!(ips, vec!["10.0.0.5"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workdirs_are_private_and_kept_only_on_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let openssl = real_openssl(true);
+        let ok = openssl.workdir().unwrap();
+        let ok_path = ok.path().to_path_buf();
+        assert_eq!(
+            fs::metadata(&ok_path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let pass = write_pass_file(&ok_path, "p.pass", b"secret").unwrap();
+        assert_eq!(pass, "file:p.pass");
+        assert_eq!(fs::read(ok_path.join("p.pass")).unwrap(), b"secret\n");
+        assert_eq!(
+            fs::metadata(ok_path.join("p.pass"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(write_pass_file(&ok_path, "q.pass", b"a\nb").is_err());
+        openssl.run_ok(&ok_path, &["version"]).unwrap();
+        drop(ok);
+        assert!(!ok_path.exists(), "successful workdir must be removed");
+
+        let failed = openssl.workdir().unwrap();
+        let failed_path = failed.path().to_path_buf();
+        assert!(
+            openssl
+                .run_ok(&failed_path, &["x509", "-in", "missing.pem"])
+                .is_err()
+        );
+        drop(failed);
+        assert!(failed_path.exists(), "failed workdir must be kept");
+        let _ = fs::remove_dir_all(failed_path);
     }
 }

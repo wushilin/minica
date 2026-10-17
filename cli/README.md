@@ -3,9 +3,18 @@
 A small client for retrieving certificates from a MiniCA server. It first checks
 whether a certificate with the requested common name already exists under the
 CA: if it does, that certificate is downloaded (and first renewed for 365 days
-when it expires within a year); otherwise a new one is created. Either way it
+when it expires within 30 days); otherwise a new one is created. Either way it
 saves the cert, private key, PKCS#12 bundle, the bundle password, and the issuing
 CA certificate to disk.
+
+When reusing an existing certificate:
+
+- A **revoked** certificate is an error: it is neither renewed nor downloaded.
+  Use a different common name, or remove the revoked certificate on the server.
+- Fields you set explicitly (flag, env, or `~/.minica`) — hostnames/SANs, key
+  profile, digest, subject fields, days, PKCS#12 password — are compared with
+  the existing certificate, and each difference is printed as a warning on
+  stderr. The existing certificate is still reused unchanged.
 
 ## Build
 
@@ -64,6 +73,11 @@ optional leading `export ` and
 surrounding quotes on the value are stripped; lines starting with `#` are
 comments. Override the file location with `MINICA_CONFIG`.
 
+Keep credentials out of the command line: prefer `MINICA_PASSWORD` in the
+environment or in `~/.minica` over `--password`, which other local users can
+see in the process list. `~/.minica` should be `chmod 600`; the CLI warns on
+stderr when a `~/.minica` holding a password is group/world accessible.
+
 ```sh
 # ~/.minica
 export MINICA_URL=https://ca.example.com/minica
@@ -78,7 +92,7 @@ MINICA_ORG="Example Corp"
 | --- | --- | --- |
 | `MINICA_URL` | `--url` | Base URL including the base path, e.g. `http://host:9988/minica` |
 | `MINICA_USER` | `--user` | Username (must be an **admin**; creating certs requires admin) |
-| `MINICA_PASSWORD` | `--password` | Password |
+| `MINICA_PASSWORD` | `--password` | Password (prefer the env var or `~/.minica`; see above) |
 | `MINICA_CA_ID` | `--ca` | Target CA id |
 
 ### Certificate fields (env or flag, prompted otherwise)
@@ -104,7 +118,7 @@ MINICA_ORG="Example Corp"
 | --- | --- |
 | `--out-dir` (or `MINICA_OUT_DIR`) | Output directory (default `./certs`) |
 | `-y`, `--non-interactive` | Use flags/env/defaults without prompting |
-| `--insecure` (or `MINICA_INSECURE`) | Skip TLS certificate verification |
+| `--insecure` (or `MINICA_INSECURE`) | Skip TLS certificate verification. `MINICA_INSECURE` takes `true`/`false`/`1`/`0`; other values are an error |
 
 ## Output files
 
@@ -117,6 +131,10 @@ Given an output prefix of `test1`:
 | `test1.p12` | `GET /download/cert/{ca}/{cert}/pkcs12` |
 | `test1.p12.password` | `GET /download/cert/{ca}/{cert}/password` |
 | `CA.pem` | `GET /download/ca/{ca}/cert` |
+
+`CA.pem` always has that name, so several CAs sharing one `--out-dir` overwrite
+each other's `CA.pem`; the CLI warns when it replaces a `CA.pem` with different
+content. Use one output directory per CA to keep them apart.
 
 ## Non-interactive example
 
@@ -134,5 +152,9 @@ minica cert -y \
 - MiniCA enforces a double-submit CSRF check on mutating API calls; the client
   generates a matching `minica_csrf` cookie / `X-CSRF-Token` header pair
   automatically.
-- The PKCS#12 password file and the create response are written with `0600`
-  permissions; the key with `0600`; cert and CA with `0644`.
+- Files are written atomically (temp file in the same directory, fsync,
+  rename), and permissions are applied even when a file already exists: the
+  key, PKCS#12 bundle, and its password are `0600`; cert and CA are `0644`. A
+  missing output directory is created `0700`; an existing one is left as-is.
+- A warning is printed when `MINICA_URL` is plain `http://` to a non-loopback
+  host, since credentials and private keys then travel unencrypted.

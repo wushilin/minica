@@ -120,6 +120,9 @@ backup-able state, real revocation, hashed credentials, and safe concurrency.
    MINICA_PASSWORD=adminpass MINICA_CA_ID=<ca-id> \
    ./mcacli cert --cn test1.example.com --hostnames a.com,b.com,10.0.0.5
    ```
+   (`adminpass` is the sample config's placeholder; change it before any real
+   use. Prefer `MINICA_PASSWORD` in the environment or a `chmod 600 ~/.minica`
+   over `--password`, which other local users can see in the process list.)
 
 ### Docker-friendly environment variables
 
@@ -148,6 +151,22 @@ auth:
       - '{{ENV:MINICA_TRUSTED_REMOTE_1:-}}'
 ```
 
+> **Security: override the default admin password.** With no overrides,
+> `config.yaml.docker` (and therefore the container image) binds to `0.0.0.0`
+> and configures the bootstrap admin as `admin` / `adminpass` — a publicly
+> known password, logged as a warning at startup. That is only acceptable for
+> throwaway test containers. For any other deployment, set
+> `MINICA_ADMIN_PASSWORD`, preferably to a bcrypt hash:
+>
+> ```sh
+> minica --gen-password > admin-password.bcrypt   # prompts for the password
+> podman run ... -e MINICA_ADMIN_PASSWORD="$(cat admin-password.bcrypt)" minica:local
+> ```
+>
+> or pass it via `--env-file`, a Docker/Podman secret exposed as an env var, or
+> a Kubernetes Secret (`env.valueFrom.secretKeyRef`). Set `MINICA_HOST` as well
+> if the server should not listen on every interface.
+
 [config.yaml.docker](./config.yaml.docker) is a fully parameterised template —
 every setting has a `MINICA_*` variable whose default matches
 `config.yaml.example`, except that the container image overrides mutable paths
@@ -167,6 +186,18 @@ Build the local image with Podman:
 docker/build.sh minica:local
 ```
 
+`build.sh`, `package.sh`, and `docker/build.sh` build for the host
+architecture (`x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl`);
+set `MINICA_TARGET=<rust-target-triple>` to override. When building the image
+by hand on a non-x86_64 host, pass the same triple with
+`--build-arg RUST_TARGET=aarch64-unknown-linux-musl`.
+
+The server runs as the unprivileged user `minica` (uid/gid `10001`). A new
+named volume inherits the right ownership automatically; a bind mount, or a
+volume created by an older image that ran as root, must be owned by
+`10001:10001` (`sudo chown -R 10001:10001 <dir>`, or
+`podman unshare chown -R 10001:10001 <dir>` for a rootless Podman bind mount).
+
 Run it with `/data` mounted:
 
 ```sh
@@ -180,6 +211,7 @@ Docker uses the same image recipe. If you prefer Docker instead of Podman:
 ```sh
 ./build.sh
 docker build -f docker/Dockerfile -t minica:local .
+# on arm64 hosts: docker build --build-arg RUST_TARGET=aarch64-unknown-linux-musl ...
 docker run --rm -p 9988:9988 -v minica-data:/data \
   -e MINICA_ADMIN_PASSWORD='$2b$12$...' \
   minica:local
@@ -196,7 +228,8 @@ Common Docker-friendly variables:
 | --- | --- | --- |
 | `MINICA_HOST` | `0.0.0.0` | Server bind address. |
 | `MINICA_PORT` | `9988` | Server port. |
-| `MINICA_BASE_PATH` | `/minica` | UI/API base path. |
+| `MINICA_BASE_PATH` | `/minica` | UI/API base path. `/` or empty mounts at the root. |
+| `MINICA_SECURE_COOKIES` | `false` | Mark the CSRF/flash cookies `Secure`. Enable only when browsers always reach MiniCA over HTTPS. |
 | `MINICA_PUBLIC_BASE_URL` | `http://127.0.0.1:9988/minica` | External URL used in links and CRL distribution points. |
 | `MINICA_CRL_ENABLED` | `true` | Enable CRL generation and serving. |
 | `MINICA_CRL_NEXT_UPDATE_DAYS` | `30` | CRL `nextUpdate` interval. |
@@ -213,14 +246,15 @@ Common Docker-friendly variables:
 | `MINICA_OPENSSL_REAP_AFTER_HOURS` | `24` | Age threshold for cleaning abandoned OpenSSL workdirs. |
 | `MINICA_BASIC_AUTH_ENABLE` | `true` | Enable config/bootstrap Basic auth. |
 | `MINICA_ADMIN_USER` | `admin` | Bootstrap admin username. |
-| `MINICA_ADMIN_PASSWORD` | `adminpass` | Bootstrap admin password or bcrypt hash. Use `minica --gen-password`. |
+| `MINICA_ADMIN_PASSWORD` | `adminpass` | Bootstrap admin password or bcrypt hash. Use `minica --gen-password`. **The default is for tests only — always override it.** |
 | `MINICA_ADMIN_ROLE` | `admin` | Bootstrap account role. |
 | `MINICA_HEADER_AUTH_ENABLE` | `false` | Enable reverse-proxy header auth. |
 | `MINICA_HEADER_USERNAME` | `Remote-User` | Header carrying the authenticated username. |
 | `MINICA_HEADER_GROUP` | `Remote-Groups` | Header carrying user groups. |
 | `MINICA_HEADER_ADMIN_GROUP` | `admin` | Group that grants admin role. |
 | `MINICA_HEADER_VIEWER_GROUP` | `user` | Group that grants viewer role. |
-| `MINICA_TRUSTED_REMOTE_1` ... `MINICA_TRUSTED_REMOTE_10` | `-` | Trusted reverse-proxy peers, as IPs or CIDRs. Unset slots are ignored; no trusted peers means trust every remote. |
+| `MINICA_TRUSTED_REMOTE_1` ... `MINICA_TRUSTED_REMOTE_10` | `-` | Trusted reverse-proxy peers, as IPs or CIDRs. Unset slots are ignored. With header auth enabled, an empty trusted list is rejected at startup. |
+| `MINICA_HEADER_TRUST_ALL_REMOTES` | `false` | Explicitly trust identity headers from any peer when no trusted remote is set. Only safe if the port is reachable solely through the proxy; logs a security warning. |
 
 ```sh
 podman run --rm -p 8443:8443 -v minica-data:/data \
@@ -307,10 +341,10 @@ auth:
     admin_group: admin           # group that grants the admin role
     viewer_group: user           # group that grants the viewer role
     # Honor identity headers only from these peers (IPs or CIDRs) — typically
-    # the upstream reverse proxy. Omit or leave empty to trust every remote.
-    #trusted_remotes:
-    #  - 127.0.0.1
-    #  - 10.0.0.0/8
+    # the upstream reverse proxy. An empty list is rejected at startup.
+    trusted_remotes:
+      - 127.0.0.1
+      - 10.0.0.0/8
 ```
 
 - The group header accepts `a,b`, `a;b`, or a JSON array `["a","b"]`; group
@@ -320,8 +354,10 @@ auth:
   `X-Forwarded-For` — behind a chain of proxies, list the last hop. A request
   from an untrusted peer gets a page naming the declared identity, e.g.
   *user 'xyz' was declared by untrusted remote 192.168.1.5*.
-- Only enable this when MiniCA is reachable exclusively through the proxy, or
-  pin the proxy with `trusted_remotes`. CSRF protection stays enabled.
+- Only enable this when MiniCA is reachable exclusively through the proxy, and
+  pin the proxy with `trusted_remotes`: with header auth enabled, the server
+  refuses to start when the trusted list is empty. CSRF protection stays
+  enabled.
 
 > **Note:** Like the original, this is intended for development and internal/test
 > environments where standing up a full enterprise PKI is overkill.

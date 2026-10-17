@@ -1,0 +1,37 @@
+# Build context for docker/Dockerfile (context = repository root).
+#
+# The Dockerfile only COPYs:
+#   target/<rust-target>/release/minica
+#   config.yaml.docker
+# so everything else is excluded. target/ is excluded level by level (rather
+# than with a single "target/" line) so the release binary can be re-included
+# reliably by both Docker/BuildKit and Podman/Buildah.
+
+.git
+.gitignore
+.claude
+upstream-minica
+
+# Rust build output: keep only target/*-unknown-linux-musl/release/minica.
+target/*
+!target/*-unknown-linux-musl
+target/*-unknown-linux-musl/*
+!target/*-unknown-linux-musl/release
+target/*-unknown-linux-musl/release/*
+!target/*-unknown-linux-musl/release/minica
+
+# Local state, logs, secrets and generated artifacts.
+runtime
+logs
+dist
+certs
+docker/.test-out
+cli/mcacli
+*.sqlite
+*.sqlite-*
+*.key
+*.p12
+*.p12.password
+
+# Local configs may hold real credentials; only the template is needed.
+config.yaml

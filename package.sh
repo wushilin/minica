@@ -1,14 +1,33 @@
 #!/usr/bin/env bash
 #
 # package.sh - build (via build.sh) and package the MUSL release into
-#   dist/minica-<cargo-version>.x64.tar.gz
+#   dist/minica-<cargo-version>.<arch>.tar.gz
 # a flat tarball containing both the server binary (minica) and the CLI (mcacli).
+# <arch> is "x64" for x86_64 and "arm64" for aarch64. The target defaults to
+# the host architecture; override it with MINICA_TARGET=<rust-target-triple>.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-TARGET="x86_64-unknown-linux-musl"
+default_target() {
+    case "$(uname -m)" in
+        x86_64 | amd64) echo "x86_64-unknown-linux-musl" ;;
+        aarch64 | arm64) echo "aarch64-unknown-linux-musl" ;;
+        *)
+            echo "error: unsupported host architecture $(uname -m); set MINICA_TARGET" >&2
+            exit 1
+            ;;
+    esac
+}
+
+TARGET="${MINICA_TARGET:-$(default_target)}"
+export MINICA_TARGET="$TARGET"
+case "$TARGET" in
+    x86_64-*) ARCH="x64" ;;
+    aarch64-*) ARCH="arm64" ;;
+    *) ARCH="${TARGET%%-*}" ;;
+esac
 SERVER_BIN="target/$TARGET/release/minica"
 CLI_BIN="cli/mcacli"
 
@@ -22,7 +41,7 @@ if [ -z "$VERSION" ]; then
     exit 1
 fi
 
-TARBALL="minica-${VERSION}.x64.tar.gz"
+TARBALL="minica-${VERSION}.${ARCH}.tar.gz"
 DIST="$ROOT/dist"
 
 for f in "$SERVER_BIN" "$CLI_BIN"; do

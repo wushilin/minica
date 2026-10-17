@@ -3,14 +3,29 @@
 # build.sh - build the MiniCA server (static MUSL binary) and the Go CLI.
 #
 # Outputs:
-#   target/x86_64-unknown-linux-musl/release/minica   (server)
-#   cli/mcacli                                         (CLI)
+#   target/<target>/release/minica   (server)
+#   cli/mcacli                       (CLI)
+#
+# <target> defaults to the host architecture's MUSL triple
+# (x86_64-unknown-linux-musl or aarch64-unknown-linux-musl); override it with
+# MINICA_TARGET=<rust-target-triple>.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-TARGET="x86_64-unknown-linux-musl"
+default_target() {
+    case "$(uname -m)" in
+        x86_64 | amd64) echo "x86_64-unknown-linux-musl" ;;
+        aarch64 | arm64) echo "aarch64-unknown-linux-musl" ;;
+        *)
+            echo "error: unsupported host architecture $(uname -m); set MINICA_TARGET" >&2
+            exit 1
+            ;;
+    esac
+}
+
+TARGET="${MINICA_TARGET:-$(default_target)}"
 
 echo ">> Building MiniCA server ($TARGET, release)"
 # Ensure the MUSL target is installed (no-op if already present).

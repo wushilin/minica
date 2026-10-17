@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use ipnet::IpNet;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de::Error as _};
+use serde_yaml::{Mapping, Value};
 use std::{
     collections::HashSet,
     fs,
@@ -11,7 +12,7 @@ use std::{
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::opt_string")]
     pub public_base_url: Option<String>,
     #[serde(default)]
     pub crl: CrlConfig,
@@ -25,13 +26,22 @@ pub struct Config {
 #[derive(Clone, Debug, Deserialize)]
 pub struct ServerConfig {
     pub host: String,
+    #[serde(deserialize_with = "lenient::from_str")]
     pub port: u16,
+    /// URL prefix the app is mounted under. Normalised by `Config::load` to a
+    /// leading slash and no trailing slash; the root (`/` or empty) is stored
+    /// as the empty string so `format!("{base}/cas")` never yields `//cas`.
     pub base_path: String,
+    /// Mark cookies `Secure`. MiniCA itself speaks plain HTTP, so only enable
+    /// this when every browser reaches it over HTTPS (e.g. a TLS proxy).
+    #[serde(default, deserialize_with = "lenient::bool")]
+    pub secure_cookies: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct RuntimeConfig {
     pub folder: PathBuf,
+    #[serde(default, deserialize_with = "lenient::opt_path")]
     pub db_folder: Option<PathBuf>,
 }
 
@@ -40,11 +50,80 @@ pub struct OpenSslConfig {
     pub path: PathBuf,
     /// Maximum wall-clock time a single openssl invocation may run before it is
     /// terminated. Defaults to 15s when omitted from the config file.
-    #[serde(default = "default_timeout_seconds")]
+    #[serde(
+        default = "default_timeout_seconds",
+        deserialize_with = "lenient::from_str"
+    )]
     pub timeout_seconds: u64,
     pub working_root: PathBuf,
+    #[serde(deserialize_with = "lenient::bool")]
     pub keep_failed_workdirs: bool,
+    #[serde(deserialize_with = "lenient::from_str")]
     pub reap_after_hours: u64,
+}
+
+/// Lenient scalar deserializers. `{{ENV:...}}` tokens are resolved after YAML
+/// parsing, so an env-supplied value always arrives as a string; these accept
+/// either the native YAML type or a string that parses as it.
+mod lenient {
+    use serde::{Deserialize, Deserializer, de::DeserializeOwned, de::Error};
+    use serde_yaml::Value;
+    use std::{fmt::Display, path::PathBuf, str::FromStr};
+
+    pub fn from_str<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: FromStr + DeserializeOwned,
+        T::Err: Display,
+    {
+        match Value::deserialize(deserializer)? {
+            Value::String(text) => text
+                .trim()
+                .parse()
+                .map_err(|err| D::Error::custom(format!("invalid number {text:?}: {err}"))),
+            other => serde_yaml::from_value(other).map_err(D::Error::custom),
+        }
+    }
+
+    pub fn bool<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+        match Value::deserialize(deserializer)? {
+            Value::Bool(value) => Ok(value),
+            Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
+                "true" | "yes" | "on" | "1" => Ok(true),
+                "false" | "no" | "off" | "0" => Ok(false),
+                _ => Err(D::Error::custom(format!(
+                    "invalid boolean {text:?}, expected true or false"
+                ))),
+            },
+            other => Err(D::Error::custom(format!(
+                "invalid type: expected a boolean, found {other:?}"
+            ))),
+        }
+    }
+
+    /// `null`, `~` and the empty string all mean "not set".
+    pub fn opt_string<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<String>, D::Error> {
+        match Value::deserialize(deserializer)? {
+            Value::Null => Ok(None),
+            Value::String(text) if is_null_word(&text) => Ok(None),
+            Value::String(text) => Ok(Some(text)),
+            other => Err(D::Error::custom(format!(
+                "invalid type: expected a string, found {other:?}"
+            ))),
+        }
+    }
+
+    pub fn opt_path<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<PathBuf>, D::Error> {
+        opt_string(deserializer).map(|value| value.map(PathBuf::from))
+    }
+
+    fn is_null_word(text: &str) -> bool {
+        matches!(text.trim(), "" | "~" | "null" | "Null" | "NULL")
+    }
 }
 
 fn default_timeout_seconds() -> u64 {
@@ -69,41 +148,50 @@ fn default_true() -> bool {
 /// Basic-auth section: an `enabled` toggle plus the bootstrap account list.
 /// Accepts either the object form (`enabled:` + `list:`) or, for backward
 /// compatibility, a bare account list (which implies `enabled: true`).
-#[derive(Clone, Debug, Deserialize)]
-#[serde(from = "UsersConfigRepr")]
+#[derive(Clone, Debug)]
 pub struct UsersConfig {
     pub enabled: bool,
     pub list: Vec<UserConfig>,
 }
 
 #[derive(Deserialize)]
-#[serde(untagged)]
-enum UsersConfigRepr {
-    List(Vec<UserConfig>),
-    Object {
-        #[serde(default = "default_true")]
-        enabled: bool,
-        #[serde(default)]
-        list: Vec<UserConfig>,
-    },
+#[serde(deny_unknown_fields)]
+struct UsersObject {
+    #[serde(default = "default_true", deserialize_with = "lenient::bool")]
+    enabled: bool,
+    #[serde(default)]
+    list: Vec<UserConfig>,
 }
 
-impl From<UsersConfigRepr> for UsersConfig {
-    fn from(repr: UsersConfigRepr) -> Self {
-        match repr {
-            UsersConfigRepr::List(list) => Self {
-                enabled: true,
-                list,
-            },
-            UsersConfigRepr::Object { enabled, list } => Self { enabled, list },
+/// Dispatches on the YAML shape explicitly (rather than `#[serde(untagged)]`)
+/// so a typo reports the real problem instead of "did not match any variant".
+impl<'de> Deserialize<'de> for UsersConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match Value::deserialize(deserializer)? {
+            value @ Value::Sequence(_) => serde_yaml::from_value(value)
+                .map(|list| Self {
+                    enabled: true,
+                    list,
+                })
+                .map_err(|err| D::Error::custom(format!("auth.users list: {err}"))),
+            value @ Value::Mapping(_) => serde_yaml::from_value::<UsersObject>(value)
+                .map(|users| Self {
+                    enabled: users.enabled,
+                    list: users.list,
+                })
+                .map_err(|err| D::Error::custom(format!("auth.users: {err}"))),
+            _ => Err(D::Error::custom(
+                "auth.users must be a list of accounts, or a mapping with `enabled` and `list`",
+            )),
         }
     }
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HeaderAuthConfig {
     /// Toggle for this mode; on by default when the section is present.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", deserialize_with = "lenient::bool")]
     pub enabled: bool,
     /// Header carrying the authenticated user id.
     #[serde(default = "default_username_header")]
@@ -117,10 +205,16 @@ pub struct HeaderAuthConfig {
     /// Group name that grants the viewer role.
     #[serde(default = "default_viewer_group")]
     pub viewer_group: String,
-    /// Peers (bare IPs or CIDRs) allowed to assert identity headers;
-    /// empty = trust every remote.
+    /// Peers (bare IPs or CIDRs) allowed to assert identity headers. Must be
+    /// non-empty unless `trust_all_remotes` is set.
     #[serde(default)]
     pub trusted_remotes: Vec<String>,
+    /// Explicit opt-in to honour identity headers from every remote when
+    /// `trusted_remotes` is empty. Only safe when MiniCA is reachable solely
+    /// through the authenticating proxy. Ignored when `trusted_remotes` lists
+    /// at least one peer.
+    #[serde(default, deserialize_with = "lenient::bool")]
+    pub trust_all_remotes: bool,
     /// Parsed form of `trusted_remotes`, populated by `AuthConfig::validate`.
     #[serde(skip)]
     pub trusted_networks: Vec<IpNet>,
@@ -146,10 +240,18 @@ impl AuthConfig {
     /// At least one auth mode must be enabled. Header auth is active when
     /// identity headers are present; enabled Basic auth remains available as a
     /// fallback for requests without identity headers. Also pre-parses
-    /// `trusted_remotes` so bad entries fail at startup, not per-request.
+    /// `trusted_remotes` so bad entries fail at startup, not per-request, and
+    /// refuses an empty trusted list unless `trust_all_remotes` opts in.
     pub fn validate(&mut self) -> Result<()> {
         if let Some(headers) = self.headers.as_mut().filter(|headers| headers.enabled) {
             headers.trusted_networks = parse_trusted_remotes(&headers.trusted_remotes)?;
+            if headers.trusted_networks.is_empty() && !headers.trust_all_remotes {
+                anyhow::bail!(
+                    "auth.headers: header auth is enabled but trusted_remotes is empty, so any client could \
+                     assert identity headers; list the reverse proxy's IP/CIDR in auth.headers.trusted_remotes, \
+                     or set auth.headers.trust_all_remotes: true to explicitly trust every remote"
+                );
+            }
             return Ok(());
         }
         if self.users.as_ref().is_some_and(|users| users.enabled) {
@@ -176,14 +278,132 @@ impl AuthConfig {
 }
 
 /// Resolve `{{ENV:NAME}}` / `{{ENV:NAME:default}}` tokens against environment
-/// variables. Runs on the raw config text after the file is read and before
-/// YAML parsing (unquoted tokens are not valid YAML), so any value in the
-/// file can be injected via the environment -- handy for Docker.
-fn resolve_env_tokens(text: &str) -> Result<String> {
-    let (resolved, used_names) =
-        resolve_env_tokens_with_used(text, |name| std::env::var(name).ok())?;
-    warn_unused_minica_env_vars(&used_names);
-    Ok(resolved)
+/// variables and deserialize the config. Tokens are resolved *after* YAML
+/// parsing, inside string scalars only: each token is first swapped for an
+/// inert placeholder (unquoted tokens are not valid YAML), the text is parsed,
+/// and then placeholders in string scalars are replaced with their values.
+/// Env values therefore can never change the YAML structure (a password with
+/// ": ", " #" or a newline stays one string), and tokens in comments are
+/// neither resolved nor logged. Numeric/boolean fields accept the resulting
+/// strings via the `lenient` deserializers.
+fn parse_config_with_env(
+    text: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<(Config, HashSet<String>)> {
+    let (placeholdered, resolver) = EnvPlaceholders::extract(text)?;
+    if resolver.tokens.is_empty() {
+        // No tokens: parse directly so YAML errors keep line/column info.
+        return Ok((serde_yaml::from_str(text)?, HashSet::new()));
+    }
+    let value: Value = serde_yaml::from_str(&placeholdered)?;
+    let mut used_names = HashSet::new();
+    let value = resolver.resolve_value(value, &lookup, &mut used_names)?;
+    Ok((serde_yaml::from_value(value)?, used_names))
+}
+
+/// Raw `{{ENV:...}}` tokens lifted out of the config text, each replaced by
+/// `<prefix><index>__` — a plain identifier that is valid anywhere in YAML.
+struct EnvPlaceholders {
+    prefix: String,
+    tokens: Vec<String>,
+}
+
+impl EnvPlaceholders {
+    fn extract(text: &str) -> Result<(String, Self)> {
+        const OPEN: &str = "{{ENV:";
+        const CLOSE: &str = "}}";
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let prefix = format!("__minica_env_{}_", &nonce[..12]);
+        let mut tokens = Vec::new();
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(start) = rest.find(OPEN) {
+            out.push_str(&rest[..start]);
+            let token = &rest[start..];
+            let Some(end) = token.find(CLOSE) else {
+                anyhow::bail!("unterminated {{{{ENV:...}}}} token");
+            };
+            let token = &token[..end + CLOSE.len()];
+            // Validate eagerly so a malformed token fails even if unused.
+            parse_env_token(&token[OPEN.len()..end])?;
+            out.push_str(&format!("{prefix}{}__", tokens.len()));
+            tokens.push(token.to_string());
+            rest = &rest[start + token.len()..];
+        }
+        out.push_str(rest);
+        Ok((out, Self { prefix, tokens }))
+    }
+
+    /// Substitute placeholders in one string scalar: restore the original
+    /// token text, then resolve it with the token resolver.
+    fn resolve_str(
+        &self,
+        scalar: &str,
+        lookup: &impl Fn(&str) -> Option<String>,
+        used_names: &mut HashSet<String>,
+    ) -> Result<String> {
+        if !scalar.contains(&self.prefix) {
+            return Ok(scalar.to_string());
+        }
+        let mut restored = String::with_capacity(scalar.len());
+        let mut rest = scalar;
+        while let Some(start) = rest.find(&self.prefix) {
+            restored.push_str(&rest[..start]);
+            let after = &rest[start + self.prefix.len()..];
+            let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+            let token = after[..digits]
+                .parse::<usize>()
+                .ok()
+                .filter(|_| after[digits..].starts_with("__"))
+                .and_then(|index| self.tokens.get(index));
+            match token {
+                Some(token) => {
+                    restored.push_str(token);
+                    rest = &after[digits + 2..];
+                }
+                None => {
+                    restored.push_str(&self.prefix);
+                    rest = after;
+                }
+            }
+        }
+        restored.push_str(rest);
+        let (resolved, used) = resolve_env_tokens_with_used(&restored, lookup)?;
+        used_names.extend(used);
+        Ok(resolved)
+    }
+
+    fn resolve_value(
+        &self,
+        value: Value,
+        lookup: &impl Fn(&str) -> Option<String>,
+        used_names: &mut HashSet<String>,
+    ) -> Result<Value> {
+        Ok(match value {
+            Value::String(text) => Value::String(self.resolve_str(&text, lookup, used_names)?),
+            Value::Sequence(items) => Value::Sequence(
+                items
+                    .into_iter()
+                    .map(|item| self.resolve_value(item, lookup, used_names))
+                    .collect::<Result<_>>()?,
+            ),
+            Value::Mapping(map) => {
+                let mut out = Mapping::with_capacity(map.len());
+                for (key, item) in map {
+                    out.insert(
+                        self.resolve_value(key, lookup, used_names)?,
+                        self.resolve_value(item, lookup, used_names)?,
+                    );
+                }
+                Value::Mapping(out)
+            }
+            Value::Tagged(mut tagged) => {
+                tagged.value = self.resolve_value(tagged.value, lookup, used_names)?;
+                Value::Tagged(tagged)
+            }
+            other => other,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -191,6 +411,31 @@ fn resolve_env_tokens_with(text: &str, lookup: impl Fn(&str) -> Option<String>) 
     resolve_env_tokens_with_used(text, lookup).map(|(resolved, _)| resolved)
 }
 
+/// Parse a token body (`NAME` or `NAME:default`) into its name and decoded
+/// default. The default may itself contain colons and supports only strict
+/// %HH percent escapes, so awkward values like "}}" can be written safely
+/// without form-style '+' decoding.
+fn parse_env_token(inner: &str) -> Result<(&str, Option<String>)> {
+    let (name, default) = match inner.split_once(':') {
+        Some((name, default)) => (
+            name.trim(),
+            Some(percent_decode_best_effort(default.trim())),
+        ),
+        None => (inner.trim(), None),
+    };
+    if name.is_empty() {
+        anyhow::bail!("empty variable name in {{{{ENV:...}}}} token");
+    }
+    if !is_valid_env_name(name) {
+        anyhow::bail!(
+            "invalid variable name {name:?} in {{{{ENV:...}}}} token; use [A-Za-z_][A-Za-z0-9_]*"
+        );
+    }
+    Ok((name, default))
+}
+
+/// Splice resolved token values into `text`. Applied to individual string
+/// scalars by `EnvPlaceholders`, never to raw YAML.
 fn resolve_env_tokens_with_used(
     text: &str,
     lookup: impl Fn(&str) -> Option<String>,
@@ -206,25 +451,7 @@ fn resolve_env_tokens_with_used(
         let Some(end) = token.find(CLOSE) else {
             anyhow::bail!("unterminated {{{{ENV:...}}}} token");
         };
-        // NAME or NAME:default. The default may itself contain colons and
-        // supports only strict %HH percent escapes, so awkward values like
-        // "}}" can be written safely without form-style '+' decoding.
-        let inner = &token[OPEN.len()..end];
-        let (name, default) = match inner.split_once(':') {
-            Some((name, default)) => (
-                name.trim(),
-                Some(percent_decode_best_effort(default.trim())),
-            ),
-            None => (inner.trim(), None),
-        };
-        if name.is_empty() {
-            anyhow::bail!("empty variable name in {{{{ENV:...}}}} token");
-        }
-        if !is_valid_env_name(name) {
-            anyhow::bail!(
-                "invalid variable name {name:?} in {{{{ENV:...}}}} token; use [A-Za-z_][A-Za-z0-9_]*"
-            );
-        }
+        let (name, default) = parse_env_token(&token[OPEN.len()..end])?;
         used_names.insert(name.to_string());
         let value = lookup(name).or(default).unwrap_or_default();
         if value.is_empty() {
@@ -296,29 +523,20 @@ fn warn_unused_minica_env_vars(used_names: &HashSet<String>) {
     }
 }
 
+/// Value to print for a resolved env token. Secret-looking names never reveal
+/// any characters, only that a value is set and its length.
 fn mask_env_value(name: &str, value: &str) -> String {
     if !is_sensitive_env_name(name) {
         return value.to_string();
     }
-
-    let chars: Vec<char> = value.chars().collect();
-    if chars.len() <= 2 {
-        return value.to_string();
-    }
-
-    let mut masked = String::with_capacity(value.len());
-    masked.push(chars[0]);
-    masked.extend(std::iter::repeat('*').take(chars.len() - 2));
-    masked.push(chars[chars.len() - 1]);
-    masked
+    format!("<set, {} chars>", value.chars().count())
 }
 
 fn is_sensitive_env_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    name.contains("password")
-        || name.contains("passwword")
-        || name.contains("passwd")
-        || name.contains("passphrase")
+    ["pass", "secret", "token", "key", "credential"]
+        .iter()
+        .any(|marker| name.contains(marker))
 }
 
 fn parse_trusted_remotes(entries: &[String]) -> Result<Vec<IpNet>> {
@@ -346,14 +564,19 @@ fn parse_trusted_remotes(entries: &[String]) -> Result<Vec<IpNet>> {
 #[derive(Clone, Debug, Deserialize)]
 pub struct LoggingConfig {
     pub file: PathBuf,
+    #[serde(deserialize_with = "lenient::from_str")]
     pub rotate_size_bytes: u64,
+    #[serde(deserialize_with = "lenient::from_str")]
     pub max_backups: usize,
+    #[serde(deserialize_with = "lenient::bool")]
     pub compress: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct CrlConfig {
+    #[serde(deserialize_with = "lenient::bool")]
     pub enabled: bool,
+    #[serde(deserialize_with = "lenient::from_str")]
     pub next_update_days: i64,
 }
 
@@ -436,24 +659,22 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = fs::read_to_string(path)
             .with_context(|| format!("failed to read config file {}", path.display()))?;
-        let text = resolve_env_tokens(&text).with_context(|| {
-            format!(
-                "failed to resolve {{{{ENV:...}}}} tokens in {}",
-                path.display()
-            )
-        })?;
-        let mut config: Config = serde_yaml::from_str(&text)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
-        config
-            .auth
-            .validate()
-            .with_context(|| format!("invalid auth config in {}", path.display()))?;
-        if !config.server.base_path.starts_with('/') {
-            config.server.base_path = format!("/{}", config.server.base_path);
-        }
-        if config.server.base_path.ends_with('/') && config.server.base_path.len() > 1 {
-            config.server.base_path.pop();
-        }
+        let (config, used_names) = Self::from_yaml_with(&text, |name| std::env::var(name).ok())
+            .with_context(|| format!("failed to load config file {}", path.display()))?;
+        warn_unused_minica_env_vars(&used_names);
+        Ok(config)
+    }
+
+    /// Parse, env-resolve, validate and normalise config text. `lookup`
+    /// supplies environment variables (injectable for tests). Returns the
+    /// env names referenced by resolved tokens.
+    fn from_yaml_with(
+        text: &str,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<(Self, HashSet<String>)> {
+        let (mut config, used_names) = parse_config_with_env(text, lookup)?;
+        config.auth.validate().context("invalid auth config")?;
+        config.server.base_path = normalize_base_path(&config.server.base_path);
         if let Some(base) = config.public_base_url.as_mut() {
             while base.ends_with('/') {
                 base.pop();
@@ -462,7 +683,16 @@ impl Config {
         if config.crl.next_update_days < 1 {
             config.crl.next_update_days = 30;
         }
-        Ok(config)
+        Ok((config, used_names))
+    }
+
+    /// Cookie `Path` for the app: the base path, or `/` when mounted at root.
+    pub fn cookie_path(&self) -> &str {
+        if self.server.base_path.is_empty() {
+            "/"
+        } else {
+            &self.server.base_path
+        }
     }
 
     pub fn addr(&self) -> Result<SocketAddr> {
@@ -477,6 +707,17 @@ impl Config {
             .clone()
             .unwrap_or_else(|| self.runtime.folder.clone())
             .join("db.sqlite")
+    }
+}
+
+/// `minica` / `/minica/` -> `/minica`; `/`, `` and `///` -> `` (mounted at
+/// the root).
+fn normalize_base_path(raw: &str) -> String {
+    let trimmed = raw.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("/{trimmed}")
     }
 }
 
@@ -611,26 +852,183 @@ mod env_token_tests {
     }
 
     #[test]
-    fn password_like_env_values_are_masked_for_logs() {
+    fn secret_like_env_values_are_masked_for_logs() {
         assert_eq!(
             mask_env_value("MINICA_ADMIN_PASSWORD", "adminpass"),
-            "a*******s"
+            "<set, 9 chars>"
         );
-        assert_eq!(mask_env_value("DB_PASSWD", "secret"), "s****t");
-        assert_eq!(mask_env_value("TLS_PASSPHRASE", "abc"), "a*c");
-        assert_eq!(mask_env_value("TYPO_PASSWWORD", "secret"), "s****t");
+        assert_eq!(mask_env_value("DB_PASSWD", "secret"), "<set, 6 chars>");
+        assert_eq!(mask_env_value("TLS_PASSPHRASE", "abc"), "<set, 3 chars>");
+        assert_eq!(mask_env_value("TYPO_PASSWWORD", "secret"), "<set, 6 chars>");
+        assert_eq!(mask_env_value("API_SECRET", "s3"), "<set, 2 chars>");
+        assert_eq!(mask_env_value("GITHUB_TOKEN", "t"), "<set, 1 chars>");
+        assert_eq!(mask_env_value("SIGNING_KEY", "k"), "<set, 1 chars>");
     }
 
     #[test]
-    fn non_password_env_values_are_not_masked_for_logs() {
+    fn non_secret_env_values_are_not_masked_for_logs() {
         assert_eq!(mask_env_value("MINICA_PORT", "9988"), "9988");
+        assert_eq!(
+            mask_env_value("MINICA_OPENSSL_KEEP_FAILED_WORKDIRS", "false"),
+            "false"
+        );
     }
 
     #[test]
-    fn very_short_password_like_env_values_keep_available_edges() {
-        assert_eq!(mask_env_value("PASSWORD", ""), "");
-        assert_eq!(mask_env_value("PASSWORD", "a"), "a");
-        assert_eq!(mask_env_value("PASSWORD", "ab"), "ab");
+    fn very_short_secret_env_values_reveal_nothing() {
+        assert_eq!(mask_env_value("PASSWORD", ""), "<set, 0 chars>");
+        assert_eq!(mask_env_value("PASSWORD", "a"), "<set, 1 chars>");
+        assert_eq!(mask_env_value("PASSWORD", "ab"), "<set, 2 chars>");
+    }
+
+    const BASE_YAML: &str = "server:\n  host: 0.0.0.0\n  port: 9988\n  base_path: /minica\nruntime:\n  folder: ./runtime\nopenssl:\n  path: /usr/bin/openssl\n  working_root: ./w\n  keep_failed_workdirs: false\n  reap_after_hours: 24\n";
+
+    fn load_with(yaml: &str, pairs: &'static [(&'static str, &'static str)]) -> Config {
+        Config::from_yaml_with(yaml, lookup(pairs))
+            .expect("config loads")
+            .0
+    }
+
+    #[test]
+    fn tricky_env_values_stay_single_string_scalars() {
+        let yaml = format!(
+            "{BASE_YAML}auth:\n  users:\n    - username: {{{{ENV:U:admin}}}}\n      password: {{{{ENV:P:x}}}}\n      role: admin\n"
+        );
+        for password in [
+            "a: b",
+            "x #comment",
+            "*alias",
+            "&anchor",
+            "!tag",
+            "@at",
+            "line1\nline2\n  role: viewer",
+            "{{not a token}}",
+            "'quoted'",
+            "- item",
+            "12345",
+            "true",
+            "null",
+        ] {
+            let leaked: &'static str = Box::leak(password.to_string().into_boxed_str());
+            let pairs: &'static [(&'static str, &'static str)] =
+                Box::leak(vec![("P", leaked)].into_boxed_slice());
+            let config = load_with(&yaml, pairs);
+            let users = config.auth.basic_users();
+            assert_eq!(users.len(), 1, "{password:?}");
+            assert_eq!(users[0].password, password);
+            assert_eq!(users[0].username, "admin");
+            assert_eq!(users[0].role, Role::Admin);
+        }
+    }
+
+    #[test]
+    fn tokens_in_comments_are_not_resolved() {
+        let yaml = format!(
+            "# {{{{ENV:IN_COMMENT:x}}}}\n{BASE_YAML}auth:\n  users: [] # {{{{ENV:ALSO_COMMENT}}}}\n"
+        );
+        let (_, used) = Config::from_yaml_with(&yaml, lookup(&[])).expect("loads");
+        assert!(used.is_empty(), "{used:?}");
+    }
+
+    #[test]
+    fn whole_and_partial_tokens_coerce_to_target_types() {
+        let yaml = "server:\n  host: '{{ENV:H:0.0.0.0}}'\n  port: {{ENV:PORT:9988}}\n  base_path: /pre{{ENV:BP:fix}}\nruntime:\n  folder: ./runtime\n  db_folder: {{ENV:DB:null}}\nopenssl:\n  path: /usr/bin/openssl\n  working_root: ./w\n  keep_failed_workdirs: {{ENV:KEEP:false}}\n  reap_after_hours: {{ENV:REAP:24}}\nauth:\n  users: []\n";
+        let config = load_with(yaml, &[("PORT", " 8443 "), ("KEEP", "TRUE")]);
+        assert_eq!(config.server.port, 8443);
+        assert_eq!(config.server.base_path, "/prefix");
+        assert!(config.openssl.keep_failed_workdirs);
+        assert_eq!(config.openssl.reap_after_hours, 24);
+        assert!(config.runtime.db_folder.is_none());
+
+        let err = Config::from_yaml_with(yaml, lookup(&[("PORT", "nope")]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid number"), "{err}");
+    }
+
+    #[test]
+    fn docker_template_loads_with_defaults() {
+        let (config, used) =
+            Config::from_yaml_with(include_str!("../config.yaml.docker"), lookup(&[]))
+                .expect("docker template loads with no env vars");
+        let example: Config = Config::from_yaml_with(SAMPLE_CONFIG, lookup(&[]))
+            .expect("example loads")
+            .0;
+        assert_eq!(config.server.host, example.server.host);
+        assert_eq!(config.server.port, example.server.port);
+        assert_eq!(config.server.base_path, "/minica");
+        assert_eq!(config.public_base_url, example.public_base_url);
+        assert!(config.crl.enabled);
+        assert_eq!(config.crl.next_update_days, 30);
+        assert!(config.runtime.db_folder.is_none());
+        assert_eq!(config.logging.rotate_size_bytes, 10_485_760);
+        assert_eq!(config.logging.max_backups, 10);
+        assert!(config.logging.compress);
+        assert_eq!(config.openssl.timeout_seconds, 15);
+        assert!(!config.openssl.keep_failed_workdirs);
+        assert_eq!(config.openssl.reap_after_hours, 24);
+        assert!(config.auth.active_headers().is_none());
+        let users = config.auth.basic_users();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].username, "admin");
+        assert_eq!(users[0].password, "adminpass");
+        assert!(used.contains("MINICA_PORT"));
+        assert!(used.contains("MINICA_TRUSTED_REMOTE_10"));
+    }
+
+    #[test]
+    fn docker_template_loads_with_tricky_env_values() {
+        let (config, _) = Config::from_yaml_with(
+            include_str!("../config.yaml.docker"),
+            lookup(&[
+                ("MINICA_PORT", "8443"),
+                ("MINICA_BASE_PATH", "/"),
+                ("MINICA_DB_FOLDER", "/data/db # not a comment"),
+                ("MINICA_CRL_ENABLED", "false"),
+                ("MINICA_LOG_COMPRESS", "no"),
+                ("MINICA_ADMIN_PASSWORD", "p@ss: #word\n- injected"),
+                ("MINICA_ADMIN_ROLE", "viewer"),
+                ("MINICA_HEADER_AUTH_ENABLE", "true"),
+                ("MINICA_TRUSTED_REMOTE_1", "10.0.0.7"),
+                ("MINICA_TRUSTED_REMOTE_2", "172.16.0.0/12"),
+                ("MINICA_TRUSTED_REMOTE_3", "::1"),
+            ]),
+        )
+        .expect("docker template loads with env vars");
+        assert_eq!(config.server.port, 8443);
+        assert_eq!(config.server.base_path, "");
+        assert_eq!(
+            config.runtime.db_folder,
+            Some(PathBuf::from("/data/db # not a comment"))
+        );
+        assert!(!config.crl.enabled);
+        assert!(!config.logging.compress);
+        let users = config.auth.basic_users();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].password, "p@ss: #word\n- injected");
+        assert_eq!(users[0].role, Role::Viewer);
+        let headers = config.auth.active_headers().expect("header auth on");
+        assert_eq!(headers.trusted_networks.len(), 3);
+    }
+
+    #[test]
+    fn docker_template_refuses_header_auth_without_trusted_remotes() {
+        let err = Config::from_yaml_with(
+            include_str!("../config.yaml.docker"),
+            lookup(&[("MINICA_HEADER_AUTH_ENABLE", "true")]),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("trust_all_remotes"), "{err:#}");
+    }
+
+    #[test]
+    fn base_path_is_normalised_and_root_is_empty() {
+        assert_eq!(normalize_base_path("/minica"), "/minica");
+        assert_eq!(normalize_base_path("minica/"), "/minica");
+        assert_eq!(normalize_base_path("/a/b/"), "/a/b");
+        assert_eq!(normalize_base_path("/"), "");
+        assert_eq!(normalize_base_path(""), "");
+        assert_eq!(normalize_base_path("//"), "");
     }
 }
 
@@ -690,7 +1088,7 @@ mod auth_config_tests {
 
     #[test]
     fn headers_only_uses_defaults() {
-        let mut auth = parse("headers: {}\n");
+        let mut auth = parse("headers:\n  trust_all_remotes: true\n");
         auth.validate().expect("valid");
         let headers = auth.headers.expect("headers config");
         assert_eq!(headers.username, "Remote-User");
@@ -745,7 +1143,8 @@ mod auth_config_tests {
     fn dash_and_empty_trusted_remotes_are_ignored() {
         // '-' is the env-template placeholder for "not specified" (see
         // config.yaml.docker's MINICA_TRUSTED_REMOTE_1..10); empty entries are
-        // skipped too. All placeholders -> empty list -> trust everyone.
+        // skipped too. All placeholders -> empty list, which needs the
+        // explicit trust_all_remotes opt-in.
         let mut auth = parse(
             "headers:\n  trusted_remotes:\n    - '-'\n    - ''\n    - 10.0.0.0/8\n    - ' - '\n",
         );
@@ -755,12 +1154,45 @@ mod auth_config_tests {
         assert!(networks[0].contains(&"10.1.2.3".parse::<std::net::IpAddr>().expect("test ip")));
 
         let mut auth = parse("headers:\n  trusted_remotes:\n    - '-'\n    - '-'\n");
-        auth.validate().expect("valid");
-        assert!(auth
-            .headers
-            .expect("headers config")
-            .trusted_networks
-            .is_empty());
+        let err = auth.validate().unwrap_err().to_string();
+        assert!(err.contains("trust_all_remotes"), "{err}");
+
+        let mut auth = parse(
+            "headers:\n  trust_all_remotes: true\n  trusted_remotes:\n    - '-'\n    - '-'\n",
+        );
+        auth.validate().expect("valid with explicit opt-in");
+        assert!(
+            auth.headers
+                .expect("headers config")
+                .trusted_networks
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn header_auth_with_no_trusted_remotes_is_refused() {
+        let mut auth = parse("headers: {}\n");
+        let err = auth.validate().unwrap_err().to_string();
+        assert!(err.contains("trusted_remotes is empty"), "{err}");
+        // a disabled headers section does not need a trusted list
+        let mut auth = parse("users: []\nheaders:\n  enabled: false\n");
+        auth.validate().expect("valid: header auth disabled");
+    }
+
+    #[test]
+    fn typos_in_auth_sections_are_named() {
+        let err = serde_yaml::from_str::<AuthConfig>("users:\n  enabld: true\n  list: []\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("enabld"), "{err}");
+        let err = serde_yaml::from_str::<AuthConfig>("headers:\n  trusted_remote: [10.0.0.1]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("trusted_remote"), "{err}");
+        let err = serde_yaml::from_str::<AuthConfig>("users: admin\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("list of accounts"), "{err}");
     }
 
     #[test]

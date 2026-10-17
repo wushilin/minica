@@ -9,7 +9,10 @@ use crate::{
 use anyhow::{Result, anyhow, bail};
 use axum::{
     Form, Json, Router,
-    extract::{ConnectInfo, Multipart, Path, Query, Request, State, rejection::JsonRejection},
+    extract::{
+        ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, Request, State,
+        rejection::JsonRejection,
+    },
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::Next,
     response::{Html, IntoResponse, Redirect, Response},
@@ -34,6 +37,11 @@ pub async fn stamp_peer_ip(
     request.headers_mut().insert(auth::PEER_IP_HEADER, value);
     next.run(request).await
 }
+
+/// Request body cap for the backup restore routes. Backups carry every CA,
+/// certificate and key, so they can far exceed axum's 2 MiB default, which
+/// still applies to every other route.
+const RESTORE_BODY_LIMIT: usize = 256 * 1024 * 1024;
 
 pub fn router(state: Arc<AppState>) -> Router {
     let api = Router::new()
@@ -92,7 +100,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/backup/restore",
-            post(api_backup_restore).fallback(api_method_not_allowed),
+            post(api_backup_restore)
+                .fallback(api_method_not_allowed)
+                .layer(DefaultBodyLimit::max(RESTORE_BODY_LIMIT)),
         )
         .route("/{*path}", any(api_not_found));
 
@@ -124,7 +134,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin", get(admin_console))
         .route("/swagger", get(swagger_page))
         .route("/admin/backup", get(admin_backup_export))
-        .route("/admin/backup/restore", post(admin_backup_restore))
+        .route(
+            "/admin/backup/restore",
+            post(admin_backup_restore).layer(DefaultBodyLimit::max(RESTORE_BODY_LIMIT)),
+        )
         .route("/admin/nuke", post(admin_nuke))
         .route("/admin/users", post(admin_create_user))
         .route("/admin/users/{user_id}/delete", post(admin_delete_user))
@@ -147,7 +160,7 @@ pub async fn home(State(state): State<Arc<AppState>>) -> Redirect {
 }
 
 async fn ca_list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    page_response(state, headers, |state, user, _csrf| {
+    page_response(state, headers, move |state, user, _csrf| {
         let cas = state.service.list_cas()?;
         let mut body = breadcrumb(&[("Home".to_string(), None)]);
         let write_actions = if user.role.can_write() {
@@ -187,6 +200,7 @@ async fn ca_list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
         }
         Ok(body)
     })
+    .await
 }
 
 fn ca_form_page(
@@ -208,9 +222,10 @@ fn ca_form_page(
 }
 
 async fn new_ca_form(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    admin_page_response(state, headers, |state, csrf| {
+    admin_page_response(state, headers, move |state, csrf| {
         Ok(ca_form_page(state, &csrf, None, &SubjectValues::default()))
     })
+    .await
 }
 
 async fn create_ca_form(
@@ -218,13 +233,19 @@ async fn create_ca_form(
     headers: HeaderMap,
     Form(form): Form<CaForm>,
 ) -> Response {
-    if let Err(err) =
-        auth::require_admin(&headers, &state).and_then(|_| check_form_csrf(&headers, &form._csrf))
+    // Outer error: auth/CSRF failure; inner: service failure (re-render form).
+    let request = form.clone().into_request();
+    let created = match admin_blocking(&state, &headers, Some(form._csrf.clone()), move |state| {
+        Ok(state.service.create_ca(request))
+    })
+    .await
     {
-        return error_response(err);
-    }
-    match state.service.create_ca(form.clone().into_request()) {
+        Ok(created) => created,
+        Err(err) => return error_response(&state, err),
+    };
+    match created {
         Ok(ca) => redirect_with_flash(
+            &state,
             &u(&state, "/cas"),
             "success",
             &format!("Created certificate authority \"{}\"", ca.common_name),
@@ -235,6 +256,7 @@ async fn create_ca_form(
             page_response(state, headers, move |state, _user, csrf| {
                 Ok(ca_form_page(state, &csrf, Some(&message), &values))
             })
+            .await
         }
     }
 }
@@ -266,9 +288,10 @@ fn import_ca_page(
 }
 
 async fn import_ca_form(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    admin_page_response(state, headers, |state, csrf| {
+    admin_page_response(state, headers, move |state, csrf| {
         Ok(import_ca_page(state, &csrf, &ImportValues::empty(), None))
     })
+    .await
 }
 
 async fn import_ca_form_post(
@@ -276,18 +299,22 @@ async fn import_ca_form_post(
     headers: HeaderMap,
     Form(form): Form<ImportCaForm>,
 ) -> Response {
-    if let Err(err) =
-        auth::require_admin(&headers, &state).and_then(|_| check_form_csrf(&headers, &form._csrf))
-    {
-        return error_response(err);
-    }
-    let result = state.service.import_ca(ImportCaRequest {
+    let request = ImportCaRequest {
         cert_pem: form.cert_pem.clone(),
         key_pem: form.key_pem.clone(),
         password: empty_none(form.password.clone()),
-    });
+    };
+    let result = match admin_blocking(&state, &headers, Some(form._csrf.clone()), move |state| {
+        Ok(state.service.import_ca(request))
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => return error_response(&state, err),
+    };
     match result {
         Ok(ca) => redirect_with_flash(
+            &state,
             &u(&state, "/cas"),
             "success",
             &format!("Imported certificate authority \"{}\"", ca.common_name),
@@ -302,6 +329,7 @@ async fn import_ca_form_post(
             page_response(state, headers, move |state, _user, csrf| {
                 Ok(import_ca_page(state, &csrf, &values, Some(&message)))
             })
+            .await
         }
     }
 }
@@ -311,7 +339,7 @@ async fn ca_detail(
     headers: HeaderMap,
     Path(ca_id): Path<String>,
 ) -> Response {
-    page_response(state, headers, |state, user, csrf| {
+    page_response(state, headers, move |state, user, csrf| {
         let ca = state.service.get_ca(&ca_id)?;
         let certs = state.service.list_certs(&ca_id)?;
         let mut body = breadcrumb(&[
@@ -381,6 +409,7 @@ async fn ca_detail(
         body.push_str("</section>");
         Ok(body)
     })
+    .await
 }
 
 async fn delete_ca_form(
@@ -389,7 +418,7 @@ async fn delete_ca_form(
     Path(ca_id): Path<String>,
     Form(form): Form<CsrfForm>,
 ) -> Response {
-    mutate_form_response(state, headers, &form._csrf, |state| {
+    mutate_form_response(state, headers, form._csrf.clone(), move |state| {
         let name = state
             .service
             .get_ca(&ca_id)
@@ -401,6 +430,7 @@ async fn delete_ca_form(
             format!("Deleted certificate authority \"{name}\""),
         ))
     })
+    .await
 }
 
 fn cert_form_page(
@@ -432,7 +462,7 @@ async fn new_cert_form(
     headers: HeaderMap,
     Path(ca_id): Path<String>,
 ) -> Response {
-    admin_page_response(state, headers, |state, csrf| {
+    admin_page_response(state, headers, move |state, csrf| {
         let ca = state.service.get_ca(&ca_id)?;
         Ok(cert_form_page(
             state,
@@ -443,6 +473,7 @@ async fn new_cert_form(
             &SubjectValues::default(),
         ))
     })
+    .await
 }
 
 async fn create_cert_form(
@@ -451,16 +482,19 @@ async fn create_cert_form(
     Path(ca_id): Path<String>,
     Form(form): Form<CertForm>,
 ) -> Response {
-    if let Err(err) =
-        auth::require_admin(&headers, &state).and_then(|_| check_form_csrf(&headers, &form._csrf))
+    let request = form.clone().into_request();
+    let task_ca_id = ca_id.clone();
+    let created = match admin_blocking(&state, &headers, Some(form._csrf.clone()), move |state| {
+        Ok(state.service.create_cert(&task_ca_id, request))
+    })
+    .await
     {
-        return error_response(err);
-    }
-    match state
-        .service
-        .create_cert(&ca_id, form.clone().into_request())
-    {
+        Ok(created) => created,
+        Err(err) => return error_response(&state, err),
+    };
+    match created {
         Ok(cert) => redirect_with_flash(
+            &state,
             &u(&state, &format!("/cas/{ca_id}#ca-certs")),
             "success",
             &format!("Created certificate \"{}\"", cert.common_name),
@@ -468,8 +502,8 @@ async fn create_cert_form(
         Err(err) => {
             let message = err.to_string();
             let values = SubjectValues::from(&form);
-            let ca_name = state.service.ca_display_name(&ca_id);
             page_response(state, headers, move |state, _user, csrf| {
+                let ca_name = state.service.ca_display_name(&ca_id);
                 Ok(cert_form_page(
                     state,
                     &ca_id,
@@ -479,6 +513,7 @@ async fn create_cert_form(
                     &values,
                 ))
             })
+            .await
         }
     }
 }
@@ -520,7 +555,7 @@ async fn import_cert_form(
     headers: HeaderMap,
     Path(ca_id): Path<String>,
 ) -> Response {
-    admin_page_response(state, headers, |state, csrf| {
+    admin_page_response(state, headers, move |state, csrf| {
         let ca = state.service.get_ca(&ca_id)?;
         Ok(import_cert_page(
             state,
@@ -531,6 +566,7 @@ async fn import_cert_form(
             None,
         ))
     })
+    .await
 }
 
 async fn import_cert_form_post(
@@ -539,34 +575,36 @@ async fn import_cert_form_post(
     Path(ca_id): Path<String>,
     Form(form): Form<ImportCertForm>,
 ) -> Response {
-    if let Err(err) =
-        auth::require_admin(&headers, &state).and_then(|_| check_form_csrf(&headers, &form._csrf))
+    let request = ImportCertRequest {
+        cert_pem: form.cert_pem.clone(),
+        key_pem: form.key_pem.clone(),
+        password: empty_none(form.password.clone()),
+    };
+    let task_ca_id = ca_id.clone();
+    let result = match admin_blocking(&state, &headers, Some(form._csrf.clone()), move |state| {
+        Ok(state.service.import_cert(&task_ca_id, request))
+    })
+    .await
     {
-        return error_response(err);
-    }
-    let result = state.service.import_cert(
-        &ca_id,
-        ImportCertRequest {
-            cert_pem: form.cert_pem.clone(),
-            key_pem: form.key_pem.clone(),
-            password: empty_none(form.password.clone()),
-        },
-    );
+        Ok(result) => result,
+        Err(err) => return error_response(&state, err),
+    };
     match result {
         Ok(cert) => redirect_with_flash(
+            &state,
             &u(&state, &format!("/cas/{ca_id}#ca-certs")),
             "success",
             &format!("Imported certificate \"{}\"", cert.common_name),
         ),
         Err(err) => {
             let message = err.to_string();
-            let ca_name = state.service.ca_display_name(&ca_id);
             let values = ImportValues {
                 cert_pem: form.cert_pem,
                 key_pem: form.key_pem,
                 password: form.password,
             };
             page_response(state, headers, move |state, _user, csrf| {
+                let ca_name = state.service.ca_display_name(&ca_id);
                 Ok(import_cert_page(
                     state,
                     &ca_id,
@@ -576,6 +614,7 @@ async fn import_cert_form_post(
                     Some(&message),
                 ))
             })
+            .await
         }
     }
 }
@@ -585,7 +624,7 @@ async fn cert_detail(
     headers: HeaderMap,
     Path((ca_id, cert_id)): Path<(String, String)>,
 ) -> Response {
-    page_response(state, headers, |state, user, csrf| {
+    page_response(state, headers, move |state, user, csrf| {
         let cert = state.service.get_cert(&ca_id, &cert_id)?;
         let ca = state.service.get_ca(&ca_id)?;
         let purposes = state
@@ -658,6 +697,7 @@ async fn cert_detail(
         );
         Ok(body)
     })
+    .await
 }
 
 async fn delete_cert_form(
@@ -666,7 +706,7 @@ async fn delete_cert_form(
     Path((ca_id, cert_id)): Path<(String, String)>,
     Form(form): Form<CsrfForm>,
 ) -> Response {
-    mutate_form_response(state, headers, &form._csrf, |state| {
+    mutate_form_response(state, headers, form._csrf.clone(), move |state| {
         let name = state
             .service
             .get_cert(&ca_id, &cert_id)
@@ -678,6 +718,7 @@ async fn delete_cert_form(
             format!("Deleted certificate \"{name}\""),
         ))
     })
+    .await
 }
 
 async fn renew_cert_form(
@@ -686,7 +727,7 @@ async fn renew_cert_form(
     Path((ca_id, cert_id)): Path<(String, String)>,
     Form(form): Form<RenewForm>,
 ) -> Response {
-    mutate_form_response(state, headers, &form._csrf, |state| {
+    mutate_form_response(state, headers, form._csrf.clone(), move |state| {
         let cert = state.service.renew_cert(&ca_id, &cert_id, form.days)?;
         Ok((
             Redirect::to(&u(state, &format!("/cas/{ca_id}/certs/{cert_id}"))),
@@ -696,6 +737,7 @@ async fn renew_cert_form(
             ),
         ))
     })
+    .await
 }
 
 async fn revoke_cert_form(
@@ -704,44 +746,48 @@ async fn revoke_cert_form(
     Path((ca_id, cert_id)): Path<(String, String)>,
     Form(form): Form<RevokeForm>,
 ) -> Response {
-    mutate_form_response(state, headers, &form._csrf, |state| {
+    mutate_form_response(state, headers, form._csrf.clone(), move |state| {
         let cert = state.service.revoke_cert(&ca_id, &cert_id, &form.reason)?;
         Ok((
             Redirect::to(&u(state, &format!("/cas/{ca_id}/certs/{cert_id}"))),
             format!("Revoked certificate \"{}\"", cert.common_name),
         ))
     })
+    .await
 }
 
 async fn crl_download(State(state): State<Arc<AppState>>, Path(ca_id): Path<String>) -> Response {
-    match state.service.crl_der(&ca_id) {
+    let task_state = state.clone();
+    let task_ca_id = ca_id.clone();
+    match blocking(move || task_state.service.crl_der(&task_ca_id)).await {
         Ok(bytes) => (
             [
                 (header::CONTENT_TYPE, "application/pkix-crl".to_string()),
                 (
                     header::CONTENT_DISPOSITION,
-                    format!("attachment; filename=\"ca-{ca_id}.crl\""),
+                    attachment_disposition(&format!("ca-{ca_id}.crl")),
                 ),
             ],
             bytes,
         )
             .into_response(),
-        Err(err) => error_response(err),
+        Err(err) => error_response(&state, err),
     }
 }
 
 async fn admin_console(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    admin_page_response(state, headers, |state, csrf| {
+    admin_page_response(state, headers, move |state, csrf| {
         admin_console_body(state, &csrf, None)
     })
+    .await
 }
 
 async fn swagger_page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    admin_page_response(state, headers, |state, _csrf| {
+    admin_page_response(state, headers, move |state, _csrf| {
         let base = state.config.server.base_path.clone();
         let spec = openapi_spec_json(&base);
         Ok(format!(
-            r##"{}<div class="page-head"><h1>API Explorer</h1><p class="muted">Authenticated API console for MiniCA endpoints.</p></div><section class="panel swagger-panel"><div id="swagger-ui"></div></section><link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css"><script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script><script>
+            r##"{}<div class="page-head"><h1>API Explorer</h1><p class="muted">Authenticated API console for MiniCA endpoints.</p></div><section class="panel swagger-panel"><div id="swagger-ui"></div></section><link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5.17.14/swagger-ui.css"><script src="https://unpkg.com/swagger-ui-dist@5.17.14/swagger-ui-bundle.js"></script><script>
 let minicaCsrfToken = "";
 fetch("{}/api/csrf", {{ credentials: "include" }})
   .then((response) => response.ok ? response.json() : null)
@@ -770,6 +816,7 @@ fetch("{}/api/csrf", {{ credentials: "include" }})
             spec
         ))
     })
+    .await
 }
 
 async fn admin_create_user(
@@ -777,18 +824,22 @@ async fn admin_create_user(
     headers: HeaderMap,
     Form(form): Form<AdminUserForm>,
 ) -> Response {
-    if let Err(err) =
-        auth::require_admin(&headers, &state).and_then(|_| check_form_csrf(&headers, &form._csrf))
-    {
-        return error_response(err);
-    }
-    let result = state.service.create_user(CreateUserRequest {
+    let request = CreateUserRequest {
         username: form.username.clone(),
         password: form.password.clone(),
         role: form.role.clone(),
-    });
+    };
+    let result = match admin_blocking(&state, &headers, Some(form._csrf.clone()), move |state| {
+        Ok(state.service.create_user(request))
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => return error_response(&state, err),
+    };
     match result {
         Ok(_) => redirect_with_flash(
+            &state,
             &u(&state, "/admin"),
             "success",
             &format!("Created user \"{}\"", form.username),
@@ -798,6 +849,7 @@ async fn admin_create_user(
             admin_page_response(state, headers, move |state, csrf| {
                 admin_console_body(state, &csrf, Some(&message))
             })
+            .await
         }
     }
 }
@@ -808,17 +860,22 @@ async fn admin_delete_user(
     Path(user_id): Path<String>,
     Form(form): Form<CsrfForm>,
 ) -> Response {
-    mutate_form_response(state, headers, &form._csrf, |state| {
+    mutate_form_response(state, headers, form._csrf.clone(), move |state| {
         state.service.delete_user(&user_id)?;
         Ok((
             Redirect::to(&u(state, "/admin")),
             "User deleted".to_string(),
         ))
     })
+    .await
 }
 
 async fn admin_backup_export(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    match auth::require_admin(&headers, &state).and_then(|_| state.service.export_backup_yaml()) {
+    match admin_blocking(&state, &headers, None, |state| {
+        state.service.export_backup_yaml()
+    })
+    .await
+    {
         Ok(yaml) => (
             [
                 (header::CONTENT_TYPE, "application/x-yaml".to_string()),
@@ -830,7 +887,7 @@ async fn admin_backup_export(State(state): State<Arc<AppState>>, headers: Header
             yaml,
         )
             .into_response(),
-        Err(err) => error_response(err),
+        Err(err) => error_response(&state, err),
     }
 }
 
@@ -839,32 +896,55 @@ async fn admin_backup_restore(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Response {
-    if let Err(err) = auth::require_admin(&headers, &state) {
-        return error_response(err);
+    if let Err(err) = admin_blocking(&state, &headers, None, |_| Ok(())).await {
+        return error_response(&state, err);
     }
     let mut csrf = String::new();
     let mut yaml = String::new();
-    while let Ok(Some(field)) = multipart.next_field().await {
+    loop {
+        // Surface malformed/oversized uploads instead of treating them as
+        // "no file chosen".
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(err) => {
+                return error_response(&state, anyhow!("could not read backup upload: {err}"));
+            }
+        };
         let name = field.name().unwrap_or_default().to_string();
         match name.as_str() {
             "_csrf" => {
-                csrf = field.text().await.unwrap_or_default();
+                csrf = match field.text().await {
+                    Ok(text) => text,
+                    Err(err) => {
+                        return error_response(
+                            &state,
+                            anyhow!("could not read backup upload: {err}"),
+                        );
+                    }
+                };
             }
             "backup" => {
                 let filename = field.file_name().unwrap_or_default().to_string();
                 let bytes = match field.bytes().await {
                     Ok(bytes) => bytes,
                     Err(err) => {
-                        return error_response(anyhow!("could not read backup upload: {err}"));
+                        return error_response(
+                            &state,
+                            anyhow!("could not read backup upload: {err}"),
+                        );
                     }
                 };
                 if bytes.is_empty() {
-                    return error_response(anyhow!("backup upload is empty"));
+                    return error_response(&state, anyhow!("backup upload is empty"));
                 }
                 yaml = match String::from_utf8(bytes.to_vec()) {
                     Ok(text) => text,
                     Err(_) => {
-                        return error_response(anyhow!("backup upload must be a UTF-8 YAML file"));
+                        return error_response(
+                            &state,
+                            anyhow!("backup upload must be a UTF-8 YAML file"),
+                        );
                     }
                 };
                 if filename.is_empty() {
@@ -875,14 +955,15 @@ async fn admin_backup_restore(
         }
     }
     if let Err(err) = check_form_csrf(&headers, &csrf) {
-        return error_response(err);
+        return error_response(&state, err);
     }
     if yaml.trim().is_empty() {
-        return error_response(anyhow!("choose a backup YAML file to restore"));
+        return error_response(&state, anyhow!("choose a backup YAML file to restore"));
     }
-    match state.service.import_backup_yaml(&yaml) {
-        Ok(_) => redirect_with_flash(&u(&state, "/admin"), "success", "Backup restored"),
-        Err(err) => error_response(err),
+    let task_state = state.clone();
+    match blocking(move || task_state.service.import_backup_yaml(&yaml)).await {
+        Ok(_) => redirect_with_flash(&state, &u(&state, "/admin"), "success", "Backup restored"),
+        Err(err) => error_response(&state, err),
     }
 }
 
@@ -891,7 +972,7 @@ async fn admin_nuke(
     headers: HeaderMap,
     Form(form): Form<NukeForm>,
 ) -> Response {
-    mutate_form_response(state, headers, &form._csrf, |state| {
+    mutate_form_response(state, headers, form._csrf.clone(), move |state| {
         if form.confirm.as_deref() != Some("CONFIRM") {
             bail!("type CONFIRM before nuking the database");
         }
@@ -901,6 +982,7 @@ async fn admin_nuke(
             "Database emptied".to_string(),
         ))
     })
+    .await
 }
 
 async fn admin_restore_ca(
@@ -909,7 +991,7 @@ async fn admin_restore_ca(
     Path(ca_id): Path<String>,
     Form(form): Form<CsrfForm>,
 ) -> Response {
-    mutate_form_response(state, headers, &form._csrf, |state| {
+    mutate_form_response(state, headers, form._csrf.clone(), move |state| {
         let name = state.service.ca_display_name(&ca_id);
         state.service.restore_ca(&ca_id)?;
         Ok((
@@ -917,6 +999,7 @@ async fn admin_restore_ca(
             format!("Restored certificate authority \"{name}\""),
         ))
     })
+    .await
 }
 
 async fn admin_restore_cert(
@@ -925,13 +1008,14 @@ async fn admin_restore_cert(
     Path((ca_id, cert_id)): Path<(String, String)>,
     Form(form): Form<CsrfForm>,
 ) -> Response {
-    mutate_form_response(state, headers, &form._csrf, |state| {
+    mutate_form_response(state, headers, form._csrf.clone(), move |state| {
         state.service.restore_cert(&ca_id, &cert_id)?;
         Ok((
             Redirect::to(&u(state, "/admin")),
             "Certificate restored".to_string(),
         ))
     })
+    .await
 }
 
 fn admin_console_body(state: &Arc<AppState>, csrf: &str, error: Option<&str>) -> Result<String> {
@@ -1049,9 +1133,10 @@ fn inspect_form_body(
 }
 
 async fn inspect_form(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    admin_page_response(state, headers, |state, csrf| {
+    admin_page_response(state, headers, move |state, csrf| {
         Ok(inspect_form_body(state, &csrf, None, ""))
     })
+    .await
 }
 
 async fn inspect_form_post(
@@ -1108,6 +1193,7 @@ async fn inspect_form_post(
         ));
         Ok(body)
     })
+    .await
 }
 
 async fn download_ca(
@@ -1115,11 +1201,13 @@ async fn download_ca(
     headers: HeaderMap,
     Path((ca_id, kind)): Path<(String, String)>,
 ) -> Response {
-    match auth::require_viewer(&headers, &state)
-        .and_then(|_| state.service.download_ca(&ca_id, ca_download_kind(&kind)?))
+    match viewer_blocking(&state, &headers, move |state| {
+        state.service.download_ca(&ca_id, ca_download_kind(&kind)?)
+    })
+    .await
     {
         Ok((name, bytes)) => download_response(name, bytes),
-        Err(err) => error_response(err),
+        Err(err) => error_response(&state, err),
     }
 }
 
@@ -1128,28 +1216,30 @@ async fn download_cert(
     headers: HeaderMap,
     Path((ca_id, cert_id, kind)): Path<(String, String, String)>,
 ) -> Response {
-    match auth::require_viewer(&headers, &state).and_then(|_| {
+    match viewer_blocking(&state, &headers, move |state| {
         state
             .service
             .download_cert(&ca_id, &cert_id, cert_download_kind(&kind)?)
-    }) {
+    })
+    .await
+    {
         Ok((name, bytes)) => download_response(name, bytes),
-        Err(err) => error_response(err),
+        Err(err) => error_response(&state, err),
     }
 }
 
-async fn api_csrf(headers: HeaderMap) -> Response {
+async fn api_csrf(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let token = current_or_new_csrf(&headers);
     let mut response = api_success(serde_json::json!({
         "headerName": "X-CSRF-Token",
         "token": token
     }));
-    append_cookie(&mut response, cookie_header(&token));
+    append_cookie(&mut response, cookie_header(&state, &token));
     response
 }
 
 async fn api_list_cas(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    api_view(headers, &state, || state.service.list_cas())
+    api_view(headers, state, move |state| state.service.list_cas()).await
 }
 
 async fn api_get_ca(
@@ -1157,7 +1247,7 @@ async fn api_get_ca(
     headers: HeaderMap,
     Path(ca_id): Path<String>,
 ) -> Response {
-    api_view(headers, &state, || state.service.get_ca(&ca_id))
+    api_view(headers, state, move |state| state.service.get_ca(&ca_id)).await
 }
 
 async fn api_create_ca(
@@ -1169,9 +1259,10 @@ async fn api_create_ca(
         Ok(req) => req,
         Err(err) => return api_json_rejection(err),
     };
-    api_admin(Method::PUT, headers, &state, || {
+    api_admin(Method::PUT, headers, state, move |state| {
         state.service.create_ca(req)
     })
+    .await
 }
 
 async fn api_import_ca(
@@ -1183,9 +1274,10 @@ async fn api_import_ca(
         Ok(req) => req,
         Err(err) => return api_json_rejection(err),
     };
-    api_admin(Method::PUT, headers, &state, || {
+    api_admin(Method::PUT, headers, state, move |state| {
         state.service.import_ca(req)
     })
+    .await
 }
 
 async fn api_delete_ca(
@@ -1193,10 +1285,11 @@ async fn api_delete_ca(
     headers: HeaderMap,
     Path(ca_id): Path<String>,
 ) -> Response {
-    api_admin(Method::DELETE, headers, &state, || {
+    api_admin(Method::DELETE, headers, state, move |state| {
         state.service.delete_ca(&ca_id)?;
         Ok(serde_json::json!({ "deleted": true }))
     })
+    .await
 }
 
 async fn api_list_certs(
@@ -1204,7 +1297,10 @@ async fn api_list_certs(
     headers: HeaderMap,
     Path(ca_id): Path<String>,
 ) -> Response {
-    api_view(headers, &state, || state.service.list_certs(&ca_id))
+    api_view(headers, state, move |state| {
+        state.service.list_certs(&ca_id)
+    })
+    .await
 }
 
 async fn api_get_cert(
@@ -1212,7 +1308,10 @@ async fn api_get_cert(
     headers: HeaderMap,
     Path((ca_id, cert_id)): Path<(String, String)>,
 ) -> Response {
-    api_view(headers, &state, || state.service.get_cert(&ca_id, &cert_id))
+    api_view(headers, state, move |state| {
+        state.service.get_cert(&ca_id, &cert_id)
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -1226,7 +1325,7 @@ async fn api_find_cert_by_cn(
     Path(ca_id): Path<String>,
     Query(query): Query<CertCnQuery>,
 ) -> Response {
-    if let Err(err) = auth::require_viewer(&headers, &state) {
+    if let Err(err) = viewer_blocking(&state, &headers, |_| Ok(())).await {
         return api_error_response(err);
     }
     let cn = query.cn.unwrap_or_default();
@@ -1237,7 +1336,8 @@ async fn api_find_cert_by_cn(
             "query parameter 'cn' is required",
         );
     }
-    match state.service.find_cert_id_by_cn(&ca_id, &cn) {
+    let task_state = state.clone();
+    match blocking(move || task_state.service.find_cert_id_by_cn(&ca_id, &cn)).await {
         Ok(Some(id)) => api_success(serde_json::json!({ "id": id })),
         Ok(None) => api_error_status(
             StatusCode::NOT_FOUND,
@@ -1258,9 +1358,10 @@ async fn api_create_cert(
         Ok(req) => req,
         Err(err) => return api_json_rejection(err),
     };
-    api_admin(Method::PUT, headers, &state, || {
+    api_admin(Method::PUT, headers, state, move |state| {
         state.service.create_cert(&ca_id, req)
     })
+    .await
 }
 
 async fn api_import_cert(
@@ -1273,9 +1374,10 @@ async fn api_import_cert(
         Ok(req) => req,
         Err(err) => return api_json_rejection(err),
     };
-    api_admin(Method::PUT, headers, &state, || {
+    api_admin(Method::PUT, headers, state, move |state| {
         state.service.import_cert(&ca_id, req)
     })
+    .await
 }
 
 async fn api_delete_cert(
@@ -1283,10 +1385,11 @@ async fn api_delete_cert(
     headers: HeaderMap,
     Path((ca_id, cert_id)): Path<(String, String)>,
 ) -> Response {
-    api_admin(Method::DELETE, headers, &state, || {
+    api_admin(Method::DELETE, headers, state, move |state| {
         state.service.delete_cert(&ca_id, &cert_id)?;
         Ok(serde_json::json!({ "deleted": true }))
     })
+    .await
 }
 
 async fn api_renew_cert(
@@ -1304,9 +1407,10 @@ async fn api_renew_cert(
             );
         }
     };
-    api_admin(Method::POST, headers, &state, || {
+    api_admin(Method::POST, headers, state, move |state| {
         state.service.renew_cert(&ca_id, &cert_id, days)
     })
+    .await
 }
 
 async fn api_revoke_cert(
@@ -1320,9 +1424,10 @@ async fn api_revoke_cert(
         Err(JsonRejection::MissingJsonContentType(_)) => "unspecified".to_string(),
         Err(err) => return api_json_rejection(err),
     };
-    api_admin(Method::POST, headers, &state, || {
+    api_admin(Method::POST, headers, state, move |state| {
         state.service.revoke_cert(&ca_id, &cert_id, &reason)
     })
+    .await
 }
 
 async fn api_inspect(
@@ -1334,13 +1439,18 @@ async fn api_inspect(
         Ok(req) => req,
         Err(err) => return api_json_rejection(err),
     };
-    api_admin(Method::PUT, headers, &state, || {
+    api_admin(Method::PUT, headers, state, move |state| {
         state.service.inspect_cert(&req.cert_pem)
     })
+    .await
 }
 
 async fn api_backup_export(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    match auth::require_admin(&headers, &state).and_then(|_| state.service.export_backup_yaml()) {
+    match admin_blocking(&state, &headers, None, |state| {
+        state.service.export_backup_yaml()
+    })
+    .await
+    {
         Ok(yaml) => api_success(serde_json::json!({
             "filename": "minica-backup.yaml",
             "contentType": "application/x-yaml",
@@ -1355,10 +1465,11 @@ async fn api_backup_restore(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    api_admin(Method::POST, headers, &state, || {
+    api_admin(Method::POST, headers, state, move |state| {
         state.service.import_backup_yaml(&body)?;
         Ok(serde_json::json!({ "restored": true }))
     })
+    .await
 }
 
 async fn api_not_found() -> Response {
@@ -1373,35 +1484,116 @@ async fn api_method_not_allowed() -> Response {
     )
 }
 
-fn page_response<F>(state: Arc<AppState>, headers: HeaderMap, f: F) -> Response
+/// Marker error for a blocking task that panicked or was cancelled; mapped to
+/// 500 rather than the message-based 4xx statuses.
+#[derive(Debug)]
+struct InternalError(String);
+
+impl std::fmt::Display for InternalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "internal server error: {}", self.0)
+    }
+}
+
+impl std::error::Error for InternalError {}
+
+/// Runs synchronous work — openssl subprocesses, SQLite, bcrypt — on tokio's
+/// blocking pool so it never stalls the async workers. A panic in `f` becomes
+/// an `InternalError` (HTTP 500) instead of tearing down the connection task.
+async fn blocking<T, F>(f: F) -> Result<T>
 where
-    F: FnOnce(&Arc<AppState>, auth::User, String) -> Result<String>,
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
 {
-    match auth::require_viewer(&headers, &state).and_then(|user| {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(result) => result,
+        Err(err) => {
+            tracing::error!(error = %err, "blocking request task failed");
+            let reason = if err.is_panic() {
+                "task panicked"
+            } else {
+                "task cancelled"
+            };
+            Err(InternalError(reason.to_string()).into())
+        }
+    }
+}
+
+async fn page_response<F>(state: Arc<AppState>, headers: HeaderMap, f: F) -> Response
+where
+    F: FnOnce(&Arc<AppState>, auth::User, String) -> Result<String> + Send + 'static,
+{
+    let (task_state, task_headers) = (state.clone(), headers.clone());
+    let result = blocking(move || {
+        let user = auth::require_viewer(&task_headers, &task_state)?;
         let is_admin = user.role.can_write();
-        let token = current_or_new_csrf(&headers);
-        let content = f(&state, user, token.clone())?;
+        let token = current_or_new_csrf(&task_headers);
+        let content = f(&task_state, user, token.clone())?;
         Ok((token, is_admin, content))
-    }) {
+    })
+    .await;
+    match result {
         Ok((token, is_admin, content)) => render_page(&state, &headers, &token, is_admin, content),
-        Err(err) => error_response(err),
+        Err(err) => error_response(&state, err),
     }
 }
 
 /// Like `page_response` but requires the admin role and always renders the
 /// layout with the Admin Console link visible.
-fn admin_page_response<F>(state: Arc<AppState>, headers: HeaderMap, f: F) -> Response
+async fn admin_page_response<F>(state: Arc<AppState>, headers: HeaderMap, f: F) -> Response
 where
-    F: FnOnce(&Arc<AppState>, String) -> Result<String>,
+    F: FnOnce(&Arc<AppState>, String) -> Result<String> + Send + 'static,
 {
-    match auth::require_admin(&headers, &state).and_then(|_user| {
-        let token = current_or_new_csrf(&headers);
-        let content = f(&state, token.clone())?;
+    let (task_state, task_headers) = (state.clone(), headers.clone());
+    let result = blocking(move || {
+        auth::require_admin(&task_headers, &task_state)?;
+        let token = current_or_new_csrf(&task_headers);
+        let content = f(&task_state, token.clone())?;
         Ok((token, content))
-    }) {
+    })
+    .await;
+    match result {
         Ok((token, content)) => render_page(&state, &headers, &token, true, content),
-        Err(err) => error_response(err),
+        Err(err) => error_response(&state, err),
     }
+}
+
+/// Authenticates (and, when `csrf` is given, checks the form CSRF token) then
+/// runs `f`, all on the blocking pool. For handlers that are not a plain page
+/// or redirect.
+async fn admin_blocking<T, F>(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    csrf: Option<String>,
+    f: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Arc<AppState>) -> Result<T> + Send + 'static,
+{
+    let (state, headers) = (state.clone(), headers.clone());
+    blocking(move || {
+        auth::require_admin(&headers, &state)?;
+        if let Some(csrf) = csrf {
+            check_form_csrf(&headers, &csrf)?;
+        }
+        f(&state)
+    })
+    .await
+}
+
+/// Viewer-level counterpart of `admin_blocking`.
+async fn viewer_blocking<T, F>(state: &Arc<AppState>, headers: &HeaderMap, f: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Arc<AppState>) -> Result<T> + Send + 'static,
+{
+    let (state, headers) = (state.clone(), headers.clone());
+    blocking(move || {
+        auth::require_viewer(&headers, &state)?;
+        f(&state)
+    })
+    .await
 }
 
 /// Wraps page content in the layout, sets the CSRF cookie, and surfaces any
@@ -1421,53 +1613,57 @@ fn render_page(
     let body = format!("{panel}{content}");
     let mut response =
         Html(layout(&state.config.server.base_path, &body, is_admin)).into_response();
-    append_cookie(&mut response, cookie_header(token));
+    append_cookie(&mut response, cookie_header(state, token));
     if flash.is_some() {
-        append_cookie(&mut response, flash_clear_cookie());
+        append_cookie(&mut response, flash_clear_cookie(state));
     }
     response
 }
 
-fn mutate_form_response<F>(state: Arc<AppState>, headers: HeaderMap, csrf: &str, f: F) -> Response
+async fn mutate_form_response<F>(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    csrf: String,
+    f: F,
+) -> Response
 where
-    F: FnOnce(&Arc<AppState>) -> Result<(Redirect, String)>,
+    F: FnOnce(&Arc<AppState>) -> Result<(Redirect, String)> + Send + 'static,
 {
-    match auth::require_admin(&headers, &state)
-        .and_then(|_| check_form_csrf(&headers, csrf))
-        .and_then(|_| f(&state))
-    {
+    match admin_blocking(&state, &headers, Some(csrf), f).await {
         Ok((redirect, notice)) => {
             let mut response = redirect.into_response();
             if !notice.is_empty() {
-                append_cookie(&mut response, flash_set_cookie("success", &notice));
+                append_cookie(&mut response, flash_set_cookie(&state, "success", &notice));
             }
             response
         }
-        Err(err) => error_response(err),
+        Err(err) => error_response(&state, err),
     }
 }
 
-fn api_view<T: serde::Serialize, F: FnOnce() -> Result<T>>(
-    headers: HeaderMap,
-    state: &Arc<AppState>,
-    f: F,
-) -> Response {
-    match auth::require_viewer(&headers, state).and_then(|_| f()) {
+async fn api_view<T, F>(headers: HeaderMap, state: Arc<AppState>, f: F) -> Response
+where
+    T: serde::Serialize + Send + 'static,
+    F: FnOnce(&Arc<AppState>) -> Result<T> + Send + 'static,
+{
+    match viewer_blocking(&state, &headers, f).await {
         Ok(value) => api_success(value),
         Err(err) => api_error_response(err),
     }
 }
 
-fn api_admin<T: serde::Serialize, F: FnOnce() -> Result<T>>(
-    method: Method,
-    headers: HeaderMap,
-    state: &Arc<AppState>,
-    f: F,
-) -> Response {
-    match auth::require_admin(&headers, state)
-        .and_then(|_| auth::check_csrf(&method, &headers))
-        .and_then(|_| f())
-    {
+async fn api_admin<T, F>(method: Method, headers: HeaderMap, state: Arc<AppState>, f: F) -> Response
+where
+    T: serde::Serialize + Send + 'static,
+    F: FnOnce(&Arc<AppState>) -> Result<T> + Send + 'static,
+{
+    let task_headers = headers.clone();
+    let result = admin_blocking(&state, &headers, None, move |state| {
+        auth::check_csrf(&method, &task_headers)?;
+        f(state)
+    })
+    .await;
+    match result {
         Ok(value) => api_success(value),
         Err(err) => api_error_response(err),
     }
@@ -1492,7 +1688,7 @@ fn api_json_rejection(err: JsonRejection) -> Response {
 
 fn api_error_response(err: anyhow::Error) -> Response {
     let msg = err.to_string();
-    let status = status_for_error_message(&msg);
+    let status = status_for_error(&err);
     let code = error_code_for_status(status, &msg);
     api_error_status(status, code, &msg)
 }
@@ -1521,36 +1717,43 @@ fn api_error_status(status: StatusCode, code: &str, message: &str) -> Response {
 }
 
 fn check_form_csrf(headers: &HeaderMap, form_token: &str) -> Result<()> {
-    let cookie = headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let cookie_token = cookie.split(';').find_map(|part| {
-        let (k, v) = part.trim().split_once('=')?;
-        (k == "minica_csrf").then_some(v)
-    });
-    if cookie_token == Some(form_token) {
+    let cookie_token = cookie_value(headers, "minica_csrf");
+    if auth::csrf_tokens_match(cookie_token.as_deref(), Some(form_token)) {
         Ok(())
     } else {
         Err(anyhow!("CSRF token missing or invalid"))
     }
 }
 
+/// Reuses the client's CSRF cookie only when it is a well-formed token, so an
+/// arbitrary cookie value is never reflected into `Set-Cookie`.
 fn current_or_new_csrf(headers: &HeaderMap) -> String {
-    headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|cookie| {
-            cookie.split(';').find_map(|part| {
-                let (k, v) = part.trim().split_once('=')?;
-                (k == "minica_csrf").then(|| v.to_string())
-            })
-        })
+    cookie_value(headers, "minica_csrf")
+        .filter(|token| auth::is_valid_csrf_token(token))
         .unwrap_or_else(auth::csrf_token)
 }
 
-fn cookie_header(token: &str) -> String {
-    format!("minica_csrf={}; Path=/minica; SameSite=Strict", h(token))
+/// Shared cookie attributes: scoped to the base path, SameSite=Strict, and
+/// `Secure` when `server.secure_cookies` is set.
+fn cookie_attributes(state: &AppState) -> String {
+    let secure = if state.config.server.secure_cookies {
+        "; Secure"
+    } else {
+        ""
+    };
+    format!(
+        "Path={}; SameSite=Strict{secure}",
+        state.config.cookie_path()
+    )
+}
+
+/// The CSRF cookie is HttpOnly: page JS never reads it (forms embed the token
+/// and the Swagger page fetches it from `/api/csrf`).
+fn cookie_header(state: &AppState, token: &str) -> String {
+    format!(
+        "minica_csrf={token}; {}; HttpOnly",
+        cookie_attributes(state)
+    )
 }
 
 fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -1567,14 +1770,17 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 
 /// Encodes a transient "flash" notification into a short-lived cookie so it can
 /// be shown as a toast on the page the browser lands on after a redirect.
-fn flash_set_cookie(kind: &str, message: &str) -> String {
+fn flash_set_cookie(state: &AppState, kind: &str, message: &str) -> String {
     let payload = format!("{kind}\u{1}{message}");
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
-    format!("minica_flash={encoded}; Path=/minica; Max-Age=20; SameSite=Strict")
+    format!(
+        "minica_flash={encoded}; Max-Age=20; {}",
+        cookie_attributes(state)
+    )
 }
 
-fn flash_clear_cookie() -> String {
-    "minica_flash=; Path=/minica; Max-Age=0; SameSite=Strict".to_string()
+fn flash_clear_cookie(state: &AppState) -> String {
+    format!("minica_flash=; Max-Age=0; {}", cookie_attributes(state))
 }
 
 /// Reads (without consuming) the flash cookie into `(kind, message)`.
@@ -1609,19 +1815,19 @@ fn append_cookie(response: &mut Response, cookie: String) {
 }
 
 /// Turns a redirect into a response that also drops a success flash cookie.
-fn redirect_with_flash(target: &str, kind: &str, message: &str) -> Response {
+fn redirect_with_flash(state: &AppState, target: &str, kind: &str, message: &str) -> Response {
     let mut response = Redirect::to(target).into_response();
-    append_cookie(&mut response, flash_set_cookie(kind, message));
+    append_cookie(&mut response, flash_set_cookie(state, kind, message));
     response
 }
 
-fn error_response(err: anyhow::Error) -> Response {
+fn error_response(state: &AppState, err: anyhow::Error) -> Response {
     let msg = err.to_string();
-    let status = status_for_error_message(&msg);
+    let status = status_for_error(&err);
     let mut response = (
         status,
         Html(layout(
-            "/minica",
+            &state.config.server.base_path,
             &format!("<h1>Request failed</h1><p>{}</p>", h(&msg)),
             false,
         )),
@@ -1634,6 +1840,14 @@ fn error_response(err: anyhow::Error) -> Response {
         );
     }
     response
+}
+
+fn status_for_error(err: &anyhow::Error) -> StatusCode {
+    if err.downcast_ref::<InternalError>().is_some() {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        status_for_error_message(&err.to_string())
+    }
 }
 
 fn status_for_error_message(msg: &str) -> StatusCode {
@@ -1686,14 +1900,33 @@ fn download_response(name: String, bytes: Vec<u8>) -> Response {
     (
         [
             (header::CONTENT_TYPE, "application/octet-stream".to_string()),
-            (
-                header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"{}\"", h(&name)),
-            ),
+            (header::CONTENT_DISPOSITION, attachment_disposition(&name)),
         ],
         bytes,
     )
         .into_response()
+}
+
+/// `attachment; filename="..."` with the name reduced to `[A-Za-z0-9._-]`
+/// (anything else becomes `_`), so it can never break out of the quoted
+/// header parameter.
+fn attachment_disposition(name: &str) -> String {
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe = if safe.is_empty() {
+        "download".to_string()
+    } else {
+        safe
+    };
+    format!("attachment; filename=\"{safe}\"")
 }
 
 fn ca_download_kind(kind: &str) -> Result<Download> {
@@ -2169,7 +2402,7 @@ fn openapi_spec_json(base: &str) -> String {
             "version": "1.0.0",
             "description": "API for managing certificate authorities, issued certificates, inspection, and backups."
         },
-        "servers": [{ "url": base }],
+        "servers": [{ "url": if base.is_empty() { "/" } else { base } }],
         "components": {
             "securitySchemes": {
                 "basicAuth": { "type": "http", "scheme": "basic" },
@@ -2807,7 +3040,9 @@ mod peer_ip_tests {
             )
             .await
             .expect("route request");
-        let body = to_bytes(response.into_body(), 1024).await.expect("read body");
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("read body");
         assert_eq!(&body[..], b"10.1.2.3");
     }
 }
@@ -2815,6 +3050,38 @@ mod peer_ip_tests {
 #[cfg(test)]
 mod error_mapping_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn panicking_blocking_task_maps_to_500() {
+        let err = blocking(|| -> Result<()> { panic!("boom") })
+            .await
+            .unwrap_err();
+        assert_eq!(status_for_error(&err), StatusCode::INTERNAL_SERVER_ERROR);
+        let response = api_error_response(err);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // ordinary errors keep their message-based status
+        let err = blocking(|| -> Result<()> { bail!("CA not found") })
+            .await
+            .unwrap_err();
+        assert_eq!(status_for_error(&err), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn attachment_filenames_are_sanitised() {
+        assert_eq!(
+            attachment_disposition("ca-01.crt"),
+            "attachment; filename=\"ca-01.crt\""
+        );
+        assert_eq!(
+            attachment_disposition("a\"b\r\nX-Evil: 1;.pem"),
+            "attachment; filename=\"a_b__X-Evil__1_.pem\""
+        );
+        assert_eq!(
+            attachment_disposition("ünï code&.p12"),
+            "attachment; filename=\"_n__code_.p12\""
+        );
+        assert_eq!(attachment_disposition(""), "attachment; filename=\"download\"");
+    }
 
     #[test]
     fn header_auth_errors_map_to_statuses() {

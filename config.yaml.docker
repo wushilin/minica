@@ -6,16 +6,29 @@
 # may contain colons, and percent escapes are decoded on a best-effort basis.
 # Only strict %HH hex escapes are decoded; '+' stays '+'. The defaults
 # reproduce config.yaml.example, so running with no environment variables
-# behaves exactly like the stock config. Resolution happens after the file is
-# read and before YAML parsing, so values may be any YAML value.
+# behaves exactly like the stock config. Tokens are resolved after YAML parsing,
+# inside string values only: a resolved value is always taken literally (it
+# cannot inject YAML structure), and numeric/boolean fields accept it as text.
+# Tokens inside comments are ignored.
 #
 #   podman run -e MINICA_PORT=8443 -e MINICA_ADMIN_PASSWORD='$2b$12$...' ...
 #   minica --start -c config.yaml.docker
+#
+# SECURITY: with no environment overrides the server listens on all interfaces
+# (0.0.0.0) and the bootstrap admin is admin / adminpass, a publicly known
+# password (the server logs a warning when it is in use). That is only
+# acceptable for throwaway test containers. In any other deployment set
+# MINICA_ADMIN_PASSWORD, preferably to a bcrypt hash from
+# `minica --gen-password`, e.g.
+#   podman run -e MINICA_ADMIN_PASSWORD="$(cat admin-password.bcrypt)" ...
+# (or pass it from a secret / env file: --env-file, Kubernetes Secret, ...).
 
 server:
   host: {{ENV:MINICA_HOST:0.0.0.0}}
   port: {{ENV:MINICA_PORT:9988}}
   base_path: {{ENV:MINICA_BASE_PATH:/minica}}
+  # Mark cookies Secure. Only enable when every browser reaches MiniCA over HTTPS.
+  secure_cookies: {{ENV:MINICA_SECURE_COOKIES:false}}
 
 public_base_url: {{ENV:MINICA_PUBLIC_BASE_URL:http://127.0.0.1:9988/minica}}
 
@@ -47,12 +60,14 @@ auth:
     enabled: {{ENV:MINICA_BASIC_AUTH_ENABLE:true}}
     list:
       - username: {{ENV:MINICA_ADMIN_USER:admin}}
+        # Default "adminpass" is for tests only: override MINICA_ADMIN_PASSWORD.
         password: {{ENV:MINICA_ADMIN_PASSWORD:adminpass}}
         role: {{ENV:MINICA_ADMIN_ROLE:admin}}
 
   # Reverse-proxy header auth. Defaults to disabled: enabling it makes MiniCA
   # trust identity headers, so only turn it on behind an authenticating proxy
-  # (and preferably pin the proxy with MINICA_TRUSTED_REMOTE_1..10).
+  # and pin the proxy with MINICA_TRUSTED_REMOTE_1..10. With header auth
+  # enabled, an empty trusted list is rejected at startup.
   headers:
     enabled: {{ENV:MINICA_HEADER_AUTH_ENABLE:false}}
     username: {{ENV:MINICA_HEADER_USERNAME:Remote-User}}
@@ -60,8 +75,12 @@ auth:
     admin_group: {{ENV:MINICA_HEADER_ADMIN_GROUP:admin}}
     viewer_group: {{ENV:MINICA_HEADER_VIEWER_GROUP:user}}
     # Up to 10 trusted peers (IP or CIDR), one env var per slot. '-' means the
-    # slot is not used; when no slot is set, every remote is trusted.
+    # slot is not used. When header auth is enabled and no slot is set (empty
+    # trusted list), the server refuses to start unless
+    # MINICA_HEADER_TRUST_ALL_REMOTES=true (trusts identity headers from ANY
+    # peer; only safe when the port is reachable solely through the proxy).
     #   podman run -e MINICA_TRUSTED_REMOTE_1=10.0.0.7 -e MINICA_TRUSTED_REMOTE_2=172.16.0.0/12 ...
+    trust_all_remotes: {{ENV:MINICA_HEADER_TRUST_ALL_REMOTES:false}}
     trusted_remotes:
       - '{{ENV:MINICA_TRUSTED_REMOTE_1:-}}'
       - '{{ENV:MINICA_TRUSTED_REMOTE_2:-}}'

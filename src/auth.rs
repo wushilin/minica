@@ -56,24 +56,43 @@ fn authenticate_basic(headers: &HeaderMap, state: &AppState) -> Result<User> {
     }
 
     // All other accounts live in the database with bcrypt-hashed passwords.
-    if let Some(record) = state.service.db().find_user(username)? {
-        if bcrypt::verify(password, &record.password_hash).unwrap_or(false) {
-            let role = Role::parse(&record.role).unwrap_or(Role::Viewer);
-            return Ok(User {
-                username: record.username,
-                role,
-            });
+    // Unknown usernames still pay for one bcrypt verification against a dummy
+    // hash, so response timing does not reveal which accounts exist.
+    match state.service.db().find_user(username)? {
+        Some(record) => {
+            if bcrypt::verify(password, &record.password_hash).unwrap_or(false) {
+                let role = Role::parse(&record.role).unwrap_or(Role::Viewer);
+                return Ok(User {
+                    username: record.username,
+                    role,
+                });
+            }
+        }
+        None => {
+            let _ = bcrypt::verify(password, dummy_bcrypt_hash());
         }
     }
 
     bail!("invalid username or password")
 }
 
+/// A bcrypt hash at the default cost, computed once, used to equalise timing
+/// for usernames that do not exist.
+fn dummy_bcrypt_hash() -> &'static str {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| {
+        bcrypt::hash("minica-dummy-password", bcrypt::DEFAULT_COST).unwrap_or_default()
+    })
+}
+
 /// Reverse-proxy header authentication: identity is asserted by request
 /// headers injected by a trusted proxy. No local account is consulted.
 fn authenticate_headers(headers: &HeaderMap, config: &HeaderAuthConfig) -> Result<User> {
     let username = header_value(headers, &config.username);
-    if !config.trusted_networks.is_empty() {
+    // An empty trusted list only means "trust everyone" when the operator
+    // opted in with `trust_all_remotes` (config validation enforces this at
+    // startup; this re-check is defence in depth).
+    if !config.trusted_networks.is_empty() || !config.trust_all_remotes {
         let peer = header_value(headers, PEER_IP_HEADER)
             .and_then(|value| value.parse::<std::net::IpAddr>().ok())
             .map(|ip| ip.to_canonical());
@@ -175,7 +194,38 @@ pub fn verify_config_password(stored: &str, provided: &str) -> bool {
     if looks_like_bcrypt(stored) {
         bcrypt::verify(provided, stored).unwrap_or(false)
     } else {
-        stored == provided
+        ct_eq(stored.as_bytes(), provided.as_bytes())
+    }
+}
+
+/// Constant-time byte comparison: the running time depends only on the
+/// lengths, not on where the inputs first differ.
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let diff = a.iter().zip(b).fold(0_u8, |acc, (x, y)| acc | (x ^ y));
+    std::hint::black_box(diff) == 0
+}
+
+/// Shape accepted for CSRF tokens: 16..=128 chars of `[A-Za-z0-9_-]`. Covers
+/// tokens minted by `csrf_token` (32 alphanumerics) and client-generated ones
+/// such as the CLI's 32 hex chars, while rejecting empty or cookie-breaking
+/// values.
+pub fn is_valid_csrf_token(token: &str) -> bool {
+    (16..=128).contains(&token.len())
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+/// Double-submit check: both tokens present, well-formed, and equal.
+pub fn csrf_tokens_match(cookie_token: Option<&str>, submitted: Option<&str>) -> bool {
+    match (cookie_token, submitted) {
+        (Some(cookie), Some(submitted)) => {
+            is_valid_csrf_token(cookie) && ct_eq(cookie.as_bytes(), submitted.as_bytes())
+        }
+        _ => false,
     }
 }
 
@@ -211,6 +261,30 @@ mod password_tests {
     }
 
     #[test]
+    fn ct_eq_compares_bytes() {
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"abcd"));
+        assert!(ct_eq(b"", b""));
+    }
+
+    #[test]
+    fn csrf_tokens_must_be_present_well_formed_and_equal() {
+        let token = csrf_token();
+        assert!(is_valid_csrf_token(&token));
+        assert!(csrf_tokens_match(Some(&token), Some(&token)));
+        assert!(!csrf_tokens_match(Some(""), Some("")));
+        assert!(!csrf_tokens_match(None, None));
+        assert!(!csrf_tokens_match(Some(&token), None));
+        assert!(!csrf_tokens_match(Some(&token), Some(&csrf_token())));
+        // CLI-style hex tokens are accepted; cookie-breaking ones are not.
+        assert!(is_valid_csrf_token("0123456789abcdef0123456789abcdef"));
+        assert!(!is_valid_csrf_token("short"));
+        assert!(!is_valid_csrf_token("aaaaaaaaaaaaaaaa; Path=/"));
+        assert!(!is_valid_csrf_token("aaaaaaaaaaaaaaaa<script>"));
+    }
+
+    #[test]
     fn bcrypt_credential_verifies_against_hash() {
         let hash = bcrypt::hash("adminpass", 4).unwrap();
         assert!(looks_like_bcrypt(&hash));
@@ -232,6 +306,7 @@ mod group_parsing_tests {
             admin_group: "admin".to_string(),
             viewer_group: "user".to_string(),
             trusted_remotes: Vec::new(),
+            trust_all_remotes: true,
             trusted_networks: Vec::new(),
         }
     }
@@ -297,6 +372,7 @@ mod header_auth_tests {
             admin_group: "admin".to_string(),
             viewer_group: "user".to_string(),
             trusted_remotes: Vec::new(),
+            trust_all_remotes: true,
             trusted_networks: Vec::new(),
         }
     }
@@ -427,6 +503,21 @@ mod header_auth_tests {
     }
 
     #[test]
+    fn empty_trusted_list_without_opt_in_rejects_everyone() {
+        let mut config = cfg();
+        config.trust_all_remotes = false;
+        let headers = request_headers(&[
+            ("Remote-User", "alice"),
+            ("Remote-Groups", "user"),
+            (PEER_IP_HEADER, "10.1.2.3"),
+        ]);
+        let err = authenticate_headers(&headers, &config)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("untrusted remote"), "{err}");
+    }
+
+    #[test]
     fn missing_peer_with_trusted_remotes_is_rejected_as_anonymous_when_no_user() {
         let headers = request_headers(&[("Remote-Groups", "user")]);
         let err = authenticate_headers(&headers, &cfg_trusting(&["10.0.0.0/8"]))
@@ -453,7 +544,7 @@ pub fn check_csrf(method: &Method, headers: &HeaderMap) -> Result<()> {
         .get("x-csrf-token")
         .and_then(|v| v.to_str().ok())
         .map(ToOwned::to_owned);
-    if cookie_token.is_some() && cookie_token == header_token {
+    if csrf_tokens_match(cookie_token.as_deref(), header_token.as_deref()) {
         Ok(())
     } else {
         bail!("CSRF token missing or invalid")

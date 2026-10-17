@@ -11,6 +11,10 @@ use std::{
 
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// How many `.pre-migrate-*.bak` copies of the database to keep. Each holds
+/// every private key, so older ones are pruned after a new one is made.
+const MAX_MIGRATION_BACKUPS: usize = 3;
+
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
@@ -26,6 +30,9 @@ pub struct CaSecrets {
     pub serial_txt: Vec<u8>,
     pub crl_der: Vec<u8>,
     pub crl_updated_at: i64,
+    /// openssl `crlnumber` file contents; empty for CAs created before CRL
+    /// numbering (the openssl layer then starts at 1).
+    pub crlnumber_txt: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -83,6 +90,14 @@ pub struct BackupCertRow {
     pub updated_at: i64,
 }
 
+/// A full logical copy of the database, as exported to / restored from a
+/// backup file.
+#[derive(Clone, Default)]
+pub struct BackupSnapshot {
+    pub users: Vec<UserRecord>,
+    pub cas: Vec<(BackupCaRow, Vec<BackupCertRow>)>,
+}
+
 #[derive(Clone)]
 pub struct CertMeta {
     pub id: String,
@@ -107,11 +122,23 @@ pub struct CertMeta {
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         tracing::info!(db_path = %path.display(), "opening sqlite database");
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty() && !parent.exists())
+        {
+            create_private_dir_all(parent)
                 .with_context(|| format!("failed to create db folder {}", parent.display()))?;
         }
         let db_existed = path.exists();
+        if db_existed {
+            // The database holds every private key; tighten an existing file
+            // left with umask permissions, but don't refuse to start if we
+            // can't (e.g. the file belongs to another user).
+            restrict_permissions(path);
+        } else {
+            create_private_file(path)
+                .with_context(|| format!("failed to create sqlite db {}", path.display()))?;
+        }
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open sqlite db {}", path.display()))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -157,8 +184,11 @@ impl Db {
             schema_version = SCHEMA_VERSION,
             "running database migrations"
         );
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        conn.execute_batch(
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        // One transaction: a migration that fails part-way leaves the schema
+        // exactly as it was (SQLite DDL is transactional).
+        let tx = conn.transaction()?;
+        tx.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS schema_version (
                 version INTEGER NOT NULL
@@ -185,6 +215,7 @@ impl Db {
                 serial_txt BLOB NOT NULL,
                 crl_der BLOB NOT NULL DEFAULT X'',
                 crl_updated_at INTEGER NOT NULL DEFAULT 0,
+                crlnumber_txt BLOB NOT NULL DEFAULT X'',
                 deleted INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
@@ -249,42 +280,30 @@ impl Db {
                 ON certificates(updated_at) WHERE deleted = 1;
             "#,
         )?;
-        // Add the soft-delete columns to databases created before they existed.
-        // Errors (e.g. the column already exists) are intentionally ignored.
-        let _ = conn.execute(
+        // Add columns to databases created before they existed. Only the
+        // "duplicate column" error (column already present) is tolerated.
+        for sql in [
             "ALTER TABLE certificate_authorities ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
             "ALTER TABLE certificates ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
             "ALTER TABLE certificate_authorities ADD COLUMN key_profile TEXT NOT NULL DEFAULT 'rsa:4096'",
-            [],
-        );
-        let _ = conn.execute(
             "ALTER TABLE certificates ADD COLUMN key_profile TEXT NOT NULL DEFAULT 'rsa:4096'",
-            [],
-        );
-        let _ = conn.execute(
             "ALTER TABLE certificate_authorities ADD COLUMN crl_der BLOB NOT NULL DEFAULT X''",
-            [],
-        );
-        let _ = conn.execute(
             "ALTER TABLE certificate_authorities ADD COLUMN crl_updated_at INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute("ALTER TABLE certificates ADD COLUMN revoked_at INTEGER", []);
-        let _ = conn.execute(
+            "ALTER TABLE certificate_authorities ADD COLUMN crlnumber_txt BLOB NOT NULL DEFAULT X''",
+            "ALTER TABLE certificates ADD COLUMN revoked_at INTEGER",
             "ALTER TABLE certificates ADD COLUMN revocation_reason TEXT",
-            [],
-        );
-        conn.execute("DELETE FROM schema_version", [])?;
-        conn.execute(
+        ] {
+            add_column(&tx, sql)?;
+        }
+        if !schema_columns_present(&tx)? {
+            bail!("database schema is still incomplete after migration");
+        }
+        tx.execute("DELETE FROM schema_version", [])?;
+        tx.execute(
             "INSERT INTO schema_version(version) VALUES (?)",
             params![SCHEMA_VERSION],
         )?;
+        tx.commit()?;
         tracing::info!(
             schema_version = SCHEMA_VERSION,
             "database migrations complete"
@@ -300,8 +319,9 @@ impl Db {
             INSERT INTO certificate_authorities (
                 id, common_name, country_code, state, city, organization, organization_unit,
                 subject, issue_time, valid_days, key_profile, digest_algorithm,
-                cert_pem, key_pem, pkcs12, password, index_txt, serial_txt, crl_der, crl_updated_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                cert_pem, key_pem, pkcs12, password, index_txt, serial_txt, crl_der, crl_updated_at,
+                crlnumber_txt, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
             params![
                 meta.id,
@@ -324,6 +344,7 @@ impl Db {
                 secrets.serial_txt,
                 secrets.crl_der,
                 secrets.crl_updated_at,
+                secrets.crlnumber_txt,
                 now,
                 now
             ],
@@ -347,7 +368,7 @@ impl Db {
                    ca.organization_unit, ca.subject, ca.issue_time, ca.valid_days,
                    ca.key_profile, ca.digest_algorithm, ca.cert_pem, ca.key_pem, COUNT(c.id)
             FROM certificate_authorities ca
-            LEFT JOIN certificates c ON c.ca_id = ca.id
+            LEFT JOIN certificates c ON c.ca_id = ca.id AND c.deleted = 0
             WHERE ca.deleted = 0
             GROUP BY ca.id
             ORDER BY ca.created_at DESC
@@ -393,7 +414,7 @@ impl Db {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let now = Utc::now().timestamp_millis();
         let count = conn.execute(
-            "UPDATE certificate_authorities SET key_profile = ?, digest_algorithm = ?, updated_at = ? WHERE id = ?",
+            "UPDATE certificate_authorities SET key_profile = ?, digest_algorithm = ?, updated_at = ? WHERE id = ? AND deleted = 0",
             params![key_profile, digest_algorithm, now, id],
         )?;
         if count == 0 {
@@ -407,7 +428,8 @@ impl Db {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.query_row(
             r#"
-            SELECT cert_pem, key_pem, pkcs12, password, index_txt, serial_txt, crl_der, crl_updated_at
+            SELECT cert_pem, key_pem, pkcs12, password, index_txt, serial_txt, crl_der, crl_updated_at,
+                   crlnumber_txt
             FROM certificate_authorities
             WHERE id = ? AND deleted = 0
             "#,
@@ -422,6 +444,7 @@ impl Db {
                     serial_txt: row.get(5)?,
                     crl_der: row.get(6)?,
                     crl_updated_at: row.get(7)?,
+                    crlnumber_txt: row.get(8)?,
                 })
             },
         )
@@ -443,16 +466,36 @@ impl Db {
         Ok(())
     }
 
+    /// Restores a soft-deleted CA, refusing if an active CA has since taken its
+    /// common name (checked in the same transaction as the update).
     pub fn restore_ca(&self, id: &str) -> Result<()> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
         let now = Utc::now().timestamp_millis();
-        let count = conn.execute(
+        let common_name: String = tx
+            .query_row(
+                "SELECT common_name FROM certificate_authorities WHERE id = ? AND deleted = 1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .with_context(|| format!("deleted CA not found: {id}"))?;
+        let clashes: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM certificate_authorities WHERE deleted = 0 AND lower(trim(common_name)) = lower(trim(?1))",
+            params![common_name],
+            |row| row.get(0),
+        )?;
+        if clashes > 0 {
+            bail!(
+                "cannot restore CA: an active CA already uses the common name {}",
+                common_name.trim()
+            );
+        }
+        let count = tx.execute(
             "UPDATE certificate_authorities SET deleted = 0, updated_at = ? WHERE id = ? AND deleted = 1",
             params![now, id],
         )?;
-        if count == 0 {
-            bail!("deleted CA not found: {id}");
-        }
+        tx.commit()?;
         tracing::info!(ca_id = %id, rows_affected = count, "restored certificate authority");
         Ok(())
     }
@@ -509,17 +552,33 @@ impl Db {
         .flatten()
     }
 
+    /// Inserts a certificate under the CA signing lock. `ca_state` is the new
+    /// (index.txt, serial.txt) pair to persist, or `None` when the operation
+    /// (an import) did not touch the CA's openssl state.
     pub fn insert_cert_with_state(
         &self,
         meta: &CertMeta,
         secrets: &CertSecrets,
-        ca_state: (&[u8], &[u8]),
+        ca_state: Option<(&[u8], &[u8])>,
         lock_owner: &str,
     ) -> Result<()> {
         let now = Utc::now().timestamp_millis();
         let mut conn = self.conn.lock().expect("db mutex poisoned");
         let tx = conn.transaction()?;
         verify_lock_tx(&tx, &meta.ca_id, lock_owner)?;
+        let ca_rows = match ca_state {
+            Some((index_txt, serial_txt)) => tx.execute(
+                "UPDATE certificate_authorities SET index_txt = ?, serial_txt = ?, updated_at = ? WHERE id = ? AND deleted = 0",
+                params![index_txt, serial_txt, now, meta.ca_id],
+            )?,
+            None => tx.execute(
+                "UPDATE certificate_authorities SET updated_at = ? WHERE id = ? AND deleted = 0",
+                params![now, meta.ca_id],
+            )?,
+        };
+        if ca_rows == 0 {
+            bail!("CA not found: {}", meta.ca_id);
+        }
         let cert_rows = tx.execute(
             r#"
             INSERT INTO certificates (
@@ -553,10 +612,6 @@ impl Db {
                 now,
                 now
             ],
-        )?;
-        let ca_rows = tx.execute(
-            "UPDATE certificate_authorities SET index_txt = ?, serial_txt = ?, updated_at = ? WHERE id = ?",
-            params![ca_state.0, ca_state.1, now, meta.ca_id],
         )?;
         let lock_rows = tx.execute(
             "DELETE FROM ca_locks WHERE ca_id = ? AND owner_id = ?",
@@ -623,246 +678,58 @@ impl Db {
         Ok(())
     }
 
-    pub fn list_backup_cas(&self) -> Result<Vec<BackupCaRow>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT id, common_name, country_code, state, city, organization, organization_unit,
-                   subject, issue_time, valid_days, key_profile, digest_algorithm,
-                   cert_pem, key_pem, pkcs12, password, index_txt, serial_txt, crl_der, crl_updated_at,
-                   deleted, created_at, updated_at
-            FROM certificate_authorities
-            ORDER BY created_at ASC, id ASC
-            "#,
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(BackupCaRow {
-                meta: CaMeta {
-                    id: row.get(0)?,
-                    common_name: row.get(1)?,
-                    country_code: row.get(2)?,
-                    state: row.get(3)?,
-                    city: row.get(4)?,
-                    organization: row.get(5)?,
-                    organization_unit: row.get(6)?,
-                    subject: row.get(7)?,
-                    issue_time: row.get(8)?,
-                    valid_days: row.get(9)?,
-                    key_profile: row.get(10)?,
-                    digest_algorithm: row.get(11)?,
-                },
-                secrets: CaSecrets {
-                    cert_pem: row.get(12)?,
-                    key_pem: row.get(13)?,
-                    pkcs12: row.get(14)?,
-                    password: row.get(15)?,
-                    index_txt: row.get(16)?,
-                    serial_txt: row.get(17)?,
-                    crl_der: row.get(18)?,
-                    crl_updated_at: row.get(19)?,
-                },
-                deleted: row.get::<_, i64>(20)? != 0,
-                created_at: row.get(21)?,
-                updated_at: row.get(22)?,
-            })
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+    /// Reads users, CAs and each CA's certificates as one consistent snapshot:
+    /// a single lock acquisition and a single read transaction, so a
+    /// concurrent issue/revoke cannot leave the backup half-updated.
+    pub fn backup_snapshot(&self) -> Result<BackupSnapshot> {
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
+        let users = query_users(&tx)?;
+        let mut cas = Vec::new();
+        for ca in query_backup_cas(&tx)? {
+            let certs = query_backup_certs(&tx, &ca.meta.id)?;
+            cas.push((ca, certs));
+        }
+        tx.commit()?;
+        Ok(BackupSnapshot { users, cas })
     }
 
-    pub fn list_backup_certs(&self, ca_id: &str) -> Result<Vec<BackupCertRow>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT id, ca_id, common_name, country_code, state, city, organization, organization_unit,
-                   subject, issue_time, valid_days, dns_list, ip_list, key_profile, digest_algorithm,
-                   cert_pem, key_pem, csr_pem, pkcs12, password, bundle_zip,
-                   deleted, revoked_at, revocation_reason, created_at, updated_at
-            FROM certificates
-            WHERE ca_id = ?1
-            ORDER BY created_at ASC, id ASC
-            "#,
-        )?;
-        let rows = stmt.query_map(params![ca_id], |row| {
-            let dns: String = row.get(11)?;
-            let ips: String = row.get(12)?;
-            Ok(BackupCertRow {
-                meta: CertMeta {
-                    id: row.get(0)?,
-                    ca_id: row.get(1)?,
-                    common_name: row.get(2)?,
-                    country_code: row.get(3)?,
-                    state: row.get(4)?,
-                    city: row.get(5)?,
-                    organization: row.get(6)?,
-                    organization_unit: row.get(7)?,
-                    subject: row.get(8)?,
-                    issue_time: row.get(9)?,
-                    valid_days: row.get(10)?,
-                    dns_list: split_list(&dns),
-                    ip_list: split_list(&ips),
-                    key_profile: row.get(13)?,
-                    digest_algorithm: row.get(14)?,
-                    revoked_at: row.get(22)?,
-                    revocation_reason: row.get(23)?,
-                },
-                secrets: CertSecrets {
-                    cert_pem: row.get(15)?,
-                    key_pem: row.get(16)?,
-                    csr_pem: row.get(17)?,
-                    pkcs12: row.get(18)?,
-                    password: row.get(19)?,
-                    bundle_zip: row.get(20)?,
-                },
-                deleted: row.get::<_, i64>(21)? != 0,
-                revoked_at: row.get(22)?,
-                revocation_reason: row.get(23)?,
-                created_at: row.get(24)?,
-                updated_at: row.get(25)?,
-            })
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
-    }
-
-    pub fn insert_ca_restore_full(
-        &self,
-        meta: &CaMeta,
-        secrets: &CaSecrets,
-        deleted: bool,
-        created_at: i64,
-        updated_at: i64,
-    ) -> Result<()> {
-        let now = Utc::now().timestamp_millis();
-        let created_at = if created_at == 0 { now } else { created_at };
-        let updated_at = if updated_at == 0 {
-            created_at
-        } else {
-            updated_at
-        };
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let rows = conn.execute(
-            r#"
-            INSERT INTO certificate_authorities (
-                id, common_name, country_code, state, city, organization, organization_unit,
-                subject, issue_time, valid_days, key_profile, digest_algorithm,
-                cert_pem, key_pem, pkcs12, password, index_txt, serial_txt, crl_der, crl_updated_at,
-                deleted, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-            params![
-                meta.id,
-                meta.common_name,
-                meta.country_code,
-                meta.state,
-                meta.city,
-                meta.organization,
-                meta.organization_unit,
-                meta.subject,
-                meta.issue_time,
-                meta.valid_days,
-                meta.key_profile,
-                meta.digest_algorithm,
-                secrets.cert_pem,
-                secrets.key_pem,
-                secrets.pkcs12,
-                secrets.password,
-                secrets.index_txt,
-                secrets.serial_txt,
-                secrets.crl_der,
-                secrets.crl_updated_at,
-                if deleted { 1 } else { 0 },
-                created_at,
-                updated_at
-            ],
-        )?;
-        tracing::info!(ca_id = %meta.id, deleted, rows_affected = rows, "restored certificate authority from backup");
-        Ok(())
-    }
-
-    pub fn insert_cert_restore_full(
-        &self,
-        meta: &CertMeta,
-        secrets: &CertSecrets,
-        deleted: bool,
-        created_at: i64,
-        updated_at: i64,
-    ) -> Result<()> {
-        let now = Utc::now().timestamp_millis();
-        let created_at = if created_at == 0 { now } else { created_at };
-        let updated_at = if updated_at == 0 {
-            created_at
-        } else {
-            updated_at
-        };
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let rows = conn.execute(
-            r#"
-            INSERT INTO certificates (
-                id, ca_id, common_name, country_code, state, city, organization, organization_unit,
-                subject, issue_time, valid_days, dns_list, ip_list, key_profile, digest_algorithm,
-                cert_pem, key_pem, csr_pem, pkcs12, password, bundle_zip,
-                deleted, revoked_at, revocation_reason, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-            params![
-                meta.id,
-                meta.ca_id,
-                meta.common_name,
-                meta.country_code,
-                meta.state,
-                meta.city,
-                meta.organization,
-                meta.organization_unit,
-                meta.subject,
-                meta.issue_time,
-                meta.valid_days,
-                meta.dns_list.join(";"),
-                meta.ip_list.join(";"),
-                meta.key_profile,
-                meta.digest_algorithm,
-                secrets.cert_pem,
-                secrets.key_pem,
-                secrets.csr_pem,
-                secrets.pkcs12,
-                secrets.password,
-                secrets.bundle_zip,
-                if deleted { 1 } else { 0 },
-                meta.revoked_at,
-                meta.revocation_reason,
-                created_at,
-                updated_at
-            ],
-        )?;
+    /// Restores a whole backup atomically: the emptiness check and every insert
+    /// run in one transaction under one lock acquisition, so a failure part-way
+    /// leaves the database empty rather than half-restored.
+    pub fn restore_backup(&self, snapshot: &BackupSnapshot) -> Result<()> {
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
+        if !is_empty_conn(&tx)? {
+            bail!("backup restore requires an empty database");
+        }
+        for user in &snapshot.users {
+            insert_user_row(&tx, user)?;
+        }
+        for (ca, certs) in &snapshot.cas {
+            insert_ca_row(&tx, ca)?;
+            for cert in certs {
+                if cert.meta.ca_id != ca.meta.id {
+                    bail!(
+                        "backup certificate {} does not belong to CA {}",
+                        cert.meta.id,
+                        ca.meta.id
+                    );
+                }
+                insert_cert_row(&tx, cert)?;
+            }
+        }
+        tx.commit()?;
         tracing::info!(
-            ca_id = %meta.ca_id,
-            cert_id = %meta.id,
-            deleted,
-            rows_affected = rows,
-            "restored certificate from backup"
+            user_count = snapshot.users.len(),
+            ca_count = snapshot.cas.len(),
+            cert_count = snapshot
+                .cas
+                .iter()
+                .map(|(_, certs)| certs.len())
+                .sum::<usize>(),
+            "restored backup in one transaction"
         );
-        Ok(())
-    }
-
-    pub fn insert_user_restore(
-        &self,
-        id: &str,
-        username: &str,
-        password_hash: &str,
-        role: &str,
-        created_at: i64,
-    ) -> Result<()> {
-        let created_at = if created_at == 0 {
-            Utc::now().timestamp_millis()
-        } else {
-            created_at
-        };
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let rows = conn.execute(
-            "INSERT INTO users(id, username, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)",
-            params![id, username, password_hash, role, created_at],
-        )?;
-        tracing::info!(user_id = %id, username = %username, role = %role, rows_affected = rows, "restored user from backup");
         Ok(())
     }
 
@@ -887,17 +754,7 @@ impl Db {
 
     pub fn is_empty(&self) -> Result<bool> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        let count: i64 = conn.query_row(
-            r#"
-            SELECT
-                (SELECT COUNT(*) FROM certificate_authorities) +
-                (SELECT COUNT(*) FROM certificates) +
-                (SELECT COUNT(*) FROM users)
-            "#,
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(count == 0)
+        is_empty_conn(&conn)
     }
 
     /// True when a non-deleted CA already uses this common name. CA common
@@ -963,17 +820,25 @@ impl Db {
         let tx = conn.transaction()?;
         verify_lock_tx(&tx, ca_id, lock_owner)?;
         let cert_rows = tx.execute(
+            // Never touches revocation: a revoked certificate stays revoked
+            // and is not renewable (its key may be compromised).
             r#"
             UPDATE certificates
-            SET cert_pem = ?, pkcs12 = ?, bundle_zip = ?, issue_time = ?, valid_days = ?, revoked_at = NULL, revocation_reason = NULL, updated_at = ?
-            WHERE id = ? AND ca_id = ?
+            SET cert_pem = ?, pkcs12 = ?, bundle_zip = ?, issue_time = ?, valid_days = ?, updated_at = ?
+            WHERE id = ? AND ca_id = ? AND deleted = 0 AND revoked_at IS NULL
             "#,
             params![cert_pem, pkcs12, bundle_zip, issue_time, valid_days, now, cert_id, ca_id],
         )?;
+        if cert_rows == 0 {
+            bail!("certificate not found or revoked: {ca_id}/{cert_id}");
+        }
         let ca_rows = tx.execute(
-            "UPDATE certificate_authorities SET index_txt = ?, serial_txt = ?, updated_at = ? WHERE id = ?",
+            "UPDATE certificate_authorities SET index_txt = ?, serial_txt = ?, updated_at = ? WHERE id = ? AND deleted = 0",
             params![ca_state.0, ca_state.1, now, ca_id],
         )?;
+        if ca_rows == 0 {
+            bail!("CA not found: {ca_id}");
+        }
         let lock_rows = tx.execute(
             "DELETE FROM ca_locks WHERE ca_id = ? AND owner_id = ?",
             params![ca_id, lock_owner],
@@ -998,9 +863,10 @@ impl Db {
         reason: &str,
         revoked_at: i64,
         ca_state: (&[u8], &[u8]),
-        crl_der: &[u8],
+        crl: (&[u8], &[u8]),
         lock_owner: &str,
     ) -> Result<()> {
+        let (crl_der, crlnumber_txt) = crl;
         let now = Utc::now().timestamp_millis();
         let mut conn = self.conn.lock().expect("db mutex poisoned");
         let tx = conn.transaction()?;
@@ -1017,9 +883,12 @@ impl Db {
             bail!("certificate not found: {ca_id}/{cert_id}");
         }
         let ca_rows = tx.execute(
-            "UPDATE certificate_authorities SET index_txt = ?, serial_txt = ?, crl_der = ?, crl_updated_at = ?, updated_at = ? WHERE id = ? AND deleted = 0",
-            params![ca_state.0, ca_state.1, crl_der, now, now, ca_id],
+            "UPDATE certificate_authorities SET index_txt = ?, serial_txt = ?, crl_der = ?, crlnumber_txt = ?, crl_updated_at = ?, updated_at = ? WHERE id = ? AND deleted = 0",
+            params![ca_state.0, ca_state.1, crl_der, crlnumber_txt, now, now, ca_id],
         )?;
+        if ca_rows == 0 {
+            bail!("CA not found: {ca_id}");
+        }
         let lock_rows = tx.execute(
             "DELETE FROM ca_locks WHERE ca_id = ? AND owner_id = ?",
             params![ca_id, lock_owner],
@@ -1035,20 +904,6 @@ impl Db {
             crl_bytes = crl_der.len(),
             "revoked certificate and refreshed CRL"
         );
-        Ok(())
-    }
-
-    pub fn update_ca_crl(&self, ca_id: &str, crl_der: &[u8], index_txt: &[u8]) -> Result<()> {
-        let now = Utc::now().timestamp_millis();
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let rows = conn.execute(
-            "UPDATE certificate_authorities SET crl_der = ?, crl_updated_at = ?, index_txt = ?, updated_at = ? WHERE id = ? AND deleted = 0",
-            params![crl_der, now, index_txt, now, ca_id],
-        )?;
-        if rows == 0 {
-            bail!("CA not found: {ca_id}");
-        }
-        tracing::info!(ca_id = %ca_id, rows_affected = rows, crl_bytes = crl_der.len(), "updated certificate authority CRL");
         Ok(())
     }
 
@@ -1138,16 +993,47 @@ impl Db {
         Ok(())
     }
 
+    /// Restores a soft-deleted certificate. Refused while its CA is deleted, or
+    /// when an active certificate under the same CA has since taken its common
+    /// name; both checks run in the same transaction as the update.
     pub fn restore_cert(&self, ca_id: &str, cert_id: &str) -> Result<()> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
         let now = Utc::now().timestamp_millis();
-        let count = conn.execute(
+        let common_name: String = tx
+            .query_row(
+                "SELECT common_name FROM certificates WHERE ca_id = ? AND id = ? AND deleted = 1",
+                params![ca_id, cert_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .with_context(|| format!("deleted certificate not found: {ca_id}/{cert_id}"))?;
+        let ca_deleted: Option<i64> = tx
+            .query_row(
+                "SELECT deleted FROM certificate_authorities WHERE id = ?",
+                params![ca_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if ca_deleted != Some(0) {
+            bail!("cannot restore certificate: its CA is deleted; restore the CA first");
+        }
+        let clashes: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM certificates WHERE deleted = 0 AND ca_id = ?1 AND lower(trim(common_name)) = lower(trim(?2))",
+            params![ca_id, common_name],
+            |row| row.get(0),
+        )?;
+        if clashes > 0 {
+            bail!(
+                "cannot restore certificate: an active certificate in this CA already uses the common name {}",
+                common_name.trim()
+            );
+        }
+        let count = tx.execute(
             "UPDATE certificates SET deleted = 0, updated_at = ? WHERE ca_id = ? AND id = ? AND deleted = 1",
             params![now, ca_id, cert_id],
         )?;
-        if count == 0 {
-            bail!("deleted certificate not found: {ca_id}/{cert_id}");
-        }
+        tx.commit()?;
         tracing::info!(ca_id = %ca_id, cert_id = %cert_id, rows_affected = count, "restored certificate");
         Ok(())
     }
@@ -1232,12 +1118,7 @@ impl Db {
 
     pub fn list_users(&self) -> Result<Vec<UserRecord>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT id, username, password_hash, role, created_at FROM users ORDER BY username",
-        )?;
-        let rows = stmt.query_map([], row_to_user)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        query_users(&conn)
     }
 
     pub fn find_user(&self, username: &str) -> Result<Option<UserRecord>> {
@@ -1272,6 +1153,267 @@ fn row_to_user(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserRecord> {
     })
 }
 
+fn query_users(conn: &Connection) -> Result<Vec<UserRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, username, password_hash, role, created_at FROM users ORDER BY username",
+    )?;
+    let rows = stmt.query_map([], row_to_user)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+fn query_backup_cas(conn: &Connection) -> Result<Vec<BackupCaRow>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, common_name, country_code, state, city, organization, organization_unit,
+               subject, issue_time, valid_days, key_profile, digest_algorithm,
+               cert_pem, key_pem, pkcs12, password, index_txt, serial_txt, crl_der, crl_updated_at,
+               deleted, created_at, updated_at, crlnumber_txt
+        FROM certificate_authorities
+        ORDER BY created_at ASC, id ASC
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(BackupCaRow {
+            meta: CaMeta {
+                id: row.get(0)?,
+                common_name: row.get(1)?,
+                country_code: row.get(2)?,
+                state: row.get(3)?,
+                city: row.get(4)?,
+                organization: row.get(5)?,
+                organization_unit: row.get(6)?,
+                subject: row.get(7)?,
+                issue_time: row.get(8)?,
+                valid_days: row.get(9)?,
+                key_profile: row.get(10)?,
+                digest_algorithm: row.get(11)?,
+            },
+            secrets: CaSecrets {
+                cert_pem: row.get(12)?,
+                key_pem: row.get(13)?,
+                pkcs12: row.get(14)?,
+                password: row.get(15)?,
+                index_txt: row.get(16)?,
+                serial_txt: row.get(17)?,
+                crl_der: row.get(18)?,
+                crl_updated_at: row.get(19)?,
+                crlnumber_txt: row.get(23)?,
+            },
+            deleted: row.get::<_, i64>(20)? != 0,
+            created_at: row.get(21)?,
+            updated_at: row.get(22)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+fn query_backup_certs(conn: &Connection, ca_id: &str) -> Result<Vec<BackupCertRow>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, ca_id, common_name, country_code, state, city, organization, organization_unit,
+               subject, issue_time, valid_days, dns_list, ip_list, key_profile, digest_algorithm,
+               cert_pem, key_pem, csr_pem, pkcs12, password, bundle_zip,
+               deleted, revoked_at, revocation_reason, created_at, updated_at
+        FROM certificates
+        WHERE ca_id = ?1
+        ORDER BY created_at ASC, id ASC
+        "#,
+    )?;
+    let rows = stmt.query_map(params![ca_id], |row| {
+        let dns: String = row.get(11)?;
+        let ips: String = row.get(12)?;
+        Ok(BackupCertRow {
+            meta: CertMeta {
+                id: row.get(0)?,
+                ca_id: row.get(1)?,
+                common_name: row.get(2)?,
+                country_code: row.get(3)?,
+                state: row.get(4)?,
+                city: row.get(5)?,
+                organization: row.get(6)?,
+                organization_unit: row.get(7)?,
+                subject: row.get(8)?,
+                issue_time: row.get(9)?,
+                valid_days: row.get(10)?,
+                dns_list: split_list(&dns),
+                ip_list: split_list(&ips),
+                key_profile: row.get(13)?,
+                digest_algorithm: row.get(14)?,
+                revoked_at: row.get(22)?,
+                revocation_reason: row.get(23)?,
+            },
+            secrets: CertSecrets {
+                cert_pem: row.get(15)?,
+                key_pem: row.get(16)?,
+                csr_pem: row.get(17)?,
+                pkcs12: row.get(18)?,
+                password: row.get(19)?,
+                bundle_zip: row.get(20)?,
+            },
+            deleted: row.get::<_, i64>(21)? != 0,
+            revoked_at: row.get(22)?,
+            revocation_reason: row.get(23)?,
+            created_at: row.get(24)?,
+            updated_at: row.get(25)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+fn is_empty_conn(conn: &Connection) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        r#"
+        SELECT
+            (SELECT COUNT(*) FROM certificate_authorities) +
+            (SELECT COUNT(*) FROM certificates) +
+            (SELECT COUNT(*) FROM users)
+        "#,
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count == 0)
+}
+
+/// Zero timestamps (older backups) become "now" / created_at respectively.
+fn restore_timestamps(created_at: i64, updated_at: i64) -> (i64, i64) {
+    let created_at = if created_at == 0 {
+        Utc::now().timestamp_millis()
+    } else {
+        created_at
+    };
+    let updated_at = if updated_at == 0 {
+        created_at
+    } else {
+        updated_at
+    };
+    (created_at, updated_at)
+}
+
+fn insert_user_row(conn: &Connection, user: &UserRecord) -> Result<()> {
+    let (created_at, _) = restore_timestamps(user.created_at, 0);
+    conn.execute(
+        "INSERT INTO users(id, username, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)",
+        params![
+            user.id,
+            user.username,
+            user.password_hash,
+            user.role,
+            created_at
+        ],
+    )
+    .with_context(|| format!("failed to restore user {}", user.username))?;
+    tracing::info!(user_id = %user.id, username = %user.username, role = %user.role, "restored user from backup");
+    Ok(())
+}
+
+fn insert_ca_row(conn: &Connection, ca: &BackupCaRow) -> Result<()> {
+    let (created_at, updated_at) = restore_timestamps(ca.created_at, ca.updated_at);
+    let (meta, secrets) = (&ca.meta, &ca.secrets);
+    conn.execute(
+        r#"
+        INSERT INTO certificate_authorities (
+            id, common_name, country_code, state, city, organization, organization_unit,
+            subject, issue_time, valid_days, key_profile, digest_algorithm,
+            cert_pem, key_pem, pkcs12, password, index_txt, serial_txt, crl_der, crl_updated_at,
+            crlnumber_txt, deleted, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+        params![
+            meta.id,
+            meta.common_name,
+            meta.country_code,
+            meta.state,
+            meta.city,
+            meta.organization,
+            meta.organization_unit,
+            meta.subject,
+            meta.issue_time,
+            meta.valid_days,
+            meta.key_profile,
+            meta.digest_algorithm,
+            secrets.cert_pem,
+            secrets.key_pem,
+            secrets.pkcs12,
+            secrets.password,
+            secrets.index_txt,
+            secrets.serial_txt,
+            secrets.crl_der,
+            secrets.crl_updated_at,
+            secrets.crlnumber_txt,
+            if ca.deleted { 1 } else { 0 },
+            created_at,
+            updated_at
+        ],
+    )
+    .with_context(|| format!("failed to restore CA {}", meta.id))?;
+    tracing::info!(ca_id = %meta.id, deleted = ca.deleted, "restored certificate authority from backup");
+    Ok(())
+}
+
+fn insert_cert_row(conn: &Connection, cert: &BackupCertRow) -> Result<()> {
+    let (created_at, updated_at) = restore_timestamps(cert.created_at, cert.updated_at);
+    let (meta, secrets) = (&cert.meta, &cert.secrets);
+    conn.execute(
+        r#"
+        INSERT INTO certificates (
+            id, ca_id, common_name, country_code, state, city, organization, organization_unit,
+            subject, issue_time, valid_days, dns_list, ip_list, key_profile, digest_algorithm,
+            cert_pem, key_pem, csr_pem, pkcs12, password, bundle_zip,
+            deleted, revoked_at, revocation_reason, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+        params![
+            meta.id,
+            meta.ca_id,
+            meta.common_name,
+            meta.country_code,
+            meta.state,
+            meta.city,
+            meta.organization,
+            meta.organization_unit,
+            meta.subject,
+            meta.issue_time,
+            meta.valid_days,
+            meta.dns_list.join(";"),
+            meta.ip_list.join(";"),
+            meta.key_profile,
+            meta.digest_algorithm,
+            secrets.cert_pem,
+            secrets.key_pem,
+            secrets.csr_pem,
+            secrets.pkcs12,
+            secrets.password,
+            secrets.bundle_zip,
+            if cert.deleted { 1 } else { 0 },
+            cert.revoked_at,
+            cert.revocation_reason,
+            created_at,
+            updated_at
+        ],
+    )
+    .with_context(|| format!("failed to restore certificate {}", meta.id))?;
+    tracing::info!(
+        ca_id = %meta.ca_id,
+        cert_id = %meta.id,
+        deleted = cert.deleted,
+        "restored certificate from backup"
+    );
+    Ok(())
+}
+
+/// Runs an `ALTER TABLE ... ADD COLUMN`, tolerating only the error SQLite
+/// raises when the column already exists. Anything else aborts the migration.
+fn add_column(conn: &Connection, sql: &str) -> Result<()> {
+    match conn.execute(sql, []) {
+        Ok(_) => Ok(()),
+        Err(err) if err.to_string().contains("duplicate column name") => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("migration step failed: {sql}")),
+    }
+}
+
 fn schema_is_current(conn: &Connection) -> Result<bool> {
     let version = schema_version(conn)?;
     if let Some(version) = version {
@@ -1279,7 +1421,14 @@ fn schema_is_current(conn: &Connection) -> Result<bool> {
             bail!("database schema version {version} is newer than supported {SCHEMA_VERSION}");
         }
     }
+    if !schema_columns_present(conn)? {
+        return Ok(false);
+    }
+    Ok(version == Some(SCHEMA_VERSION))
+}
 
+/// True when every required table has every required column.
+fn schema_columns_present(conn: &Connection) -> Result<bool> {
     let required = [
         (
             "certificate_authorities",
@@ -1304,6 +1453,7 @@ fn schema_is_current(conn: &Connection) -> Result<bool> {
                 "serial_txt",
                 "crl_der",
                 "crl_updated_at",
+                "crlnumber_txt",
                 "deleted",
                 "created_at",
                 "updated_at",
@@ -1362,8 +1512,7 @@ fn schema_is_current(conn: &Connection) -> Result<bool> {
             return Ok(false);
         }
     }
-
-    Ok(version == Some(SCHEMA_VERSION))
+    Ok(true)
 }
 
 fn schema_version(conn: &Connection) -> Result<Option<u32>> {
@@ -1407,12 +1556,100 @@ fn copy_db_backup(path: &Path) -> Result<PathBuf> {
     let backup = parent.join(format!("{name}.pre-migrate-{stamp}-{suffix}.bak"));
     fs::copy(path, &backup)
         .with_context(|| format!("failed to create migration backup {}", backup.display()))?;
+    // fs::copy carries over the source mode; the copy holds the same private
+    // keys, so make sure it is owner-only regardless.
+    restrict_permissions(&backup);
     tracing::info!(
         db_path = %path.display(),
         backup_path = %backup.display(),
         "created pre-migration sqlite backup"
     );
+    prune_migration_backups(parent, name, &backup);
     Ok(backup)
+}
+
+/// Deletes all but the newest `MAX_MIGRATION_BACKUPS` pre-migration copies.
+/// The timestamp in the file name sorts chronologically. `keep` (the backup
+/// just made) is never removed.
+fn prune_migration_backups(parent: &Path, name: &str, keep: &Path) {
+    let prefix = format!("{name}.pre-migrate-");
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    let mut backups = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|file| file.starts_with(&prefix) && file.ends_with(".bak"))
+        })
+        .collect::<Vec<_>>();
+    backups.sort();
+    let excess = backups.len().saturating_sub(MAX_MIGRATION_BACKUPS);
+    for old in backups.into_iter().take(excess) {
+        if old == keep {
+            continue;
+        }
+        match fs::remove_file(&old) {
+            Ok(_) => {
+                tracing::info!(backup_path = %old.display(), "pruned old pre-migration sqlite backup")
+            }
+            Err(err) => tracing::warn!(
+                backup_path = %old.display(),
+                error = %err,
+                "failed to prune old pre-migration sqlite backup"
+            ),
+        }
+    }
+}
+
+/// Creates a missing database folder (and parents) owner-only.
+fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
+/// Creates an empty (valid) SQLite file with owner-only permissions before
+/// SQLite opens it, so it is never created with umask permissions.
+fn create_private_file(path: &Path) -> std::io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path).map(|_| ())
+}
+
+/// Best-effort chmod 0600; logs instead of failing (e.g. not our file).
+fn restrict_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(metadata) = fs::metadata(path) else {
+            return;
+        };
+        if metadata.permissions().mode() & 0o077 == 0 {
+            return;
+        }
+        if let Err(err) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "could not restrict database file permissions to 0600"
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 fn verify_lock_tx(tx: &rusqlite::Transaction<'_>, ca_id: &str, owner_id: &str) -> Result<()> {
@@ -1507,6 +1744,7 @@ mod tests {
                 serial_txt: Vec::new(),
                 crl_der: Vec::new(),
                 crl_updated_at: 0,
+                crlnumber_txt: Vec::new(),
             },
         )
     }
@@ -1620,5 +1858,231 @@ mod tests {
         db.delete_cert("ca1", "cert1").unwrap();
 
         assert_eq!(db.find_cert_id_by_cn("ca1", "web").unwrap(), None);
+    }
+
+    #[test]
+    fn restore_cert_refuses_duplicate_active_cn_and_deleted_ca() {
+        let db = temp_db();
+        insert_ca(&db, "ca1", "CA One");
+        insert_cert(&db, "old", "ca1", "web");
+        db.delete_cert("ca1", "old").unwrap();
+        insert_cert(&db, "new", "ca1", " WEB ");
+        let err = db.restore_cert("ca1", "old").unwrap_err().to_string();
+        assert!(err.contains("already uses the common name"), "{err}");
+
+        db.delete_cert("ca1", "new").unwrap();
+        db.delete_ca("ca1").unwrap();
+        let err = db.restore_cert("ca1", "old").unwrap_err().to_string();
+        assert!(err.contains("CA is deleted"), "{err}");
+
+        db.restore_ca("ca1").unwrap();
+        db.restore_cert("ca1", "old").unwrap();
+        assert_eq!(
+            db.find_cert_id_by_cn("ca1", "web").unwrap().as_deref(),
+            Some("old")
+        );
+    }
+
+    #[test]
+    fn restore_ca_refuses_duplicate_active_cn() {
+        let db = temp_db();
+        insert_ca(&db, "ca1", "Root CA");
+        db.delete_ca("ca1").unwrap();
+        insert_ca(&db, "ca2", "root ca");
+        let err = db.restore_ca("ca1").unwrap_err().to_string();
+        assert!(err.contains("already uses the common name"), "{err}");
+        assert!(db.get_ca("ca1").is_err(), "CA must stay deleted");
+    }
+
+    #[test]
+    fn list_cas_cert_count_ignores_deleted_certs() {
+        let db = temp_db();
+        insert_ca(&db, "ca1", "CA One");
+        insert_cert(&db, "c1", "ca1", "a");
+        insert_cert(&db, "c2", "ca1", "b");
+        db.delete_cert("ca1", "c2").unwrap();
+        assert_eq!(db.get_ca("ca1").unwrap().cert_count, 1);
+    }
+
+    #[test]
+    fn locked_writes_refuse_revoked_certs_and_deleted_cas() {
+        let db = temp_db();
+        insert_ca(&db, "ca1", "CA One");
+        let (meta, secrets) = sample_cert("c1", "ca1", "web");
+        db.acquire_ca_lock("ca1", "owner", 60_000).unwrap();
+        db.insert_cert_with_state(&meta, &secrets, None, "owner")
+            .unwrap();
+
+        db.acquire_ca_lock("ca1", "owner", 60_000).unwrap();
+        db.revoke_cert_with_state(
+            "ca1",
+            "c1",
+            "keyCompromise",
+            1,
+            (b"", b"01"),
+            (b"", b"02"),
+            "owner",
+        )
+        .unwrap();
+        db.acquire_ca_lock("ca1", "owner", 60_000).unwrap();
+        let err = db
+            .update_cert_with_state(
+                "ca1",
+                "c1",
+                b"pem",
+                b"p12",
+                b"zip",
+                2,
+                30,
+                (b"", b"02"),
+                "owner",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("revoked"), "{err}");
+        db.release_ca_lock("ca1", "owner").unwrap();
+        let cert = db.get_cert("ca1", "c1").unwrap();
+        assert_eq!(
+            cert.revoked_at,
+            Some(1),
+            "renewal must not clear revocation"
+        );
+
+        db.delete_ca("ca1").unwrap();
+        db.acquire_ca_lock("ca1", "owner", 60_000).unwrap();
+        let (meta, secrets) = sample_cert("c2", "ca1", "other");
+        assert!(
+            db.insert_cert_with_state(&meta, &secrets, None, "owner")
+                .is_err()
+        );
+        assert!(db.update_ca_metadata("ca1", "rsa:2048", "sha256").is_err());
+    }
+
+    #[test]
+    fn restore_backup_is_all_or_nothing() {
+        let db = temp_db();
+        let (ca_meta, ca_secrets) = sample_ca("ca1", "CA One");
+        let ca_row = BackupCaRow {
+            meta: ca_meta,
+            secrets: ca_secrets,
+            deleted: false,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let (cert_meta, cert_secrets) = sample_cert("c1", "ca1", "web");
+        let cert_row = BackupCertRow {
+            meta: cert_meta,
+            secrets: cert_secrets,
+            deleted: false,
+            revoked_at: None,
+            revocation_reason: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let user = UserRecord {
+            id: "u1".to_string(),
+            username: "alice".to_string(),
+            password_hash: "$2b$x".to_string(),
+            role: "viewer".to_string(),
+            created_at: 0,
+        };
+        // The duplicated certificate id fails on the last insert; everything
+        // before it must be rolled back.
+        let broken = BackupSnapshot {
+            users: vec![user.clone()],
+            cas: vec![(ca_row.clone(), vec![cert_row.clone(), cert_row.clone()])],
+        };
+        assert!(db.restore_backup(&broken).is_err());
+        assert!(
+            db.is_empty().unwrap(),
+            "failed restore must leave the db empty"
+        );
+
+        let good = BackupSnapshot {
+            users: vec![user],
+            cas: vec![(ca_row, vec![cert_row])],
+        };
+        db.restore_backup(&good).unwrap();
+        let snapshot = db.backup_snapshot().unwrap();
+        assert_eq!(snapshot.users.len(), 1);
+        assert_eq!(snapshot.cas.len(), 1);
+        assert_eq!(snapshot.cas[0].1.len(), 1);
+        let err = db.restore_backup(&good).unwrap_err().to_string();
+        assert!(err.contains("empty database"), "{err}");
+    }
+
+    #[test]
+    fn add_column_only_tolerates_duplicate_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (a INTEGER)").unwrap();
+        add_column(&conn, "ALTER TABLE t ADD COLUMN b INTEGER").unwrap();
+        add_column(&conn, "ALTER TABLE t ADD COLUMN b INTEGER").unwrap();
+        assert!(add_column(&conn, "ALTER TABLE missing ADD COLUMN b INTEGER").is_err());
+    }
+
+    #[test]
+    fn migration_adds_crlnumber_column_to_older_schema() {
+        let suffix: String = rand::rng()
+            .sample_iter(Alphanumeric)
+            .take(12)
+            .map(char::from)
+            .collect();
+        let dir = std::env::temp_dir().join(format!("minica-db-test-{suffix}"));
+        let path = dir.join("old.sqlite");
+        drop(Db::open(&path).unwrap());
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("ALTER TABLE certificate_authorities DROP COLUMN crlnumber_txt")
+                .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        insert_ca(&db, "ca1", "CA One");
+        assert!(db.get_ca_secrets("ca1").unwrap().crlnumber_txt.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn db_files_are_private_and_old_migration_backups_pruned() {
+        use std::os::unix::fs::PermissionsExt;
+        let suffix: String = rand::rng()
+            .sample_iter(Alphanumeric)
+            .take(12)
+            .map(char::from)
+            .collect();
+        let dir = std::env::temp_dir().join(format!("minica-db-test-{suffix}"));
+        let path = dir.join("db.sqlite");
+        drop(Db::open(&path).unwrap());
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&path), 0o600);
+
+        for stamp in [
+            "20200101T000000Z",
+            "20210101T000000Z",
+            "20220101T000000Z",
+            "20230101T000000Z",
+        ] {
+            fs::write(
+                dir.join(format!("db.sqlite.pre-migrate-{stamp}-x.bak")),
+                b"",
+            )
+            .unwrap();
+        }
+        let newest = dir.join("db.sqlite.pre-migrate-20230101T000000Z-x.bak");
+        prune_migration_backups(&dir, "db.sqlite", &newest);
+        let mut left = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains(".pre-migrate-"))
+            .collect::<Vec<_>>();
+        left.sort();
+        assert_eq!(left.len(), MAX_MIGRATION_BACKUPS);
+        assert!(
+            left[0].contains("2021"),
+            "oldest backup must be pruned: {left:?}"
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 }

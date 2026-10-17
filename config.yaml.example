@@ -50,6 +50,12 @@ openssl:
 # `minica --gen-password`) or plaintext. Plaintext still works but logs a
 # warning at startup. (`users:` may be the bare account list, as below, or an
 # object with `enabled:` and `list:` keys.)
+#
+# SECURITY: "adminpass" is a publicly known placeholder (the server logs a
+# warning when it is in use). Replace it before any non-test deployment, e.g.
+# with the output of `minica --gen-password`, or write
+#   password: {{ENV:MINICA_ADMIN_PASSWORD}}
+# and supply MINICA_ADMIN_PASSWORD from the environment / a secret store.
 auth:
   users:
     - username: admin
@@ -60,7 +66,7 @@ auth:
   # oauth2-proxy, ...) in front of MiniCA to identify users via request
   # headers. No local account is needed; users are managed entirely by the
   # proxy/IdP and there is no login prompt. Only enable this when MiniCA is
-  # reachable exclusively through that proxy, or pin the proxy's address with
+  # reachable exclusively through that proxy, and pin the proxy's address with
   # trusted_remotes. When both modes are enabled, requests with this identity
   # header use header auth; requests without it may still use Basic auth.
   #headers:
@@ -71,7 +77,8 @@ auth:
   #  admin_group: admin           # group that grants the admin role
   #  viewer_group: user           # group that grants the viewer role
   #  # Honor identity headers only from these peers (IPs or CIDRs) — typically
-  #  # the upstream reverse proxy. Omit or leave empty to trust every remote.
+  #  # the upstream reverse proxy. With header auth enabled, an empty or
+  #  # missing trusted_remotes list is rejected at startup.
   #  trusted_remotes:
   #    - 127.0.0.1
   #    - 10.0.0.0/8

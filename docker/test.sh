@@ -5,6 +5,9 @@
 # Builds the MiniCA image, runs it with a disposable persistent /data volume,
 # creates a CA through the API, then verifies the Go CLI can issue and download
 # a certificate through Basic auth.
+#
+# The CLI output (including private keys) goes to docker/.test-out/<run-id> and
+# is removed on exit; set MINICA_TEST_KEEP_OUT=1 to keep it for inspection.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,11 +20,18 @@ CONTAINER_NAME="$RUN_ID"
 VOLUME_NAME="$RUN_ID-data"
 OUT_DIR="$ROOT/docker/.test-out/$RUN_ID"
 COOKIE_JAR="$OUT_DIR/cookies.txt"
+KEEP_OUT="${MINICA_TEST_KEEP_OUT:-}"
 
 cleanup() {
     set +e
     podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1
     podman volume rm "$VOLUME_NAME" >/dev/null 2>&1
+    if [ -n "$KEEP_OUT" ]; then
+        echo "   kept test output: $OUT_DIR" >&2
+    else
+        rm -rf "$OUT_DIR"
+        rmdir "$ROOT/docker/.test-out" >/dev/null 2>&1
+    fi
 }
 trap cleanup EXIT
 
@@ -42,6 +52,30 @@ pick_port() {
     done
     echo "error: no free test port found" >&2
     exit 1
+}
+
+file_mode() {
+    # GNU stat first, then BSD/macOS stat.
+    stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
+# check_bundle <dir> <prefix>: all five files exist and are non-empty, and the
+# secret files (key, PKCS#12 bundle, its password) are owner-only (600).
+check_bundle() {
+    local dir="$1" prefix="$2" file mode
+    for file in "$prefix.pem" "$prefix.key" "$prefix.p12" "$prefix.p12.password" CA.pem; do
+        if [ ! -s "$dir/$file" ]; then
+            echo "error: expected CLI output missing or empty: $dir/$file" >&2
+            exit 1
+        fi
+    done
+    for file in "$prefix.key" "$prefix.p12" "$prefix.p12.password"; do
+        mode="$(file_mode "$dir/$file")"
+        if [ "$mode" != "600" ]; then
+            echo "error: $dir/$file has mode $mode, expected 600" >&2
+            exit 1
+        fi
+    done
 }
 
 json_value() {
@@ -144,12 +178,7 @@ cert_cn="docker-test-$RUN_ID.example.test"
     --name docker-test \
     --out-dir "$cert_out"
 
-for file in docker-test.pem docker-test.key docker-test.p12 docker-test.p12.password CA.pem; do
-    if [ ! -s "$cert_out/$file" ]; then
-        echo "error: expected CLI output missing or empty: $cert_out/$file" >&2
-        exit 1
-    fi
-done
+check_bundle "$cert_out" docker-test
 
 echo ">> Reusing/renewing certificate through CLI"
 reuse_out="$OUT_DIR/certs-reuse"
@@ -168,12 +197,7 @@ reuse_out="$OUT_DIR/certs-reuse"
     --name docker-test-reuse \
     --out-dir "$reuse_out"
 
-for file in docker-test-reuse.pem docker-test-reuse.key docker-test-reuse.p12 docker-test-reuse.p12.password CA.pem; do
-    if [ ! -s "$reuse_out/$file" ]; then
-        echo "error: expected CLI reuse output missing or empty: $reuse_out/$file" >&2
-        exit 1
-    fi
-done
+check_bundle "$reuse_out" docker-test-reuse
 
 echo ">> Verifying persisted /data volume contents"
 for dir in runtime sqlite logs; do
@@ -189,4 +213,6 @@ fi
 
 echo ">> Container smoke test passed"
 echo "   image: $IMAGE_TAG"
-echo "   output: $cert_out"
+if [ -n "$KEEP_OUT" ]; then
+    echo "   output: $cert_out"
+fi
