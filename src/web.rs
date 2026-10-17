@@ -1,5 +1,6 @@
 use crate::{
     AppState, auth,
+    i18n::{Lang, t, tf, tf_html, tr},
     models::{
         CreateCaRequest, CreateCertRequest, CreateUserRequest, ImportCaRequest, ImportCertRequest,
         InspectRequest,
@@ -63,6 +64,10 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .fallback(api_method_not_allowed),
         )
         .route(
+            "/cas/{ca_id}/renew/{days}",
+            post(api_renew_ca).fallback(api_method_not_allowed),
+        )
+        .route(
             "/cas/{ca_id}/certs",
             get(api_list_certs)
                 .put(api_create_cert)
@@ -113,6 +118,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/cas/import", get(import_ca_form).post(import_ca_form_post))
         .route("/cas/{ca_id}", get(ca_detail))
         .route("/cas/{ca_id}/delete", post(delete_ca_form))
+        .route("/cas/{ca_id}/renew", post(renew_ca_form))
         .route("/cas/{ca_id}/certs", post(create_cert_form))
         .route("/cas/{ca_id}/certs/new", get(new_cert_form))
         .route(
@@ -130,9 +136,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(revoke_cert_form),
         )
         .route("/crl/{ca_id}", get(crl_download))
+        .route("/{ca_id}/download", get(public_ca_cert_download))
         .route("/inspect", get(inspect_form).post(inspect_form_post))
         .route("/admin", get(admin_console))
         .route("/swagger", get(swagger_page))
+        .route("/lang/{code}", get(switch_lang))
         .route("/admin/backup", get(admin_backup_export))
         .route(
             "/admin/backup/restore",
@@ -160,30 +168,57 @@ pub async fn home(State(state): State<Arc<AppState>>) -> Redirect {
 }
 
 async fn ca_list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let lang = request_lang(&headers);
     page_response(state, headers, move |state, user, _csrf| {
         let cas = state.service.list_cas()?;
-        let mut body = breadcrumb(&[("Home".to_string(), None)]);
+        let mut body = breadcrumb(lang, &[(t(lang, "crumb.home"), None)]);
         let write_actions = if user.role.can_write() {
             format!(
-                r#"<a class="btn btn-primary" href="{}">New CA</a><a class="btn btn-outline-secondary" href="{}">Import CA</a>"#,
+                r#"<a class="btn btn-primary" href="{}">{}</a><a class="btn btn-outline-secondary" href="{}">{}</a>"#,
                 u(state, "/cas/new"),
-                u(state, "/cas/import")
+                t(lang, "ca.list.new"),
+                u(state, "/cas/import"),
+                t(lang, "ca.import.submit")
             )
         } else {
             String::new()
         };
+        let role = if user.role.can_write() {
+            tr(lang, "role.admin", &[])
+        } else {
+            tr(lang, "role.viewer", &[])
+        };
         body.push_str(&format!(
-            r#"<div class="toolbar"><div><h1>Certificate Authorities</h1><p class="muted">Signed in as {} ({:?})</p></div><div class="actions">{}</div></div>"#,
-            h(&user.username), user.role, write_actions
+            r#"<div class="toolbar"><div><h1>{}</h1><p class="muted">{}</p></div><div class="actions">{}</div></div>"#,
+            t(lang, "ca.list.title"),
+            tf(lang, "ca.list.signed_in_as", &[("user", &user.username), ("role", &role)]),
+            write_actions
         ));
         if cas.is_empty() {
             if user.role.can_write() {
-                body.push_str(&format!(r#"<section class="empty"><h2>No certificate authorities yet</h2><p>Create a new development CA or import an existing PEM certificate/key pair.</p><a class="btn btn-primary" href="{}">Create the first CA</a></section>"#, u(state, "/cas/new")));
+                body.push_str(&format!(
+                    r#"<section class="empty"><h2>{}</h2><p>{}</p><a class="btn btn-primary" href="{}">{}</a></section>"#,
+                    t(lang, "ca.list.empty_title"),
+                    t(lang, "ca.list.empty_admin"),
+                    u(state, "/cas/new"),
+                    t(lang, "ca.list.create_first")
+                ));
             } else {
-                body.push_str(r#"<section class="empty"><h2>No certificate authorities yet</h2><p>No certificate authorities are available to view. Ask an administrator to create or import one.</p></section>"#);
+                body.push_str(&format!(
+                    r#"<section class="empty"><h2>{}</h2><p>{}</p></section>"#,
+                    t(lang, "ca.list.empty_title"),
+                    t(lang, "ca.list.empty_viewer")
+                ));
             }
         } else {
-            body.push_str(r#"<table class="table table-hover align-middle"><thead><tr><th>Common Name</th><th>Subject</th><th>Valid Until</th><th>Algorithm</th><th>Certs</th></tr></thead><tbody>"#);
+            body.push_str(&format!(
+                r#"<table class="table table-hover align-middle"><thead><tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th></tr></thead><tbody>"#,
+                t(lang, "field.common_name"),
+                t(lang, "field.subject"),
+                t(lang, "field.valid_until"),
+                t(lang, "field.algorithm"),
+                t(lang, "ca.list.certs")
+            ));
             for ca in cas {
                 body.push_str(&format!(
                     r#"<tr><td><a class="row-link" href="{}"><strong>{}</strong></a><div class="tiny">{}</div></td><td class="subject">{}</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
@@ -192,7 +227,7 @@ async fn ca_list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
                     h(&ca.id),
                     h(&ca.subject),
                     date(ca.issue_time + ca.valid_days * 86_400_000),
-                    ca_key_label(&ca.key_profile, &ca.digest_algorithm),
+                    ca_key_label(lang, &ca.key_profile, &ca.digest_algorithm),
                     ca.cert_count
                 ));
             }
@@ -205,25 +240,34 @@ async fn ca_list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
 
 fn ca_form_page(
     state: &Arc<AppState>,
+    lang: Lang,
     csrf: &str,
     error: Option<&str>,
     values: &SubjectValues,
 ) -> String {
     format!(
-        r#"{}<h1>New Certificate Authority</h1>{}<form method="post" action="{}" class="form-grid">{}</form>"#,
-        breadcrumb(&[
-            ("Home".to_string(), Some(u(state, "/cas"))),
-            ("New Certificate Authority".to_string(), None),
+        r#"{}<h1>{}</h1>{}<form method="post" action="{}" class="form-grid">{}</form>"#,
+        breadcrumb(lang, &[
+            (t(lang, "crumb.home"), Some(u(state, "/cas"))),
+            (t(lang, "ca.new.title"), None),
         ]),
-        error.map(error_banner).unwrap_or_default(),
+        t(lang, "ca.new.title"),
+        error.map(|e| error_banner(lang, e)).unwrap_or_default(),
         u(state, "/cas"),
-        ca_form_fields(csrf, "Create CA", "", values)
+        ca_form_fields(lang, csrf, &t(lang, "ca.new.submit"), "", values)
     )
 }
 
 async fn new_ca_form(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let lang = request_lang(&headers);
     admin_page_response(state, headers, move |state, csrf| {
-        Ok(ca_form_page(state, &csrf, None, &SubjectValues::default()))
+        Ok(ca_form_page(
+            state,
+            lang,
+            &csrf,
+            None,
+            &SubjectValues::default(),
+        ))
     })
     .await
 }
@@ -233,6 +277,7 @@ async fn create_ca_form(
     headers: HeaderMap,
     Form(form): Form<CaForm>,
 ) -> Response {
+    let lang = request_lang(&headers);
     // Outer error: auth/CSRF failure; inner: service failure (re-render form).
     let request = form.clone().into_request();
     let created = match admin_blocking(&state, &headers, Some(form._csrf.clone()), move |state| {
@@ -241,20 +286,20 @@ async fn create_ca_form(
     .await
     {
         Ok(created) => created,
-        Err(err) => return error_response(&state, err),
+        Err(err) => return error_response(&state, &headers, err),
     };
     match created {
         Ok(ca) => redirect_with_flash(
             &state,
             &u(&state, "/cas"),
             "success",
-            &format!("Created certificate authority \"{}\"", ca.common_name),
+            &tr(lang, "flash.ca_created", &[("name", &ca.common_name)]),
         ),
         Err(err) => {
             let message = err.to_string();
             let values = SubjectValues::from(&form);
             page_response(state, headers, move |state, _user, csrf| {
-                Ok(ca_form_page(state, &csrf, Some(&message), &values))
+                Ok(ca_form_page(state, lang, &csrf, Some(&message), &values))
             })
             .await
         }
@@ -263,24 +308,28 @@ async fn create_ca_form(
 
 fn import_ca_page(
     state: &Arc<AppState>,
+    lang: Lang,
     csrf: &str,
     values: &ImportValues,
     error: Option<&str>,
 ) -> String {
     format!(
         "{}{}",
-        breadcrumb(&[
-            ("Home".to_string(), Some(u(state, "/cas"))),
-            ("Import Certificate Authority".to_string(), None),
+        breadcrumb(lang, &[
+            (t(lang, "crumb.home"), Some(u(state, "/cas"))),
+            (t(lang, "ca.import.title"), None),
         ]),
         import_form(
-            "Import Certificate Authority",
-            "Paste an existing CA certificate and matching private key.",
+            lang,
+            ImportLabels {
+                title: t(lang, "ca.import.title"),
+                help: t(lang, "ca.import.help"),
+                cert_label: t(lang, "ca.import.cert_label"),
+                key_label: t(lang, "ca.import.key_label"),
+                submit: t(lang, "ca.import.submit"),
+            },
             u(state, "/cas/import"),
             csrf,
-            "CA Certificate PEM",
-            "CA Private Key PEM",
-            "Import CA",
             values,
             error,
         )
@@ -288,8 +337,15 @@ fn import_ca_page(
 }
 
 async fn import_ca_form(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let lang = request_lang(&headers);
     admin_page_response(state, headers, move |state, csrf| {
-        Ok(import_ca_page(state, &csrf, &ImportValues::empty(), None))
+        Ok(import_ca_page(
+            state,
+            lang,
+            &csrf,
+            &ImportValues::empty(),
+            None,
+        ))
     })
     .await
 }
@@ -299,6 +355,7 @@ async fn import_ca_form_post(
     headers: HeaderMap,
     Form(form): Form<ImportCaForm>,
 ) -> Response {
+    let lang = request_lang(&headers);
     let request = ImportCaRequest {
         cert_pem: form.cert_pem.clone(),
         key_pem: form.key_pem.clone(),
@@ -310,14 +367,14 @@ async fn import_ca_form_post(
     .await
     {
         Ok(result) => result,
-        Err(err) => return error_response(&state, err),
+        Err(err) => return error_response(&state, &headers, err),
     };
     match result {
         Ok(ca) => redirect_with_flash(
             &state,
             &u(&state, "/cas"),
             "success",
-            &format!("Imported certificate authority \"{}\"", ca.common_name),
+            &tr(lang, "flash.ca_imported", &[("name", &ca.common_name)]),
         ),
         Err(err) => {
             let message = err.to_string();
@@ -327,7 +384,7 @@ async fn import_ca_form_post(
                 password: form.password,
             };
             page_response(state, headers, move |state, _user, csrf| {
-                Ok(import_ca_page(state, &csrf, &values, Some(&message)))
+                Ok(import_ca_page(state, lang, &csrf, &values, Some(&message)))
             })
             .await
         }
@@ -339,12 +396,13 @@ async fn ca_detail(
     headers: HeaderMap,
     Path(ca_id): Path<String>,
 ) -> Response {
+    let lang = request_lang(&headers);
     page_response(state, headers, move |state, user, csrf| {
         let ca = state.service.get_ca(&ca_id)?;
         let certs = state.service.list_certs(&ca_id)?;
-        let mut body = breadcrumb(&[
-            ("Home".to_string(), Some(u(state, "/cas"))),
-            (format!("Certificate Authority ({})", ca.common_name), None),
+        let mut body = breadcrumb(lang, &[
+            (t(lang, "crumb.home"), Some(u(state, "/cas"))),
+            (tf(lang, "crumb.ca", &[("name", &ca.common_name)]), None),
         ]);
         body.push_str(&format!(
             r#"<div class="toolbar"><div><h1>{}</h1><p class="subject">{}</p></div><div class="actions">{}</div></div>"#,
@@ -352,12 +410,15 @@ async fn ca_detail(
             h(&ca.subject),
             if user.role.can_write() {
                 format!(
-                    r#"<a class="btn btn-primary" href="{}">New Certificate</a><a class="btn btn-outline-secondary" href="{}">Import Certificate</a><form class="inline" method="post" action="{}"><input type="hidden" name="_csrf" value="{}"><button type="submit" class="btn btn-outline-danger" data-confirm="Delete certificate authority &quot;{}&quot; and all its certificates?">Delete CA</button></form>"#,
+                    r#"<a class="btn btn-primary" href="{}">{}</a><a class="btn btn-outline-secondary" href="{}">{}</a><form class="inline" method="post" action="{}"><input type="hidden" name="_csrf" value="{}"><button type="submit" class="btn btn-outline-danger" data-confirm="{}">{}</button></form>"#,
                     u(state, &format!("/cas/{}/certs/new", ca.id)),
+                    t(lang, "cert.new.title"),
                     u(state, &format!("/cas/{}/certs/import", ca.id)),
+                    t(lang, "cert.import.title"),
                     u(state, &format!("/cas/{}/delete", ca.id)),
                     h(&csrf),
-                    h(&ca.common_name)
+                    tf(lang, "ca.detail.delete_confirm", &[("name", &ca.common_name)]),
+                    t(lang, "ca.detail.delete")
                 )
             } else {
                 String::new()
@@ -367,30 +428,86 @@ async fn ca_detail(
             .service
             .cert_purposes(&ca.cert_pem)
             .unwrap_or_default();
+        let public_url = state
+            .service
+            .public_ca_cert_url(&ca.id)
+            .unwrap_or_else(|| u(state, &format!("/{}/download", ca.id)));
+        let public_download_url = state
+            .service
+            .public_ca_cert_download_url(&ca.id)
+            .unwrap_or_else(|| u(state, &format!("/download/ca/{}/cert", ca.id)));
+        let renew = if !user.role.can_write() {
+            String::new()
+        } else if state.service.ca_is_self_signed(&ca.cert_pem).unwrap_or(false) {
+            format!(
+                r#"<dt>{}</dt><dd><form method="post" action="{}" class="renew-sentence"><input type="hidden" name="_csrf" value="{}"><button type="submit" class="btn btn-sm btn-warning" data-renew="{}">{}</button><span>{}</span><input class="form-control form-control-sm" type="number" min="1" max="7350" name="days" value="3650" aria-label="{}"><span>{}</span></form></dd>"#,
+                t(lang, "field.renewal"),
+                u(state, &format!("/cas/{}/renew", ca.id)),
+                h(&csrf),
+                t(lang, "ca.detail.renew_what"),
+                t(lang, "action.renew"),
+                t(lang, "ca.detail.renew_for"),
+                t(lang, "renew.days_aria"),
+                t(lang, "renew.days")
+            )
+        } else {
+            format!(
+                r#"<dt>{}</dt><dd><span class="muted">{}</span></dd>"#,
+                t(lang, "field.renewal"),
+                t(lang, "ca.detail.intermediate_note")
+            )
+        };
         body.push_str(&format!(
-            r##"<div class="tabs" role="tablist"><button type="button" class="tab-btn active" data-tab="ca-overview">Overview</button><button type="button" class="tab-btn" data-tab="ca-certs">Certificates</button></div><section id="ca-overview" class="tab-panel panel"><h2>CA Metadata</h2><dl class="meta"><dt>Common Name</dt><dd>{}</dd><dt>Purpose</dt><dd>{}</dd><dt>Valid Until</dt><dd>{}</dd><dt>Key</dt><dd>{}</dd><dt>Issued Certs</dt><dd>{}</dd>{}</dl><div class="download-grid">{}</div>{}{}</section><section id="ca-certs" class="tab-panel panel" hidden><div class="section-head"><h2>Issued Certificates</h2><span class="muted">{} total</span></div>"##,
+            r##"<div class="tabs" role="tablist"><button type="button" class="tab-btn active" data-tab="ca-overview">{}</button><button type="button" class="tab-btn" data-tab="ca-certs">{}</button></div><section id="ca-overview" class="tab-panel panel"><h2>{}</h2><dl class="meta"><dt>{}</dt><dd>{}</dd><dt>{}</dt><dd>{}</dd><dt>{}</dt><dd>{}</dd><dt>{}</dt><dd>{}</dd><dt>{}</dt><dd>{}</dd>{}<dt>{}</dt><dd>{}<br>{}</dd>{}</dl><div class="download-grid">{}</div>{}{}</section><section id="ca-certs" class="tab-panel panel" hidden><div class="section-head"><h2>{}</h2><span class="muted">{}</span></div>"##,
+            t(lang, "ca.detail.tab_overview"),
+            t(lang, "ca.detail.tab_certs"),
+            t(lang, "ca.detail.metadata"),
+            t(lang, "field.common_name"),
             h(&ca.common_name),
-            purpose_badges(&purposes),
+            t(lang, "field.purpose"),
+            purpose_badges(lang, &purposes),
+            t(lang, "field.valid_until"),
             date(ca.issue_time + ca.valid_days * 86_400_000),
-            ca_key_label(&ca.key_profile, &ca.digest_algorithm),
+            t(lang, "field.key"),
+            ca_key_label(lang, &ca.key_profile, &ca.digest_algorithm),
+            t(lang, "ca.detail.issued_certs"),
             ca.cert_count,
             ca.crl_url
                 .as_ref()
-                .map(|url| format!(r#"<dt>CRL</dt><dd><a href="{}">{}</a></dd>"#, h(url), h(url)))
+                .map(|url| format!(
+                    r#"<dt>{}</dt><dd>{}</dd>"#,
+                    t(lang, "field.crl"),
+                    copyable_link(lang, url)
+                ))
                 .unwrap_or_default(),
-            ca_artifact_cards(state, &ca.id),
-            pem_panel("CA Certificate", &ca.cert_pem, false),
-            pem_panel("CA Private Key", &ca.key_pem, true),
-            certs.len()
+            t(lang, "ca.detail.public_url"),
+            copyable_link(lang, &public_url),
+            copyable_link(lang, &public_download_url),
+            renew,
+            ca_artifact_cards(state, lang, &ca.id),
+            pem_panel(lang, &t(lang, "artifact.ca_cert"), &ca.cert_pem, false),
+            pem_panel(lang, &t(lang, "ca.detail.pem_key"), &ca.key_pem, true),
+            t(lang, "ca.detail.issued_title"),
+            tf(lang, "ca.detail.total", &[("count", &certs.len().to_string())])
         ));
         if certs.is_empty() {
-            if user.role.can_write() {
-                body.push_str(r#"<section class="empty"><h3>No certificates issued</h3><p>Create a certificate from this CA when you are ready.</p></section>"#);
+            let help = if user.role.can_write() {
+                t(lang, "ca.detail.no_certs_admin")
             } else {
-                body.push_str(r#"<section class="empty"><h3>No certificates issued</h3><p>No certificates are available under this CA yet.</p></section>"#);
-            }
+                t(lang, "ca.detail.no_certs_viewer")
+            };
+            body.push_str(&format!(
+                r#"<section class="empty"><h3>{}</h3><p>{}</p></section>"#,
+                t(lang, "ca.detail.no_certs"),
+                help
+            ));
         } else {
-            body.push_str(r#"<div class="table-responsive"><table class="table table-hover paged-table" data-page-size="10"><thead><tr><th>Common Name</th><th>Valid Until</th><th>SANs</th><th></th></tr></thead><tbody>"#);
+            body.push_str(&format!(
+                r#"<div class="table-responsive"><table class="table table-hover paged-table" data-page-size="10"><thead><tr><th>{}</th><th>{}</th><th>{}</th><th></th></tr></thead><tbody>"#,
+                t(lang, "field.common_name"),
+                t(lang, "field.valid_until"),
+                t(lang, "field.sans")
+            ));
             for cert in certs {
                 body.push_str(&format!(
                     r#"<tr><td><a class="row-link" href="{}"><strong>{}</strong></a><div class="tiny">{}</div></td><td>{}</td><td>{}</td><td class="text-end">{}</td></tr>"#,
@@ -400,7 +517,13 @@ async fn ca_detail(
                     date(cert.issue_time + cert.valid_days * 86_400_000),
                     h(&cert.dns_list.join(", ")),
                     if user.role.can_write() {
-                        format!(r#"<form class="inline" method="post" action="{}"><input type="hidden" name="_csrf" value="{}"><button type="submit" class="btn btn-sm btn-outline-danger" data-confirm="Delete certificate &quot;{}&quot;? This does not revoke it.">Delete</button></form>"#, u(state, &format!("/cas/{}/certs/{}/delete", ca.id, cert.id)), h(&csrf), h(&cert.common_name))
+                        format!(
+                            r#"<form class="inline" method="post" action="{}"><input type="hidden" name="_csrf" value="{}"><button type="submit" class="btn btn-sm btn-outline-danger" data-confirm="{}">{}</button></form>"#,
+                            u(state, &format!("/cas/{}/certs/{}/delete", ca.id, cert.id)),
+                            h(&csrf),
+                            tf(lang, "ca.detail.delete_cert_confirm", &[("name", &cert.common_name)]),
+                            t(lang, "action.delete")
+                        )
                     } else { String::new() }
                 ));
             }
@@ -418,6 +541,7 @@ async fn delete_ca_form(
     Path(ca_id): Path<String>,
     Form(form): Form<CsrfForm>,
 ) -> Response {
+    let lang = request_lang(&headers);
     mutate_form_response(state, headers, form._csrf.clone(), move |state| {
         let name = state
             .service
@@ -427,7 +551,28 @@ async fn delete_ca_form(
         state.service.delete_ca(&ca_id)?;
         Ok((
             Redirect::to(&u(state, "/cas")),
-            format!("Deleted certificate authority \"{name}\""),
+            tr(lang, "flash.ca_deleted", &[("name", &name)]),
+        ))
+    })
+    .await
+}
+
+async fn renew_ca_form(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(ca_id): Path<String>,
+    Form(form): Form<RenewForm>,
+) -> Response {
+    let lang = request_lang(&headers);
+    mutate_form_response(state, headers, form._csrf.clone(), move |state| {
+        let ca = state.service.renew_ca(&ca_id, form.days)?;
+        Ok((
+            Redirect::to(&u(state, &format!("/cas/{ca_id}"))),
+            tr(
+                lang,
+                "flash.ca_renewed",
+                &[("name", &ca.common_name), ("days", &form.days.to_string())],
+            ),
         ))
     })
     .await
@@ -435,6 +580,7 @@ async fn delete_ca_form(
 
 fn cert_form_page(
     state: &Arc<AppState>,
+    lang: Lang,
     ca_id: &str,
     ca_name: &str,
     csrf: &str,
@@ -442,18 +588,19 @@ fn cert_form_page(
     values: &SubjectValues,
 ) -> String {
     format!(
-        r#"{}<h1>New Certificate</h1>{}<form method="post" action="{}" class="form-grid">{}</form>"#,
-        breadcrumb(&[
-            ("Home".to_string(), Some(u(state, "/cas"))),
+        r#"{}<h1>{}</h1>{}<form method="post" action="{}" class="form-grid">{}</form>"#,
+        breadcrumb(lang, &[
+            (t(lang, "crumb.home"), Some(u(state, "/cas"))),
             (
-                format!("Certificate Authority ({ca_name})"),
+                tf(lang, "crumb.ca", &[("name", ca_name)]),
                 Some(u(state, &format!("/cas/{ca_id}"))),
             ),
-            ("New Certificate".to_string(), None),
+            (t(lang, "cert.new.title"), None),
         ]),
-        error.map(error_banner).unwrap_or_default(),
+        t(lang, "cert.new.title"),
+        error.map(|e| error_banner(lang, e)).unwrap_or_default(),
         u(state, &format!("/cas/{ca_id}/certs")),
-        cert_form_fields(csrf, values)
+        cert_form_fields(lang, csrf, values)
     )
 }
 
@@ -462,10 +609,12 @@ async fn new_cert_form(
     headers: HeaderMap,
     Path(ca_id): Path<String>,
 ) -> Response {
+    let lang = request_lang(&headers);
     admin_page_response(state, headers, move |state, csrf| {
         let ca = state.service.get_ca(&ca_id)?;
         Ok(cert_form_page(
             state,
+            lang,
             &ca_id,
             &ca.common_name,
             &csrf,
@@ -482,6 +631,7 @@ async fn create_cert_form(
     Path(ca_id): Path<String>,
     Form(form): Form<CertForm>,
 ) -> Response {
+    let lang = request_lang(&headers);
     let request = form.clone().into_request();
     let task_ca_id = ca_id.clone();
     let created = match admin_blocking(&state, &headers, Some(form._csrf.clone()), move |state| {
@@ -490,14 +640,14 @@ async fn create_cert_form(
     .await
     {
         Ok(created) => created,
-        Err(err) => return error_response(&state, err),
+        Err(err) => return error_response(&state, &headers, err),
     };
     match created {
         Ok(cert) => redirect_with_flash(
             &state,
             &u(&state, &format!("/cas/{ca_id}#ca-certs")),
             "success",
-            &format!("Created certificate \"{}\"", cert.common_name),
+            &tr(lang, "flash.cert_created", &[("name", &cert.common_name)]),
         ),
         Err(err) => {
             let message = err.to_string();
@@ -506,6 +656,7 @@ async fn create_cert_form(
                 let ca_name = state.service.ca_display_name(&ca_id);
                 Ok(cert_form_page(
                     state,
+                    lang,
                     &ca_id,
                     &ca_name,
                     &csrf,
@@ -520,6 +671,7 @@ async fn create_cert_form(
 
 fn import_cert_page(
     state: &Arc<AppState>,
+    lang: Lang,
     ca_id: &str,
     ca_name: &str,
     csrf: &str,
@@ -528,22 +680,25 @@ fn import_cert_page(
 ) -> String {
     format!(
         "{}{}",
-        breadcrumb(&[
-            ("Home".to_string(), Some(u(state, "/cas"))),
+        breadcrumb(lang, &[
+            (t(lang, "crumb.home"), Some(u(state, "/cas"))),
             (
-                format!("Certificate Authority ({ca_name})"),
+                tf(lang, "crumb.ca", &[("name", ca_name)]),
                 Some(u(state, &format!("/cas/{ca_id}"))),
             ),
-            ("Import Certificate".to_string(), None),
+            (t(lang, "cert.import.title"), None),
         ]),
         import_form(
-            "Import Certificate",
-            "Paste a certificate issued by this CA and its matching private key.",
+            lang,
+            ImportLabels {
+                title: t(lang, "cert.import.title"),
+                help: t(lang, "cert.import.help"),
+                cert_label: t(lang, "cert.import.cert_label"),
+                key_label: t(lang, "cert.import.key_label"),
+                submit: t(lang, "cert.import.title"),
+            },
             u(state, &format!("/cas/{ca_id}/certs/import")),
             csrf,
-            "Certificate PEM",
-            "Private Key PEM",
-            "Import Certificate",
             values,
             error,
         )
@@ -555,10 +710,12 @@ async fn import_cert_form(
     headers: HeaderMap,
     Path(ca_id): Path<String>,
 ) -> Response {
+    let lang = request_lang(&headers);
     admin_page_response(state, headers, move |state, csrf| {
         let ca = state.service.get_ca(&ca_id)?;
         Ok(import_cert_page(
             state,
+            lang,
             &ca_id,
             &ca.common_name,
             &csrf,
@@ -575,6 +732,7 @@ async fn import_cert_form_post(
     Path(ca_id): Path<String>,
     Form(form): Form<ImportCertForm>,
 ) -> Response {
+    let lang = request_lang(&headers);
     let request = ImportCertRequest {
         cert_pem: form.cert_pem.clone(),
         key_pem: form.key_pem.clone(),
@@ -587,14 +745,14 @@ async fn import_cert_form_post(
     .await
     {
         Ok(result) => result,
-        Err(err) => return error_response(&state, err),
+        Err(err) => return error_response(&state, &headers, err),
     };
     match result {
         Ok(cert) => redirect_with_flash(
             &state,
             &u(&state, &format!("/cas/{ca_id}#ca-certs")),
             "success",
-            &format!("Imported certificate \"{}\"", cert.common_name),
+            &tr(lang, "flash.cert_imported", &[("name", &cert.common_name)]),
         ),
         Err(err) => {
             let message = err.to_string();
@@ -607,6 +765,7 @@ async fn import_cert_form_post(
                 let ca_name = state.service.ca_display_name(&ca_id);
                 Ok(import_cert_page(
                     state,
+                    lang,
                     &ca_id,
                     &ca_name,
                     &csrf,
@@ -624,6 +783,7 @@ async fn cert_detail(
     headers: HeaderMap,
     Path((ca_id, cert_id)): Path<(String, String)>,
 ) -> Response {
+    let lang = request_lang(&headers);
     page_response(state, headers, move |state, user, csrf| {
         let cert = state.service.get_cert(&ca_id, &cert_id)?;
         let ca = state.service.get_ca(&ca_id)?;
@@ -631,19 +791,25 @@ async fn cert_detail(
             .service
             .cert_purposes(&cert.cert_pem)
             .unwrap_or_default();
-        let crumbs = breadcrumb(&[
-            ("Home".to_string(), Some(u(state, "/cas"))),
+        let crumbs = breadcrumb(lang, &[
+            (t(lang, "crumb.home"), Some(u(state, "/cas"))),
             (
-                format!("Certificate Authority ({})", ca.common_name),
+                tf(lang, "crumb.ca", &[("name", &ca.common_name)]),
                 Some(u(state, &format!("/cas/{ca_id}"))),
             ),
-            (format!("Certificate ({})", cert.common_name), None),
+            (tf(lang, "crumb.cert", &[("name", &cert.common_name)]), None),
         ]);
         let renew = if user.role.can_write() {
             format!(
-                r#"<dt>Renewal</dt><dd><form method="post" action="{}" class="renew-sentence"><input type="hidden" name="_csrf" value="{}"><button type="submit" class="btn btn-sm btn-warning" data-renew>Renew</button><span>the cert for</span><input class="form-control form-control-sm" type="number" min="1" max="7350" name="days" value="365" aria-label="Renew days"><span>days</span></form></dd>"#,
+                r#"<dt>{}</dt><dd><form method="post" action="{}" class="renew-sentence"><input type="hidden" name="_csrf" value="{}"><button type="submit" class="btn btn-sm btn-warning" data-renew="{}">{}</button><span>{}</span><input class="form-control form-control-sm" type="number" min="1" max="7350" name="days" value="365" aria-label="{}"><span>{}</span></form></dd>"#,
+                t(lang, "field.renewal"),
                 u(state, &format!("/cas/{ca_id}/certs/{cert_id}/renew")),
-                h(&csrf)
+                h(&csrf),
+                t(lang, "cert.detail.renew_what"),
+                t(lang, "action.renew"),
+                t(lang, "cert.detail.renew_for"),
+                t(lang, "renew.days_aria"),
+                t(lang, "renew.days")
             )
         } else {
             String::new()
@@ -651,49 +817,65 @@ async fn cert_detail(
         let revoked = cert
             .revoked_at
             .map(|at| {
+                let reason = match cert.revocation_reason.as_deref() {
+                    Some(reason) => h(reason),
+                    None => t(lang, "cert.detail.reason_unspecified"),
+                };
                 format!(
-                    r#"<dt>Revoked</dt><dd>{} ({})</dd>"#,
+                    r#"<dt>{}</dt><dd>{} ({})</dd>"#,
+                    t(lang, "field.revoked"),
                     date(at),
-                    h(cert.revocation_reason.as_deref().unwrap_or("unspecified"))
+                    reason
                 )
             })
             .unwrap_or_default();
         let delete = if user.role.can_write() {
             format!(
-                r#"<form method="post" action="{}" class="inline"><input type="hidden" name="_csrf" value="{}"><button type="submit" class="btn btn-outline-danger" data-confirm="Delete certificate &quot;{}&quot;?">Delete Certificate</button></form>"#,
+                r#"<form method="post" action="{}" class="inline"><input type="hidden" name="_csrf" value="{}"><button type="submit" class="btn btn-outline-danger" data-confirm="{}">{}</button></form>"#,
                 u(state, &format!("/cas/{ca_id}/certs/{cert_id}/delete")),
                 h(&csrf),
-                h(&cert.common_name)
+                tf(lang, "cert.detail.delete_confirm", &[("name", &cert.common_name)]),
+                t(lang, "cert.detail.delete")
             )
         } else {
             String::new()
         };
         let revoke = if user.role.can_write() && cert.revoked_at.is_none() {
             format!(
-                r#"<form method="post" action="{}" class="inline"><input type="hidden" name="_csrf" value="{}"><input type="hidden" name="reason" value="keyCompromise"><button type="submit" class="btn btn-warning" data-confirm="Revoke certificate &quot;{}&quot; and publish it in the CA CRL?">Revoke</button></form>"#,
+                r#"<form method="post" action="{}" class="inline"><input type="hidden" name="_csrf" value="{}"><input type="hidden" name="reason" value="keyCompromise"><button type="submit" class="btn btn-warning" data-confirm="{}">{}</button></form>"#,
                 u(state, &format!("/cas/{ca_id}/certs/{cert_id}/revoke")),
                 h(&csrf),
-                h(&cert.common_name)
+                tf(lang, "cert.detail.revoke_confirm", &[("name", &cert.common_name)]),
+                t(lang, "cert.detail.revoke")
             )
         } else {
             String::new()
         };
         let body = format!(
-            r#"{}<div class="toolbar"><div><h1>{}</h1><p class="subject">{}</p></div><div class="actions">{}</div></div><section class="panel"><h2>Certificate Metadata</h2><dl class="meta"><dt>Usage</dt><dd>{}</dd><dt>DNS SANs</dt><dd>{}</dd><dt>IP SANs</dt><dd>{}</dd><dt>Valid Until</dt><dd>{}</dd><dt>Algorithm</dt><dd>{}</dd><dt>Key size</dt><dd>{}</dd>{}</dl></section><section class="panel download-panel"><div class="section-head"><h2>Downloads</h2><span class="muted">Certificate artifacts</span></div><div class="download-grid">{}</div></section>{}{}"#,
+            r#"{}<div class="toolbar"><div><h1>{}</h1><p class="subject">{}</p></div><div class="actions">{}</div></div><section class="panel"><h2>{}</h2><dl class="meta"><dt>{}</dt><dd>{}</dd><dt>{}</dt><dd>{}</dd><dt>{}</dt><dd>{}</dd><dt>{}</dt><dd>{}</dd><dt>{}</dt><dd>{}</dd><dt>{}</dt><dd>{}</dd>{}</dl></section><section class="panel download-panel"><div class="section-head"><h2>{}</h2><span class="muted">{}</span></div><div class="download-grid">{}</div></section>{}{}"#,
             crumbs,
             h(&cert.common_name),
             h(&cert.subject),
             format!("{revoke}{delete}"),
-            purpose_badges(&purposes),
-            san_badges(&cert.dns_list, "DNS"),
-            san_badges(&cert.ip_list, "IP"),
-            validity_label(cert.issue_time + cert.valid_days * 86_400_000),
+            t(lang, "cert.detail.metadata"),
+            t(lang, "field.usage"),
+            purpose_badges(lang, &purposes),
+            t(lang, "field.dns_sans"),
+            san_badges(&cert.dns_list, &t(lang, "san.dns")),
+            t(lang, "field.ip_sans"),
+            san_badges(&cert.ip_list, &t(lang, "san.ip")),
+            t(lang, "field.valid_until"),
+            validity_label(lang, cert.issue_time + cert.valid_days * 86_400_000),
+            t(lang, "field.algorithm"),
             h(&cert.digest_algorithm),
-            key_size_label(&cert.key_profile),
+            t(lang, "field.key_size"),
+            key_size_label(lang, &cert.key_profile),
             format!("{revoked}{renew}"),
-            cert_artifact_cards(state, &ca_id, &cert_id),
-            pem_panel("Certificate", &cert.cert_pem, false),
-            pem_panel("Private Key", &cert.key_pem, true)
+            t(lang, "cert.detail.downloads"),
+            t(lang, "cert.detail.artifacts"),
+            cert_artifact_cards(state, lang, &ca_id, &cert_id),
+            pem_panel(lang, &t(lang, "artifact.certificate"), &cert.cert_pem, false),
+            pem_panel(lang, &t(lang, "artifact.private_key"), &cert.key_pem, true)
         );
         Ok(body)
     })
@@ -706,6 +888,7 @@ async fn delete_cert_form(
     Path((ca_id, cert_id)): Path<(String, String)>,
     Form(form): Form<CsrfForm>,
 ) -> Response {
+    let lang = request_lang(&headers);
     mutate_form_response(state, headers, form._csrf.clone(), move |state| {
         let name = state
             .service
@@ -715,7 +898,7 @@ async fn delete_cert_form(
         state.service.delete_cert(&ca_id, &cert_id)?;
         Ok((
             Redirect::to(&u(state, &format!("/cas/{ca_id}#ca-certs"))),
-            format!("Deleted certificate \"{name}\""),
+            tr(lang, "flash.cert_deleted", &[("name", &name)]),
         ))
     })
     .await
@@ -727,13 +910,15 @@ async fn renew_cert_form(
     Path((ca_id, cert_id)): Path<(String, String)>,
     Form(form): Form<RenewForm>,
 ) -> Response {
+    let lang = request_lang(&headers);
     mutate_form_response(state, headers, form._csrf.clone(), move |state| {
         let cert = state.service.renew_cert(&ca_id, &cert_id, form.days)?;
         Ok((
             Redirect::to(&u(state, &format!("/cas/{ca_id}/certs/{cert_id}"))),
-            format!(
-                "Renewed certificate \"{}\" for {} days",
-                cert.common_name, form.days
+            tr(
+                lang,
+                "flash.cert_renewed",
+                &[("name", &cert.common_name), ("days", &form.days.to_string())],
             ),
         ))
     })
@@ -746,17 +931,23 @@ async fn revoke_cert_form(
     Path((ca_id, cert_id)): Path<(String, String)>,
     Form(form): Form<RevokeForm>,
 ) -> Response {
+    let lang = request_lang(&headers);
     mutate_form_response(state, headers, form._csrf.clone(), move |state| {
         let cert = state.service.revoke_cert(&ca_id, &cert_id, &form.reason)?;
         Ok((
             Redirect::to(&u(state, &format!("/cas/{ca_id}/certs/{cert_id}"))),
-            format!("Revoked certificate \"{}\"", cert.common_name),
+            tr(lang, "flash.cert_revoked", &[("name", &cert.common_name)]),
         ))
     })
     .await
 }
 
-async fn crl_download(State(state): State<Arc<AppState>>, Path(ca_id): Path<String>) -> Response {
+async fn crl_download(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(ca_id): Path<String>,
+) -> Response {
+    let lang = request_lang(&headers);
     let task_state = state.clone();
     let task_ca_id = ca_id.clone();
     match blocking(move || task_state.service.crl_der(&task_ca_id)).await {
@@ -771,23 +962,31 @@ async fn crl_download(State(state): State<Arc<AppState>>, Path(ca_id): Path<Stri
             bytes,
         )
             .into_response(),
-        Err(err) => error_response(&state, err),
+        Err(err) => public_error_response(
+            &state,
+            &headers,
+            err,
+            t(lang, "error.crl_not_found"),
+            "CRL download failed",
+        ),
     }
 }
 
 async fn admin_console(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let lang = request_lang(&headers);
     admin_page_response(state, headers, move |state, csrf| {
-        admin_console_body(state, &csrf, None)
+        admin_console_body(state, lang, &csrf, None)
     })
     .await
 }
 
 async fn swagger_page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let lang = request_lang(&headers);
     admin_page_response(state, headers, move |state, _csrf| {
         let base = state.config.server.base_path.clone();
         let spec = openapi_spec_json(&base);
         Ok(format!(
-            r##"{}<div class="page-head"><h1>API Explorer</h1><p class="muted">Authenticated API console for MiniCA endpoints.</p></div><section class="panel swagger-panel"><div id="swagger-ui"></div></section><link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5.17.14/swagger-ui.css"><script src="https://unpkg.com/swagger-ui-dist@5.17.14/swagger-ui-bundle.js"></script><script>
+            r##"{}<div class="page-head"><h1>{}</h1><p class="muted">{}</p></div><section class="panel swagger-panel"><div id="swagger-ui"></div></section><link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5.17.14/swagger-ui.css"><script src="https://unpkg.com/swagger-ui-dist@5.17.14/swagger-ui-bundle.js"></script><script>
 let minicaCsrfToken = "";
 fetch("{}/api/csrf", {{ credentials: "include" }})
   .then((response) => response.ok ? response.json() : null)
@@ -808,10 +1007,12 @@ fetch("{}/api/csrf", {{ credentials: "include" }})
     }});
   }});
 </script>"##,
-            breadcrumb(&[
-                ("Home".to_string(), Some(u(state, "/cas"))),
-                ("API Explorer".to_string(), None),
+            breadcrumb(lang, &[
+                (t(lang, "crumb.home"), Some(u(state, "/cas"))),
+                (t(lang, "nav.api_explorer"), None),
             ]),
+            t(lang, "nav.api_explorer"),
+            t(lang, "swagger.subtitle"),
             h(&base),
             spec
         ))
@@ -824,6 +1025,7 @@ async fn admin_create_user(
     headers: HeaderMap,
     Form(form): Form<AdminUserForm>,
 ) -> Response {
+    let lang = request_lang(&headers);
     let request = CreateUserRequest {
         username: form.username.clone(),
         password: form.password.clone(),
@@ -835,19 +1037,19 @@ async fn admin_create_user(
     .await
     {
         Ok(result) => result,
-        Err(err) => return error_response(&state, err),
+        Err(err) => return error_response(&state, &headers, err),
     };
     match result {
         Ok(_) => redirect_with_flash(
             &state,
             &u(&state, "/admin"),
             "success",
-            &format!("Created user \"{}\"", form.username),
+            &tr(lang, "flash.user_created", &[("name", &form.username)]),
         ),
         Err(err) => {
             let message = err.to_string();
             admin_page_response(state, headers, move |state, csrf| {
-                admin_console_body(state, &csrf, Some(&message))
+                admin_console_body(state, lang, &csrf, Some(&message))
             })
             .await
         }
@@ -860,11 +1062,12 @@ async fn admin_delete_user(
     Path(user_id): Path<String>,
     Form(form): Form<CsrfForm>,
 ) -> Response {
+    let lang = request_lang(&headers);
     mutate_form_response(state, headers, form._csrf.clone(), move |state| {
         state.service.delete_user(&user_id)?;
         Ok((
             Redirect::to(&u(state, "/admin")),
-            "User deleted".to_string(),
+            tr(lang, "flash.user_deleted", &[]),
         ))
     })
     .await
@@ -887,7 +1090,7 @@ async fn admin_backup_export(State(state): State<Arc<AppState>>, headers: Header
             yaml,
         )
             .into_response(),
-        Err(err) => error_response(&state, err),
+        Err(err) => error_response(&state, &headers, err),
     }
 }
 
@@ -896,8 +1099,9 @@ async fn admin_backup_restore(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Response {
+    let lang = request_lang(&headers);
     if let Err(err) = admin_blocking(&state, &headers, None, |_| Ok(())).await {
-        return error_response(&state, err);
+        return error_response(&state, &headers, err);
     }
     let mut csrf = String::new();
     let mut yaml = String::new();
@@ -908,7 +1112,11 @@ async fn admin_backup_restore(
             Ok(Some(field)) => field,
             Ok(None) => break,
             Err(err) => {
-                return error_response(&state, anyhow!("could not read backup upload: {err}"));
+                return error_response(
+                    &state,
+                    &headers,
+                    anyhow!("could not read backup upload: {err}"),
+                );
             }
         };
         let name = field.name().unwrap_or_default().to_string();
@@ -919,6 +1127,7 @@ async fn admin_backup_restore(
                     Err(err) => {
                         return error_response(
                             &state,
+                            &headers,
                             anyhow!("could not read backup upload: {err}"),
                         );
                     }
@@ -931,20 +1140,18 @@ async fn admin_backup_restore(
                     Err(err) => {
                         return error_response(
                             &state,
+                            &headers,
                             anyhow!("could not read backup upload: {err}"),
                         );
                     }
                 };
                 if bytes.is_empty() {
-                    return error_response(&state, anyhow!("backup upload is empty"));
+                    return error_response(&state, &headers, anyhow!(BACKUP_EMPTY));
                 }
                 yaml = match String::from_utf8(bytes.to_vec()) {
                     Ok(text) => text,
                     Err(_) => {
-                        return error_response(
-                            &state,
-                            anyhow!("backup upload must be a UTF-8 YAML file"),
-                        );
+                        return error_response(&state, &headers, anyhow!(BACKUP_NOT_UTF8));
                     }
                 };
                 if filename.is_empty() {
@@ -955,15 +1162,20 @@ async fn admin_backup_restore(
         }
     }
     if let Err(err) = check_form_csrf(&headers, &csrf) {
-        return error_response(&state, err);
+        return error_response(&state, &headers, err);
     }
     if yaml.trim().is_empty() {
-        return error_response(&state, anyhow!("choose a backup YAML file to restore"));
+        return error_response(&state, &headers, anyhow!(BACKUP_MISSING));
     }
     let task_state = state.clone();
     match blocking(move || task_state.service.import_backup_yaml(&yaml)).await {
-        Ok(_) => redirect_with_flash(&state, &u(&state, "/admin"), "success", "Backup restored"),
-        Err(err) => error_response(&state, err),
+        Ok(_) => redirect_with_flash(
+            &state,
+            &u(&state, "/admin"),
+            "success",
+            &tr(lang, "flash.backup_restored", &[]),
+        ),
+        Err(err) => error_response(&state, &headers, err),
     }
 }
 
@@ -972,14 +1184,15 @@ async fn admin_nuke(
     headers: HeaderMap,
     Form(form): Form<NukeForm>,
 ) -> Response {
+    let lang = request_lang(&headers);
     mutate_form_response(state, headers, form._csrf.clone(), move |state| {
         if form.confirm.as_deref() != Some("CONFIRM") {
-            bail!("type CONFIRM before nuking the database");
+            bail!(NUKE_UNCONFIRMED);
         }
         state.service.nuke_all()?;
         Ok((
             Redirect::to(&u(state, "/admin")),
-            "Database emptied".to_string(),
+            tr(lang, "flash.db_emptied", &[]),
         ))
     })
     .await
@@ -991,12 +1204,13 @@ async fn admin_restore_ca(
     Path(ca_id): Path<String>,
     Form(form): Form<CsrfForm>,
 ) -> Response {
+    let lang = request_lang(&headers);
     mutate_form_response(state, headers, form._csrf.clone(), move |state| {
         let name = state.service.ca_display_name(&ca_id);
         state.service.restore_ca(&ca_id)?;
         Ok((
             Redirect::to(&u(state, "/admin")),
-            format!("Restored certificate authority \"{name}\""),
+            tr(lang, "flash.ca_restored", &[("name", &name)]),
         ))
     })
     .await
@@ -1008,63 +1222,114 @@ async fn admin_restore_cert(
     Path((ca_id, cert_id)): Path<(String, String)>,
     Form(form): Form<CsrfForm>,
 ) -> Response {
+    let lang = request_lang(&headers);
     mutate_form_response(state, headers, form._csrf.clone(), move |state| {
         state.service.restore_cert(&ca_id, &cert_id)?;
         Ok((
             Redirect::to(&u(state, "/admin")),
-            "Certificate restored".to_string(),
+            tr(lang, "flash.cert_restored", &[]),
         ))
     })
     .await
 }
 
-fn admin_console_body(state: &Arc<AppState>, csrf: &str, error: Option<&str>) -> Result<String> {
+fn admin_console_body(
+    state: &Arc<AppState>,
+    lang: Lang,
+    csrf: &str,
+    error: Option<&str>,
+) -> Result<String> {
     let users = state.service.list_users()?;
     let deleted_cas = state.service.list_deleted_cas()?;
     let deleted_certs = state.service.list_deleted_certs()?;
 
-    let mut body = breadcrumb(&[
-        ("Home".to_string(), Some(u(state, "/cas"))),
-        ("Admin Console".to_string(), None),
+    let mut body = breadcrumb(lang, &[
+        (t(lang, "crumb.home"), Some(u(state, "/cas"))),
+        (t(lang, "nav.admin_console"), None),
     ]);
-    body.push_str("<h1>Admin Console</h1>");
+    body.push_str(&format!("<h1>{}</h1>", t(lang, "nav.admin_console")));
     if let Some(message) = error {
-        body.push_str(&error_banner(message));
+        body.push_str(&error_banner(lang, message));
     }
 
-    body.push_str(
-        r#"<div class="admin-shell"><nav class="admin-menu tabs" aria-label="Admin sections"><button type="button" class="admin-menu-item tab-btn active" data-tab="admin-maintenance">Backup & Restore</button><button type="button" class="admin-menu-item tab-btn" data-tab="admin-users">Users</button><button type="button" class="admin-menu-item tab-btn" data-tab="admin-deleted-cas">Deleted CAs</button><button type="button" class="admin-menu-item tab-btn" data-tab="admin-deleted-certs">Deleted Certs</button></nav><div class="admin-content">"#,
-    );
+    body.push_str(&format!(
+        r#"<div class="admin-shell"><nav class="admin-menu tabs" aria-label="{}"><button type="button" class="admin-menu-item tab-btn active" data-tab="admin-maintenance">{}</button><button type="button" class="admin-menu-item tab-btn" data-tab="admin-users">{}</button><button type="button" class="admin-menu-item tab-btn" data-tab="admin-deleted-cas">{}</button><button type="button" class="admin-menu-item tab-btn" data-tab="admin-deleted-certs">{}</button></nav><div class="admin-content">"#,
+        t(lang, "admin.sections_aria"),
+        t(lang, "admin.tab_backup"),
+        t(lang, "admin.tab_users"),
+        t(lang, "admin.tab_deleted_cas"),
+        t(lang, "admin.tab_deleted_certs")
+    ));
 
     body.push_str(&format!(
-        r#"<section id="admin-maintenance" class="panel tab-panel"><h2>Backup & Restore</h2><div class="maintenance-grid"><section class="maintenance-section"><div><h3>Export Backup</h3><p class="muted">Download all durable DB data, including DB users, active and deleted certificate authorities, certificates, timestamps, and private material. Runtime locks are excluded.</p></div><a class="btn btn-outline-primary" href="{}">Download Backup</a></section><section class="maintenance-section"><div><h3>Restore Backup</h3><p class="muted">Restore a MiniCA YAML backup into an empty database.</p></div><form method="post" action="{}" class="restore-form" enctype="multipart/form-data"><input type="hidden" name="_csrf" value="{}"><label>Restore YAML<input class="form-control" type="file" name="backup" accept=".yaml,.yml,application/x-yaml,text/yaml,text/plain" required></label><div class="form-actions"><button class="btn btn-primary" data-confirm="Restore this backup into the current empty database?" data-confirm-label="Restore" data-confirm-class="btn-primary">Restore Backup</button></div></form></section><section class="maintenance-section danger-zone"><div><h3>Nuke Database</h3><p class="muted">Deletes all DB users, certificate authorities, certificates, and runtime locks. Config-file users still remain available for login.</p></div><form method="post" action="{}" class="nuke-form"><input type="hidden" name="_csrf" value="{}"><label>Type CONFIRM<input class="form-control" name="confirm" autocomplete="off" required pattern="CONFIRM"></label><button class="btn btn-danger" data-confirm="Empty the MiniCA database? Download a backup first." data-confirm-label="Nuke">Nuke</button></form></section></div></section>"#,
+        r#"<section id="admin-maintenance" class="panel tab-panel"><h2>{}</h2><div class="maintenance-grid"><section class="maintenance-section"><div><h3>{}</h3><p class="muted">{}</p></div><a class="btn btn-outline-primary" href="{}">{}</a></section><section class="maintenance-section"><div><h3>{}</h3><p class="muted">{}</p></div><form method="post" action="{}" class="restore-form" enctype="multipart/form-data"><input type="hidden" name="_csrf" value="{}"><label>{}<input class="form-control" type="file" name="backup" accept=".yaml,.yml,application/x-yaml,text/yaml,text/plain" required></label><div class="form-actions"><button class="btn btn-primary" data-confirm="{}" data-confirm-label="{}" data-confirm-class="btn-primary">{}</button></div></form></section><section class="maintenance-section danger-zone"><div><h3>{}</h3><p class="muted">{}</p></div><form method="post" action="{}" class="nuke-form"><input type="hidden" name="_csrf" value="{}"><label>{}<input class="form-control" name="confirm" autocomplete="off" required pattern="CONFIRM"></label><button class="btn btn-danger" data-confirm="{}" data-confirm-label="{}">{}</button></form></section></div></section>"#,
+        t(lang, "admin.tab_backup"),
+        t(lang, "admin.export_title"),
+        t(lang, "admin.export_help"),
         u(state, "/admin/backup"),
+        t(lang, "admin.export_button"),
+        t(lang, "admin.restore_title"),
+        t(lang, "admin.restore_help"),
         u(state, "/admin/backup/restore"),
         h(csrf),
+        t(lang, "admin.restore_file"),
+        t(lang, "admin.restore_confirm"),
+        t(lang, "action.restore"),
+        t(lang, "admin.restore_button"),
+        t(lang, "admin.nuke_title"),
+        t(lang, "admin.nuke_help"),
         u(state, "/admin/nuke"),
-        h(csrf)
+        h(csrf),
+        t(lang, "admin.nuke_type"),
+        t(lang, "admin.nuke_confirm"),
+        t(lang, "admin.nuke_button"),
+        t(lang, "admin.nuke_button")
     ));
 
     // Users management
-    body.push_str(r#"<section id="admin-users" class="panel tab-panel" hidden><h2>Users</h2><p class="muted">Database-backed accounts with bcrypt-hashed passwords. The bootstrap admin configured in the config file is not listed here.</p>"#);
     body.push_str(&format!(
-        r#"<form method="post" action="{}" class="user-form"><input type="hidden" name="_csrf" value="{}"><div class="grid3"><label>Username<input class="form-control" name="username" required></label><label>Password<input class="form-control" type="password" name="password" minlength="6" required></label><label>Role<select class="form-select" name="role"><option value="viewer">viewer</option><option value="admin">admin</option></select></label></div><button class="btn btn-primary">Add User</button></form>"#,
+        r#"<section id="admin-users" class="panel tab-panel" hidden><h2>{}</h2><p class="muted">{}</p>"#,
+        t(lang, "admin.tab_users"),
+        t(lang, "admin.users_help")
+    ));
+    body.push_str(&format!(
+        r#"<form method="post" action="{}" class="user-form"><input type="hidden" name="_csrf" value="{}"><div class="grid3"><label>{}<input class="form-control" name="username" required></label><label>{}<input class="form-control" type="password" name="password" minlength="6" required></label><label>{}<select class="form-select" name="role"><option value="viewer">{}</option><option value="admin">{}</option></select></label></div><button class="btn btn-primary">{}</button></form>"#,
         u(state, "/admin/users"),
-        h(csrf)
+        h(csrf),
+        t(lang, "field.username"),
+        t(lang, "field.password"),
+        t(lang, "field.role"),
+        t(lang, "role.viewer"),
+        t(lang, "role.admin"),
+        t(lang, "admin.add_user")
     ));
     if users.is_empty() {
-        body.push_str(r#"<p class="muted">No database users yet.</p>"#);
+        body.push_str(&format!(
+            r#"<p class="muted">{}</p>"#,
+            t(lang, "admin.no_users")
+        ));
     } else {
-        body.push_str(r#"<table class="table"><thead><tr><th>Username</th><th>Role</th><th>Created</th><th></th></tr></thead><tbody>"#);
+        body.push_str(&format!(
+            r#"<table class="table"><thead><tr><th>{}</th><th>{}</th><th>{}</th><th></th></tr></thead><tbody>"#,
+            t(lang, "field.username"),
+            t(lang, "field.role"),
+            t(lang, "admin.created")
+        ));
         for usr in users {
+            let role = match usr.role.as_str() {
+                "admin" => t(lang, "role.admin"),
+                "viewer" => t(lang, "role.viewer"),
+                other => h(other),
+            };
             body.push_str(&format!(
-                r#"<tr><td><strong>{}</strong></td><td>{}</td><td>{}</td><td class="text-end"><form class="inline" method="post" action="{}"><input type="hidden" name="_csrf" value="{}"><button type="submit" class="btn btn-sm btn-outline-danger" data-confirm="Delete user &quot;{}&quot;?">Delete</button></form></td></tr>"#,
+                r#"<tr><td><strong>{}</strong></td><td>{}</td><td>{}</td><td class="text-end"><form class="inline" method="post" action="{}"><input type="hidden" name="_csrf" value="{}"><button type="submit" class="btn btn-sm btn-outline-danger" data-confirm="{}">{}</button></form></td></tr>"#,
                 h(&usr.username),
-                h(&usr.role),
+                role,
                 date(usr.created_at),
                 u(state, &format!("/admin/users/{}/delete", usr.id)),
                 h(csrf),
-                h(&usr.username)
+                tf(lang, "admin.delete_user_confirm", &[("name", &usr.username)]),
+                t(lang, "action.delete")
             ));
         }
         body.push_str("</tbody></table>");
@@ -1072,18 +1337,29 @@ fn admin_console_body(state: &Arc<AppState>, csrf: &str, error: Option<&str>) ->
     body.push_str("</section>");
 
     // Deleted CAs
-    body.push_str(r#"<section id="admin-deleted-cas" class="panel tab-panel" hidden><h2>Deleted Certificate Authorities</h2>"#);
+    body.push_str(&format!(
+        r#"<section id="admin-deleted-cas" class="panel tab-panel" hidden><h2>{}</h2>"#,
+        t(lang, "admin.deleted_cas_title")
+    ));
     if deleted_cas.is_empty() {
-        body.push_str(r#"<p class="muted">No deleted certificate authorities.</p>"#);
+        body.push_str(&format!(
+            r#"<p class="muted">{}</p>"#,
+            t(lang, "admin.no_deleted_cas")
+        ));
     } else {
-        body.push_str(r#"<table class="table"><thead><tr><th>Common Name</th><th>Subject</th><th></th></tr></thead><tbody>"#);
+        body.push_str(&format!(
+            r#"<table class="table"><thead><tr><th>{}</th><th>{}</th><th></th></tr></thead><tbody>"#,
+            t(lang, "field.common_name"),
+            t(lang, "field.subject")
+        ));
         for ca in deleted_cas {
             body.push_str(&format!(
-                r#"<tr><td><strong>{}</strong></td><td class="subject">{}</td><td class="text-end"><form class="inline" method="post" action="{}"><input type="hidden" name="_csrf" value="{}"><button class="btn btn-sm btn-outline-primary">Restore</button></form></td></tr>"#,
+                r#"<tr><td><strong>{}</strong></td><td class="subject">{}</td><td class="text-end"><form class="inline" method="post" action="{}"><input type="hidden" name="_csrf" value="{}"><button class="btn btn-sm btn-outline-primary">{}</button></form></td></tr>"#,
                 h(&ca.common_name),
                 h(&ca.subject),
                 u(state, &format!("/admin/cas/{}/restore", ca.id)),
-                h(csrf)
+                h(csrf),
+                t(lang, "action.restore")
             ));
         }
         body.push_str("</tbody></table>");
@@ -1091,19 +1367,30 @@ fn admin_console_body(state: &Arc<AppState>, csrf: &str, error: Option<&str>) ->
     body.push_str("</section>");
 
     // Deleted certificates
-    body.push_str(r#"<section id="admin-deleted-certs" class="panel tab-panel" hidden><h2>Deleted Certificates</h2>"#);
+    body.push_str(&format!(
+        r#"<section id="admin-deleted-certs" class="panel tab-panel" hidden><h2>{}</h2>"#,
+        t(lang, "admin.deleted_certs_title")
+    ));
     if deleted_certs.is_empty() {
-        body.push_str(r#"<p class="muted">No deleted certificates.</p>"#);
+        body.push_str(&format!(
+            r#"<p class="muted">{}</p>"#,
+            t(lang, "admin.no_deleted_certs")
+        ));
     } else {
-        body.push_str(r#"<table class="table"><thead><tr><th>Common Name</th><th>Certificate Authority</th><th></th></tr></thead><tbody>"#);
+        body.push_str(&format!(
+            r#"<table class="table"><thead><tr><th>{}</th><th>{}</th><th></th></tr></thead><tbody>"#,
+            t(lang, "field.common_name"),
+            t(lang, "field.ca")
+        ));
         for cert in deleted_certs {
             let ca_name = state.service.ca_display_name(&cert.ca_id);
             body.push_str(&format!(
-                r#"<tr><td><strong>{}</strong></td><td>{}</td><td class="text-end"><form class="inline" method="post" action="{}"><input type="hidden" name="_csrf" value="{}"><button class="btn btn-sm btn-outline-primary">Restore</button></form></td></tr>"#,
+                r#"<tr><td><strong>{}</strong></td><td>{}</td><td class="text-end"><form class="inline" method="post" action="{}"><input type="hidden" name="_csrf" value="{}"><button class="btn btn-sm btn-outline-primary">{}</button></form></td></tr>"#,
                 h(&cert.common_name),
                 h(&ca_name),
                 u(state, &format!("/admin/certs/{}/{}/restore", cert.ca_id, cert.id)),
-                h(csrf)
+                h(csrf),
+                t(lang, "action.restore")
             ));
         }
         body.push_str("</tbody></table>");
@@ -1115,28 +1402,48 @@ fn admin_console_body(state: &Arc<AppState>, csrf: &str, error: Option<&str>) ->
 
 fn inspect_form_body(
     state: &Arc<AppState>,
+    lang: Lang,
     csrf: &str,
-    error: Option<&str>,
+    error_html: Option<&str>,
     cert_pem: &str,
 ) -> String {
     format!(
-        r#"{}<div class="page-head"><h1>Inspect Certificate</h1><p class="muted">Paste any PEM certificate to view its subject, validity, SANs and purpose.</p></div><form method="post" action="{}" class="import-form"><input type="hidden" name="_csrf" value="{}"><section class="panel"><div class="field"><label for="cert_pem">Certificate PEM</label><textarea id="cert_pem" class="form-control code large-pem" name="cert_pem" rows="16" spellcheck="false" placeholder="-----BEGIN CERTIFICATE-----" required>{}</textarea></div><div class="form-actions"><button class="btn btn-primary btn-lg">Inspect</button></div>{}</section></form>"#,
-        breadcrumb(&[
-            ("Home".to_string(), Some(u(state, "/cas"))),
-            ("Inspect Certificate".to_string(), None),
+        r#"{}<div class="page-head"><h1>{}</h1><p class="muted">{}</p></div><form method="post" action="{}" class="import-form"><input type="hidden" name="_csrf" value="{}"><section class="panel"><div class="field"><label for="cert_pem">{}</label><textarea id="cert_pem" class="form-control code large-pem" name="cert_pem" rows="16" spellcheck="false" placeholder="-----BEGIN CERTIFICATE-----" required>{}</textarea></div><div class="form-actions"><button class="btn btn-primary btn-lg">{}</button></div>{}</section></form>"#,
+        breadcrumb(lang, &[
+            (t(lang, "crumb.home"), Some(u(state, "/cas"))),
+            (t(lang, "inspect.title"), None),
         ]),
+        t(lang, "inspect.title"),
+        t(lang, "inspect.help"),
         u(state, "/inspect"),
         h(csrf),
+        t(lang, "cert.import.cert_label"),
         h(cert_pem),
-        error.map(error_banner).unwrap_or_default(),
+        t(lang, "inspect.submit"),
+        error_html.map(error_banner_html).unwrap_or_default(),
     )
 }
 
 async fn inspect_form(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let lang = request_lang(&headers);
     admin_page_response(state, headers, move |state, csrf| {
-        Ok(inspect_form_body(state, &csrf, None, ""))
+        Ok(inspect_form_body(state, lang, &csrf, None, ""))
     })
     .await
+}
+
+/// Label for a field of `openssl x509 -subject -issuer -dates -serial
+/// -fingerprint` output; unknown fields are shown as OpenSSL names them.
+fn inspect_field_label(lang: Lang, field: &str) -> String {
+    match field.to_ascii_lowercase().as_str() {
+        "subject" => t(lang, "field.subject"),
+        "issuer" => t(lang, "inspect.field.issuer"),
+        "notbefore" => t(lang, "inspect.field.not_before"),
+        "notafter" => t(lang, "inspect.field.not_after"),
+        "serial" => t(lang, "inspect.field.serial"),
+        "sha256 fingerprint" => t(lang, "inspect.field.sha256_fingerprint"),
+        _ => format!(r#"<span translate="no">{}</span>"#, h(field)),
+    }
 }
 
 async fn inspect_form_post(
@@ -1144,52 +1451,81 @@ async fn inspect_form_post(
     headers: HeaderMap,
     Form(form): Form<InspectForm>,
 ) -> Response {
+    let lang = request_lang(&headers);
     admin_page_response(state, headers.clone(), move |state, csrf| {
         check_form_csrf(&headers, &form._csrf)?;
         let info = match state.service.inspect_cert(&form.cert_pem) {
             Ok(info) => info,
             Err(err) => {
+                let message = tf_html(
+                    lang,
+                    "inspect.error",
+                    &[("reason", &error_detail(&err.to_string()))],
+                );
                 return Ok(inspect_form_body(
                     state,
+                    lang,
                     &csrf,
-                    Some(&format!("Could not inspect certificate: {err}")),
+                    Some(&message),
                     &form.cert_pem,
                 ));
             }
         };
         let mut body = format!(
-            r#"{}<div class="toolbar"><div><h1>Certificate Details</h1></div></div><section class="panel"><h2>Important Information</h2><table class="table">"#,
-            breadcrumb(&[
-                ("Home".to_string(), Some(u(state, "/cas"))),
-                (
-                    "Inspect Certificate".to_string(),
-                    Some(u(state, "/inspect"))
-                ),
-                ("Details".to_string(), None),
-            ])
+            r#"{}<div class="toolbar"><div><h1>{}</h1></div></div><section class="panel"><h2>{}</h2><table class="table">"#,
+            breadcrumb(lang, &[
+                (t(lang, "crumb.home"), Some(u(state, "/cas"))),
+                (t(lang, "inspect.title"), Some(u(state, "/inspect"))),
+                (t(lang, "crumb.details"), None),
+            ]),
+            t(lang, "inspect.details_title"),
+            t(lang, "inspect.important")
         );
+        // Values are OpenSSL output (names, dates, serials): data, not UI text.
         for (k, v) in info.info {
-            body.push_str(&format!("<tr><th>{}</th><td>{}</td></tr>", h(&k), h(&v)));
+            body.push_str(&format!(
+                r#"<tr><th>{}</th><td translate="no">{}</td></tr>"#,
+                inspect_field_label(lang, &k),
+                h(&v)
+            ));
         }
         body.push_str("</table></section>");
         body.push_str(&format!(
-            r#"<section class="panel"><h2>Subject Alternative Names</h2><dl class="meta"><dt>DNS Names</dt><dd>{}</dd><dt>IP Addresses</dt><dd>{}</dd></dl></section>"#,
+            r#"<section class="panel"><h2>{}</h2><dl class="meta"><dt>{}</dt><dd translate="no">{}</dd><dt>{}</dt><dd translate="no">{}</dd></dl></section>"#,
+            t(lang, "inspect.sans_title"),
+            t(lang, "inspect.dns_names"),
             list_or_dash(&info.dns_names),
+            t(lang, "inspect.ip_addresses"),
             list_or_dash(&info.ip_addresses)
         ));
         if !info.purposes.is_empty() {
-            body.push_str(
-                r#"<section class="panel"><h2>Certificate Purposes</h2><table class="table">"#,
-            );
+            body.push_str(&format!(
+                r#"<section class="panel"><h2>{}</h2><table class="table">"#,
+                t(lang, "inspect.purposes_title")
+            ));
+            // Purpose names are OpenSSL's identifiers; only Yes/No is translated.
             for (k, v) in info.purposes {
-                body.push_str(&format!("<tr><th>{}</th><td>{}</td></tr>", h(&k), h(&v)));
+                let value = if v.eq_ignore_ascii_case("yes") {
+                    t(lang, "inspect.yes")
+                } else if v.eq_ignore_ascii_case("no") {
+                    t(lang, "inspect.no")
+                } else {
+                    format!(r#"<span translate="no">{}</span>"#, h(&v))
+                };
+                body.push_str(&format!(
+                    r#"<tr><th translate="no">{}</th><td>{}</td></tr>"#,
+                    h(&k),
+                    value
+                ));
             }
             body.push_str("</table></section>");
         }
         body.push_str(&format!(
-            r#"<details class="panel"><summary>Raw OpenSSL x509 -text output</summary><pre class="raw-output">{}</pre></details><a href="{}">Inspect another</a>"#,
+            r#"<details class="panel"><summary>{}</summary><pre class="raw-output">{}</pre></details><a href="{}">{}</a>"#,
+            t(lang, "inspect.raw_summary"),
             h(&info.raw_text),
-            u(state, "/inspect")
+            u(state, "/inspect"),
+            t(lang, "inspect.another")
         ));
         Ok(body)
     })
@@ -1201,14 +1537,74 @@ async fn download_ca(
     headers: HeaderMap,
     Path((ca_id, kind)): Path<(String, String)>,
 ) -> Response {
+    // The CA certificate is public, like the CRL: relying parties need the
+    // trust anchor without an account. Key material still requires a viewer.
+    if kind == "cert" {
+        return public_ca_cert(state, headers, ca_id).await;
+    }
     match viewer_blocking(&state, &headers, move |state| {
         state.service.download_ca(&ca_id, ca_download_kind(&kind)?)
     })
     .await
     {
         Ok((name, bytes)) => download_response(name, bytes),
-        Err(err) => error_response(&state, err),
+        Err(err) => error_response(&state, &headers, err),
     }
+}
+
+/// `{base}/{ca_id}/download`: short public alias for the CA certificate.
+async fn public_ca_cert_download(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(ca_id): Path<String>,
+) -> Response {
+    public_ca_cert(state, headers, ca_id).await
+}
+
+/// Serves a CA certificate PEM without authentication or CSRF. A missing or
+/// soft-deleted CA is a plain 404.
+async fn public_ca_cert(state: Arc<AppState>, headers: HeaderMap, ca_id: String) -> Response {
+    let lang = request_lang(&headers);
+    let task_state = state.clone();
+    match blocking(move || task_state.service.download_ca(&ca_id, Download::CaCert)).await {
+        Ok((name, bytes)) => download_response(name, bytes),
+        Err(err) => public_error_response(
+            &state,
+            &headers,
+            err,
+            t(lang, "error.ca_not_found"),
+            "public CA certificate download failed",
+        ),
+    }
+}
+
+/// Error page for unauthenticated routes. The status is never derived from
+/// the error message, which echoes the requested id (an id such as
+/// "Authorization" must not turn into a Basic-auth challenge).
+/// Panics and database failures are a 500; anything else (unknown or deleted
+/// CA, CRL disabled or not generated) is reported as `not_found` (translated
+/// HTML).
+fn public_error_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    err: anyhow::Error,
+    not_found: String,
+    context: &str,
+) -> Response {
+    let lang = request_lang(headers);
+    let internal = err
+        .chain()
+        .any(|cause| cause.is::<InternalError>() || cause.is::<rusqlite::Error>());
+    let (status, message) = if internal {
+        tracing::error!(error = %err, "{context}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            t(lang, "error.download_failed"),
+        )
+    } else {
+        (StatusCode::NOT_FOUND, not_found)
+    };
+    error_page(state, headers, lang, status, &message)
 }
 
 async fn download_cert(
@@ -1224,8 +1620,80 @@ async fn download_cert(
     .await
     {
         Ok((name, bytes)) => download_response(name, bytes),
-        Err(err) => error_response(&state, err),
+        Err(err) => error_response(&state, &headers, err),
     }
+}
+
+/// `GET {base}/lang/{code}`: stores the UI language in the `minica_lang`
+/// cookie and goes back to the page the switch was made from. Needs no auth
+/// (pages may be behind a 401) and no CSRF: it only sets a preference.
+/// The way back is the `return` query parameter, else the Referer, and only
+/// when it is a same-origin path under the base path; otherwise home.
+async fn switch_lang(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(code): Path<String>,
+    Query(query): Query<LangQuery>,
+) -> Response {
+    let Some(lang) = Lang::from_code(&code) else {
+        let lang = request_lang(&headers);
+        return error_page(
+            &state,
+            &headers,
+            lang,
+            StatusCode::BAD_REQUEST,
+            &tf(lang, "error.unknown_language", &[("code", &code)]),
+        );
+    };
+    let target = query
+        .return_to
+        .as_deref()
+        .and_then(|path| safe_return_path(&state, path))
+        .or_else(|| referer_path(&state, &headers))
+        .unwrap_or_else(|| u(&state, "/cas"));
+    let mut response = Redirect::to(&target).into_response();
+    append_cookie(&mut response, lang_cookie_header(&state, lang));
+    response
+}
+
+#[derive(Deserialize)]
+struct LangQuery {
+    #[serde(rename = "return")]
+    return_to: Option<String>,
+}
+
+/// Accepts only a local absolute path at or under the base path (printable
+/// ASCII, no `//host` or `/\host` forms), so the language switch can never
+/// redirect off-site. The switch route itself is refused to avoid loops.
+fn safe_return_path(state: &AppState, path: &str) -> Option<String> {
+    if !path.starts_with('/')
+        || path.starts_with("//")
+        || path.contains('\\')
+        || !path.chars().all(|c| c.is_ascii_graphic())
+    {
+        return None;
+    }
+    let base = state.config.server.base_path.trim_end_matches('/');
+    let rest = path.strip_prefix(base)?;
+    let under_base = rest.is_empty() || rest.starts_with(['/', '?', '#']);
+    if !under_base || rest == "/lang" || rest.starts_with("/lang/") {
+        return None;
+    }
+    Some(path.to_string())
+}
+
+/// The path of a same-origin Referer (its host must equal the Host header).
+fn referer_path(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    let referer = headers.get(header::REFERER)?.to_str().ok()?;
+    let host = headers.get(header::HOST)?.to_str().ok()?;
+    let rest = referer
+        .strip_prefix("http://")
+        .or_else(|| referer.strip_prefix("https://"))?;
+    let path = rest.strip_prefix(host)?;
+    if !path.starts_with('/') {
+        return None;
+    }
+    safe_return_path(state, path)
 }
 
 async fn api_csrf(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -1413,6 +1881,27 @@ async fn api_renew_cert(
     .await
 }
 
+async fn api_renew_ca(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((ca_id, days)): Path<(String, String)>,
+) -> Response {
+    let days = match days.parse::<i64>() {
+        Ok(days) => days,
+        Err(_) => {
+            return api_error_status(
+                StatusCode::BAD_REQUEST,
+                "invalid_path",
+                "days must be an integer",
+            );
+        }
+    };
+    api_admin(Method::POST, headers, state, move |state| {
+        state.service.renew_ca(&ca_id, days)
+    })
+    .await
+}
+
 async fn api_revoke_cert(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1534,7 +2023,7 @@ where
     .await;
     match result {
         Ok((token, is_admin, content)) => render_page(&state, &headers, &token, is_admin, content),
-        Err(err) => error_response(&state, err),
+        Err(err) => error_response(&state, &headers, err),
     }
 }
 
@@ -1554,7 +2043,7 @@ where
     .await;
     match result {
         Ok((token, content)) => render_page(&state, &headers, &token, true, content),
-        Err(err) => error_response(&state, err),
+        Err(err) => error_response(&state, &headers, err),
     }
 }
 
@@ -1605,18 +2094,20 @@ fn render_page(
     is_admin: bool,
     content: String,
 ) -> Response {
+    let lang = request_lang(headers);
     let flash = read_flash(headers);
     let panel = flash
         .as_ref()
-        .map(|(kind, message)| flash_html(kind, message))
+        .map(|(kind, message)| flash_html(lang, kind, message))
         .unwrap_or_default();
     let body = format!("{panel}{content}");
     let mut response =
-        Html(layout(&state.config.server.base_path, &body, is_admin)).into_response();
+        Html(layout(&state.config.server.base_path, lang, &body, is_admin)).into_response();
     append_cookie(&mut response, cookie_header(state, token));
     if flash.is_some() {
         append_cookie(&mut response, flash_clear_cookie(state));
     }
+    refresh_lang_cookie(state, headers, &mut response);
     response
 }
 
@@ -1637,7 +2128,7 @@ where
             }
             response
         }
-        Err(err) => error_response(&state, err),
+        Err(err) => error_response(&state, &headers, err),
     }
 }
 
@@ -1721,7 +2212,7 @@ fn check_form_csrf(headers: &HeaderMap, form_token: &str) -> Result<()> {
     if auth::csrf_tokens_match(cookie_token.as_deref(), Some(form_token)) {
         Ok(())
     } else {
-        Err(anyhow!("CSRF token missing or invalid"))
+        Err(anyhow!(CSRF_INVALID))
     }
 }
 
@@ -1736,15 +2227,61 @@ fn current_or_new_csrf(headers: &HeaderMap) -> String {
 /// Shared cookie attributes: scoped to the base path, SameSite=Strict, and
 /// `Secure` when `server.secure_cookies` is set.
 fn cookie_attributes(state: &AppState) -> String {
+    cookie_attributes_with_same_site(state, "Strict")
+}
+
+fn cookie_attributes_with_same_site(state: &AppState, same_site: &str) -> String {
     let secure = if state.config.server.secure_cookies {
         "; Secure"
     } else {
         ""
     };
     format!(
-        "Path={}; SameSite=Strict{secure}",
+        "Path={}; SameSite={same_site}{secure}",
         state.config.cookie_path()
     )
+}
+
+const LANG_COOKIE: &str = "minica_lang";
+
+/// 400 days, the longest lifetime Chrome accepts. Without a Max-Age the
+/// browser would drop the choice at the end of the session; every HTML page
+/// re-sends the cookie, so in practice it never expires.
+const LANG_COOKIE_MAX_AGE: u32 = 34_560_000;
+
+/// The language chosen with the switcher, if the cookie holds a known code.
+fn cookie_lang(headers: &HeaderMap) -> Option<Lang> {
+    cookie_value(headers, LANG_COOKIE).and_then(|code| Lang::from_code(&code))
+}
+
+/// UI language for a request: the cookie, else the best `Accept-Language`
+/// match, else English.
+fn request_lang(headers: &HeaderMap) -> Lang {
+    cookie_lang(headers)
+        .or_else(|| {
+            headers
+                .get(header::ACCEPT_LANGUAGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(Lang::negotiate)
+        })
+        .unwrap_or(Lang::EN)
+}
+
+/// SameSite=Lax (not Strict like the other cookies) so the preference also
+/// applies when arriving from a link on another site.
+fn lang_cookie_header(state: &AppState, lang: Lang) -> String {
+    format!(
+        "{LANG_COOKIE}={}; Max-Age={LANG_COOKIE_MAX_AGE}; {}; HttpOnly",
+        lang.code(),
+        cookie_attributes_with_same_site(state, "Lax")
+    )
+}
+
+/// Re-sends a valid language cookie to slide its expiry forward.
+fn refresh_lang_cookie(state: &AppState, headers: &HeaderMap, response: &mut Response) {
+    if let Some(lang) = cookie_lang(headers) {
+        append_cookie(response, lang_cookie_header(state, lang));
+    }
 }
 
 /// The CSRF cookie is HttpOnly: page JS never reads it (forms embed the token
@@ -1796,15 +2333,16 @@ fn read_flash(headers: &HeaderMap) -> Option<(String, String)> {
 
 /// Renders the flash notification as a prominent, dismissible message panel at
 /// the top of the page content (in-flow, same page) — not a transient corner toast.
-fn flash_html(kind: &str, message: &str) -> String {
+fn flash_html(lang: Lang, kind: &str, message: &str) -> String {
     let (class, icon) = if kind == "error" {
         ("flash-panel flash-error", "⚠")
     } else {
         ("flash-panel flash-success", "✓")
     };
     format!(
-        r#"<div class="{class}" role="status"><span class="flash-icon">{icon}</span><span class="flash-text">{}</span><button type="button" class="flash-close" aria-label="Dismiss">×</button></div>"#,
-        h(message)
+        r#"<div class="{class}" role="status"><span class="flash-icon">{icon}</span><span class="flash-text">{}</span><button type="button" class="flash-close" aria-label="{}">×</button></div>"#,
+        h(message),
+        t(lang, "flash.dismiss")
     )
 }
 
@@ -1821,18 +2359,12 @@ fn redirect_with_flash(state: &AppState, target: &str, kind: &str, message: &str
     response
 }
 
-fn error_response(state: &AppState, err: anyhow::Error) -> Response {
+fn error_response(state: &AppState, headers: &HeaderMap, err: anyhow::Error) -> Response {
     let msg = err.to_string();
     let status = status_for_error(&err);
-    let mut response = (
-        status,
-        Html(layout(
-            &state.config.server.base_path,
-            &format!("<h1>Request failed</h1><p>{}</p>", h(&msg)),
-            false,
-        )),
-    )
-        .into_response();
+    let lang = request_lang(headers);
+    let message = error_message_html(lang, &msg, false);
+    let mut response = error_page(state, headers, lang, status, &message);
     if status == StatusCode::UNAUTHORIZED && basic_challenge_applies(&msg) {
         response.headers_mut().insert(
             header::WWW_AUTHENTICATE,
@@ -1840,6 +2372,74 @@ fn error_response(state: &AppState, err: anyhow::Error) -> Response {
         );
     }
     response
+}
+
+/// A translated HTML status page (no admin links), re-sending the language
+/// cookie like every other page.
+fn error_page(
+    state: &AppState,
+    headers: &HeaderMap,
+    lang: Lang,
+    status: StatusCode,
+    message_html: &str,
+) -> Response {
+    let title = match status {
+        StatusCode::UNAUTHORIZED => t(lang, "error.title.unauthorized"),
+        StatusCode::FORBIDDEN => t(lang, "error.title.forbidden"),
+        StatusCode::NOT_FOUND => t(lang, "error.title.not_found"),
+        StatusCode::CONFLICT => t(lang, "error.title.conflict"),
+        StatusCode::INTERNAL_SERVER_ERROR => t(lang, "error.title.server"),
+        _ => t(lang, "error.title.failed"),
+    };
+    let mut response = (
+        status,
+        Html(layout(
+            &state.config.server.base_path,
+            lang,
+            &format!("<h1>{title}</h1><p>{message_html}</p>"),
+            false,
+        )),
+    )
+        .into_response();
+    refresh_lang_cookie(state, headers, &mut response);
+    response
+}
+
+// Messages raised by the web layer itself; shared with `error_message_html`
+// so the HTML pages can show them translated (the JSON API keeps English).
+const CSRF_INVALID: &str = "CSRF token missing or invalid";
+const BACKUP_EMPTY: &str = "backup upload is empty";
+const BACKUP_NOT_UTF8: &str = "backup upload must be a UTF-8 YAML file";
+const BACKUP_MISSING: &str = "choose a backup YAML file to restore";
+const NUKE_UNCONFIRMED: &str = "type CONFIRM before nuking the database";
+const UNKNOWN_CA_DOWNLOAD: &str = "unknown CA download kind";
+const UNKNOWN_CERT_DOWNLOAD: &str = "unknown certificate download kind";
+
+/// HTML for an error message shown on a page. Auth and web-layer messages
+/// have translations; anything else (service validation, OpenSSL failures)
+/// is shown verbatim in English inside a translated wrapper — `banner`
+/// selects the inline-form wording over the status-page one.
+fn error_message_html(lang: Lang, msg: &str, banner: bool) -> String {
+    match msg {
+        CSRF_INVALID => t(lang, "error.csrf"),
+        "missing Authorization header"
+        | "unsupported Authorization header"
+        | "invalid Basic auth payload"
+        | "invalid username or password" => t(lang, "error.sign_in"),
+        "admin role required" => t(lang, "error.admin_required"),
+        BACKUP_EMPTY => t(lang, "error.backup_empty"),
+        BACKUP_NOT_UTF8 => t(lang, "error.backup_not_utf8"),
+        BACKUP_MISSING => t(lang, "error.backup_missing"),
+        NUKE_UNCONFIRMED => t(lang, "error.nuke_unconfirmed"),
+        UNKNOWN_CA_DOWNLOAD | UNKNOWN_CERT_DOWNLOAD => t(lang, "error.download_kind"),
+        _ if banner => tf_html(lang, "error.banner", &[("reason", &error_detail(msg))]),
+        _ => tf_html(lang, "error.details", &[("reason", &error_detail(msg))]),
+    }
+}
+
+/// An untranslated (English) error message from the service layer.
+fn error_detail(msg: &str) -> String {
+    format!(r#"<span class="error-detail">{}</span>"#, h(msg))
 }
 
 fn status_for_error(err: &anyhow::Error) -> StatusCode {
@@ -1935,7 +2535,7 @@ fn ca_download_kind(kind: &str) -> Result<Download> {
         "key" => Ok(Download::CaKey),
         "pkcs12" => Ok(Download::CaPkcs12),
         "password" => Ok(Download::CaPassword),
-        _ => Err(anyhow!("unknown CA download kind")),
+        _ => Err(anyhow!(UNKNOWN_CA_DOWNLOAD)),
     }
 }
 
@@ -1947,7 +2547,7 @@ fn cert_download_kind(kind: &str) -> Result<Download> {
         "key" => Ok(Download::CertKey),
         "pkcs12" => Ok(Download::CertPkcs12),
         "password" => Ok(Download::CertPassword),
-        _ => Err(anyhow!("unknown certificate download kind")),
+        _ => Err(anyhow!(UNKNOWN_CERT_DOWNLOAD)),
     }
 }
 
@@ -2170,23 +2770,26 @@ impl From<&CertForm> for SubjectValues {
     }
 }
 
+/// A `<select>` option whose label is a technical name (algorithm, curve),
+/// identical in every language.
 fn opt(value: &str, label: &str, current: &str) -> String {
     format!(
-        r#"<option value="{}"{}>{}</option>"#,
+        r#"<option value="{}"{} translate="no">{}</option>"#,
         value,
         if value == current { " selected" } else { "" },
         label
     )
 }
 
-fn error_banner(message: &str) -> String {
-    format!(
-        r#"<div class="alert-error" role="alert">{}</div>"#,
-        h(message)
-    )
+fn error_banner(lang: Lang, message: &str) -> String {
+    error_banner_html(&error_message_html(lang, message, true))
 }
 
-fn subject_fields_common(v: &SubjectValues) -> String {
+fn error_banner_html(message_html: &str) -> String {
+    format!(r#"<div class="alert-error" role="alert">{message_html}</div>"#)
+}
+
+fn subject_fields_common(lang: Lang, v: &SubjectValues) -> String {
     let digest = format!(
         "{}{}",
         opt("sha512", "SHA-512", &v.digest_algorithm),
@@ -2206,7 +2809,18 @@ fn subject_fields_common(v: &SubjectValues) -> String {
         opt("ecdsa:secp521r1", "ECDSA P-521 / secp521r1", &v.key_profile)
     );
     format!(
-        r#"<label>Common Name<input class="form-control" name="common_name" value="{cn}" required></label><label>Country Code<input class="form-control" name="country_code" value="{cc}" maxlength="2" required></label><label>State<input class="form-control" name="state" value="{st}"></label><label>City<input class="form-control" name="city" value="{ci}"></label><label>Organization<input class="form-control" name="organization" value="{org}" required></label><label>Organization Unit<input class="form-control" name="organization_unit" value="{ou}"></label><label>Valid Days<input class="form-control" type="number" min="1" max="7350" name="valid_days" value="{vd}"></label><label>Digest<select class="form-select" name="digest_algorithm">{digest}</select></label><label>Key Profile<select class="form-select" name="key_profile">{key_profiles}</select></label><label>PKCS12 Password<input class="form-control" name="password" value="{pw}" placeholder="random if empty"></label>"#,
+        r#"<label>{l_cn}<input class="form-control" name="common_name" value="{cn}" required></label><label>{l_cc}<input class="form-control" name="country_code" value="{cc}" maxlength="2" required></label><label>{l_st}<input class="form-control" name="state" value="{st}"></label><label>{l_ci}<input class="form-control" name="city" value="{ci}"></label><label>{l_org}<input class="form-control" name="organization" value="{org}" required></label><label>{l_ou}<input class="form-control" name="organization_unit" value="{ou}"></label><label>{l_vd}<input class="form-control" type="number" min="1" max="7350" name="valid_days" value="{vd}"></label><label>{l_digest}<select class="form-select" name="digest_algorithm">{digest}</select></label><label>{l_kp}<select class="form-select" name="key_profile">{key_profiles}</select></label><label>{l_pw}<input class="form-control" name="password" value="{pw}" placeholder="{p_pw}"></label>"#,
+        l_cn = t(lang, "field.common_name"),
+        l_cc = t(lang, "field.country_code"),
+        l_st = t(lang, "field.state"),
+        l_ci = t(lang, "field.city"),
+        l_org = t(lang, "field.organization"),
+        l_ou = t(lang, "field.organization_unit"),
+        l_vd = t(lang, "field.valid_days"),
+        l_digest = t(lang, "field.digest"),
+        l_kp = t(lang, "field.key_profile"),
+        l_pw = t(lang, "field.pkcs12_password"),
+        p_pw = t(lang, "field.password_placeholder"),
         cn = h(&v.common_name),
         cc = h(&v.country_code),
         st = h(&v.state),
@@ -2218,38 +2832,97 @@ fn subject_fields_common(v: &SubjectValues) -> String {
     )
 }
 
-fn ca_form_fields(csrf: &str, submit: &str, extra: &str, v: &SubjectValues) -> String {
+/// `submit` is translated, already-escaped HTML.
+fn ca_form_fields(lang: Lang, csrf: &str, submit: &str, extra: &str, v: &SubjectValues) -> String {
     format!(
         r#"<input type="hidden" name="_csrf" value="{}">{}<div class="grid2">{}</div><button class="btn btn-primary">{}</button>"#,
         h(csrf),
         extra,
-        subject_fields_common(v),
-        h(submit)
+        subject_fields_common(lang, v),
+        submit
     )
 }
 
-fn cert_form_fields(csrf: &str, v: &SubjectValues) -> String {
+fn cert_form_fields(lang: Lang, csrf: &str, v: &SubjectValues) -> String {
     format!(
-        r#"<input type="hidden" name="_csrf" value="{}"><div class="grid2">{}<label>DNS SANs <span class="muted">comma separated</span><input class="form-control" name="dns_list" value="{}"></label><label>IP SANs <span class="muted">comma separated</span><input class="form-control" name="ip_list" value="{}"></label></div><button class="btn btn-primary">Create Certificate</button>"#,
+        r#"<input type="hidden" name="_csrf" value="{}"><div class="grid2">{}<label>{} <span class="muted">{}</span><input class="form-control" name="dns_list" value="{}"></label><label>{} <span class="muted">{}</span><input class="form-control" name="ip_list" value="{}"></label></div><button class="btn btn-primary">{}</button>"#,
         h(csrf),
-        subject_fields_common(v),
+        subject_fields_common(lang, v),
+        t(lang, "field.dns_sans"),
+        t(lang, "field.comma_separated"),
         h(&v.dns_list),
-        h(&v.ip_list)
+        t(lang, "field.ip_sans"),
+        t(lang, "field.comma_separated"),
+        h(&v.ip_list),
+        t(lang, "cert.new.submit")
     )
 }
 
-fn layout(base: &str, content: &str, is_admin: bool) -> String {
+fn layout(base: &str, lang: Lang, content: &str, is_admin: bool) -> String {
     let admin_link = if is_admin {
         format!(
-            r#"<a class="topbar-link" href="{}/swagger">API Explorer</a><a class="topbar-link" href="{}/admin">Admin Console</a>"#,
-            base, base
+            r#"<a class="topbar-link" href="{}/swagger">{}</a><a class="topbar-link" href="{}/admin">{}</a>"#,
+            base,
+            t(lang, "nav.api_explorer"),
+            base,
+            t(lang, "nav.admin_console")
         )
     } else {
         String::new()
     };
+    let switcher = lang_switcher(base, lang);
+    let modal = format!(
+        r#"<div id="confirm-modal" class="modal-backdrop" hidden><div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><h3 id="confirm-title">{}</h3><p id="confirm-message"></p><div class="modal-actions"><button type="button" class="btn btn-outline-secondary" id="confirm-cancel">{}</button><button type="button" class="btn btn-danger" id="confirm-ok">{}</button></div></div></div>"#,
+        t(lang, "modal.title"),
+        t(lang, "modal.cancel"),
+        t(lang, "modal.confirm")
+    );
+    let strings = script_strings(lang);
+    let (code, dir) = (lang.code(), lang.dir());
     format!(
-        r#"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>MiniCA</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"><style>{CSS}</style></head><body><header class="topbar"><a class="brand" href="{base}/cas">MiniCA</a><div class="topbar-actions">{admin_link}</div></header><main>{content}</main>{MODAL}<script>{JS}</script></body></html>"#
+        r#"<!doctype html><html lang="{code}" dir="{dir}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>MiniCA</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"><style>{CSS}</style></head><body><header class="topbar"><a class="brand" href="{base}/cas">MiniCA</a><div class="topbar-actions">{admin_link}{switcher}</div></header><main>{content}</main>{modal}<script type="application/json" id="minica-i18n">{strings}</script><script>{JS}</script></body></html>"#
     )
+}
+
+/// The language menu: plain links (works without JS; the page script adds
+/// a `return` parameter), each name shown in its own language.
+fn lang_switcher(base: &str, lang: Lang) -> String {
+    let links: String = Lang::all()
+        .map(|option| {
+            let current = option == lang;
+            format!(
+                r#"<a class="lang-option{}" href="{base}/lang/{code}" lang="{code}" hreflang="{code}" translate="no"{} data-lang-link>{}</a>"#,
+                if current { " active" } else { "" },
+                if current { r#" aria-current="true""# } else { "" },
+                h(option.native_name()),
+                code = option.code(),
+            )
+        })
+        .collect();
+    format!(
+        r#"<details class="lang-menu"><summary class="topbar-link" title="{label}" aria-label="{current}"><span aria-hidden="true">🌐</span> <span translate="no">{name}</span></summary><nav class="lang-list" aria-label="{label}">{links}</nav></details>"#,
+        label = t(lang, "lang.label"),
+        current = tf(lang, "lang.current", &[("name", lang.native_name())]),
+        name = h(lang.native_name()),
+    )
+}
+
+/// Strings the page script needs, as JSON for a `<script type="application/json">`
+/// block (`<` escaped so the content cannot close the element). `{name}`
+/// placeholders are filled in by the script.
+fn script_strings(lang: Lang) -> String {
+    serde_json::json!({
+        "prev": tr(lang, "pager.prev", &[]),
+        "next": tr(lang, "pager.next", &[]),
+        "copied": tr(lang, "pem.copied", &[]),
+        "show": tr(lang, "pem.show", &[]),
+        "hide": tr(lang, "pem.hide", &[]),
+        "confirmLabel": tr(lang, "action.delete", &[]),
+        "renew": tr(lang, "action.renew", &[]),
+        "renewConfirm": tr(lang, "renew.confirm", &[]),
+    })
+    .to_string()
+    .replace('<', "\\u003c")
 }
 
 fn u(state: &Arc<AppState>, path: &str) -> String {
@@ -2258,31 +2931,46 @@ fn u(state: &Arc<AppState>, path: &str) -> String {
     format!("{base}/{path}")
 }
 
-/// Renders a consistent breadcrumb trail. Each item is a `(label, optional href)`;
-/// the item without an href is rendered as the current (non-clickable) page.
-fn breadcrumb(items: &[(String, Option<String>)]) -> String {
-    let mut out = String::from(r#"<nav class="crumbs" aria-label="breadcrumb">"#);
+/// Renders a consistent breadcrumb trail. Each item is a `(label, optional href)`
+/// with the label as escaped HTML (from `t`/`tf`); the item without an href is
+/// rendered as the current (non-clickable) page.
+fn breadcrumb(lang: Lang, items: &[(String, Option<String>)]) -> String {
+    let mut out = format!(
+        r#"<nav class="crumbs" aria-label="{}">"#,
+        t(lang, "crumb.aria")
+    );
     for (i, (label, href)) in items.iter().enumerate() {
         if i > 0 {
             out.push_str(r#"<span class="crumb-sep">›</span>"#);
         }
         match href {
-            Some(href) => out.push_str(&format!(r#"<a href="{}">{}</a>"#, href, h(label))),
-            None => out.push_str(&format!(
-                r#"<span class="crumb-current">{}</span>"#,
-                h(label)
-            )),
+            Some(href) => out.push_str(&format!(r#"<a href="{href}">{label}</a>"#)),
+            None => out.push_str(&format!(r#"<span class="crumb-current">{label}</span>"#)),
         }
     }
     out.push_str("</nav>");
     out
 }
 
-fn pem_panel(title: &str, pem: &str, sensitive: bool) -> String {
+/// A link showing its own URL, followed by a button that copies it.
+fn copyable_link(lang: Lang, url: &str) -> String {
     format!(
-        r#"<div class="panel pem-panel {}"><div class="pem-head"><strong>{}</strong><div class="pem-actions"><button type="button" class="btn btn-sm btn-outline-secondary" data-copy>Copy</button><button type="button" class="btn btn-sm btn-outline-secondary" data-toggle>Show</button></div></div><textarea class="form-control code pem-text" rows="12" spellcheck="false" readonly hidden>{}</textarea></div>"#,
+        r#"<a href="{}">{}</a> <button type="button" class="btn btn-sm btn-outline-secondary" data-copy="{}">{}</button>"#,
+        h(url),
+        h(url),
+        h(url),
+        t(lang, "pem.copy")
+    )
+}
+
+/// `title` is translated, already-escaped HTML.
+fn pem_panel(lang: Lang, title: &str, pem: &str, sensitive: bool) -> String {
+    format!(
+        r#"<div class="panel pem-panel {}"><div class="pem-head"><strong>{}</strong><div class="pem-actions"><button type="button" class="btn btn-sm btn-outline-secondary" data-copy>{}</button><button type="button" class="btn btn-sm btn-outline-secondary" data-toggle>{}</button></div></div><textarea class="form-control code pem-text" rows="12" spellcheck="false" readonly hidden>{}</textarea></div>"#,
         if sensitive { "sensitive" } else { "" },
-        h(title),
+        title,
+        t(lang, "pem.copy"),
+        t(lang, "pem.show"),
         h(pem)
     )
 }
@@ -2303,28 +2991,38 @@ impl ImportValues {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Translated, already-escaped labels for `import_form`.
+struct ImportLabels {
+    title: String,
+    help: String,
+    cert_label: String,
+    key_label: String,
+    submit: String,
+}
+
 fn import_form(
-    title: &str,
-    help: &str,
+    lang: Lang,
+    labels: ImportLabels,
     action: String,
     csrf: &str,
-    cert_label: &str,
-    key_label: &str,
-    submit: &str,
     values: &ImportValues,
     error: Option<&str>,
 ) -> String {
-    let title = h(title);
-    let help = h(help);
+    let ImportLabels {
+        title,
+        help,
+        cert_label,
+        key_label,
+        submit,
+    } = labels;
     let csrf = h(csrf);
-    let cert_label = h(cert_label);
-    let key_label = h(key_label);
-    let submit = h(submit);
     let cert_pem = h(&values.cert_pem);
     let key_pem = h(&values.key_pem);
     let password = h(&values.password);
-    let error = error.map(error_banner).unwrap_or_default();
+    let error = error.map(|e| error_banner(lang, e)).unwrap_or_default();
+    let password_label = t(lang, "field.pkcs12_password");
+    let password_placeholder = t(lang, "import.password_placeholder");
+    let password_hint = t(lang, "import.password_hint");
     format!(
         r#"<div class="page-head"><h1>{title}</h1><p class="muted">{help}</p></div>
 <form method="post" action="{action}" class="import-form">
@@ -2339,9 +3037,9 @@ fn import_form(
       <textarea id="key_pem" class="form-control code large-pem" name="key_pem" rows="14" spellcheck="false" placeholder="-----BEGIN PRIVATE KEY-----" required>{key_pem}</textarea>
     </div>
     <div class="field field-narrow">
-      <label for="password">PKCS12 Password</label>
-      <input id="password" class="form-control" name="password" value="{password}" placeholder="leave blank for a random password">
-      <span class="hint">Sets the password for the generated PKCS12 bundle. Leave blank and a strong random password is generated for you (downloadable afterwards) — it is never a fixed default.</span>
+      <label for="password">{password_label}</label>
+      <input id="password" class="form-control" name="password" value="{password}" placeholder="{password_placeholder}">
+      <span class="hint">{password_hint}</span>
     </div>
     <div class="form-actions">
       <button class="btn btn-primary btn-lg">{submit}</button>
@@ -2352,42 +3050,44 @@ fn import_form(
     )
 }
 
-fn ca_artifact_cards(state: &Arc<AppState>, ca_id: &str) -> String {
+fn ca_artifact_cards(state: &Arc<AppState>, lang: Lang, ca_id: &str) -> String {
     [
-        ("CA Certificate", "PEM", "cert"),
-        ("Private Key", "Secret", "key"),
-        ("PKCS12", "Bundle", "pkcs12"),
-        ("Password", "Secret", "password"),
+        (t(lang, "artifact.ca_cert"), t(lang, "artifact.kind_pem"), "cert"),
+        (t(lang, "artifact.private_key"), t(lang, "artifact.kind_secret"), "key"),
+        (t(lang, "artifact.pkcs12"), t(lang, "artifact.kind_bundle"), "pkcs12"),
+        (t(lang, "artifact.password"), t(lang, "artifact.kind_secret"), "password"),
     ]
     .iter()
     .map(|(title, label, kind)| {
         format!(
-            r#"<div class="artifact"><strong>{}</strong><span>{}</span><a class="btn btn-sm btn-outline-primary" href="{}">Download</a></div>"#,
-            h(title),
-            h(label),
-            u(state, &format!("/download/ca/{ca_id}/{kind}"))
+            r#"<div class="artifact"><strong>{}</strong><span>{}</span><a class="btn btn-sm btn-outline-primary" href="{}">{}</a></div>"#,
+            title,
+            label,
+            u(state, &format!("/download/ca/{ca_id}/{kind}")),
+            t(lang, "action.download")
         )
     })
     .collect::<Vec<_>>()
     .join("")
 }
 
-fn cert_artifact_cards(state: &Arc<AppState>, ca_id: &str, cert_id: &str) -> String {
+fn cert_artifact_cards(state: &Arc<AppState>, lang: Lang, ca_id: &str, cert_id: &str) -> String {
     [
-        ("Bundle", "ZIP", "bundle"),
-        ("Certificate", "PEM", "cert"),
-        ("Signing Request", "CSR", "csr"),
-        ("Private Key", "Secret", "key"),
-        ("PKCS12", "Bundle", "pkcs12"),
-        ("Password", "Secret", "password"),
+        (t(lang, "artifact.bundle"), t(lang, "artifact.kind_zip"), "bundle"),
+        (t(lang, "artifact.certificate"), t(lang, "artifact.kind_pem"), "cert"),
+        (t(lang, "artifact.csr"), t(lang, "artifact.kind_csr"), "csr"),
+        (t(lang, "artifact.private_key"), t(lang, "artifact.kind_secret"), "key"),
+        (t(lang, "artifact.pkcs12"), t(lang, "artifact.kind_bundle"), "pkcs12"),
+        (t(lang, "artifact.password"), t(lang, "artifact.kind_secret"), "password"),
     ]
     .iter()
     .map(|(title, label, kind)| {
         format!(
-            r#"<div class="artifact"><strong>{}</strong><span>{}</span><a class="btn btn-sm btn-outline-primary" href="{}">Download</a></div>"#,
-            h(title),
-            h(label),
-            u(state, &format!("/download/cert/{ca_id}/{cert_id}/{kind}"))
+            r#"<div class="artifact"><strong>{}</strong><span>{}</span><a class="btn btn-sm btn-outline-primary" href="{}">{}</a></div>"#,
+            title,
+            label,
+            u(state, &format!("/download/cert/{ca_id}/{cert_id}/{kind}")),
+            t(lang, "action.download")
         )
     })
     .collect::<Vec<_>>()
@@ -2480,6 +3180,48 @@ fn openapi_spec_json(base: &str) -> String {
         },
         "security": [{ "basicAuth": [] }],
         "paths": {
+            "/download/ca/{ca_id}/cert": {
+                "get": {
+                    "summary": "Download CA certificate (public)",
+                    "description": "Returns the CA certificate as PEM. No authentication; the CA private key, PKCS#12 and password downloads still require a login.",
+                    "security": [],
+                    "parameters": [
+                        { "name": "ca_id", "in": "path", "required": true, "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "CA certificate PEM", "content": { "application/octet-stream": { "schema": { "type": "string" } } } },
+                        "404": { "description": "Unknown or deleted CA" }
+                    }
+                }
+            },
+            "/{ca_id}/download": {
+                "get": {
+                    "summary": "Download CA certificate (public, short alias)",
+                    "description": "Alias of /download/ca/{ca_id}/cert.",
+                    "security": [],
+                    "parameters": [
+                        { "name": "ca_id", "in": "path", "required": true, "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "CA certificate PEM", "content": { "application/octet-stream": { "schema": { "type": "string" } } } },
+                        "404": { "description": "Unknown or deleted CA" }
+                    }
+                }
+            },
+            "/crl/{ca_id}": {
+                "get": {
+                    "summary": "Download CRL (public)",
+                    "description": "Returns the CA's DER-encoded certificate revocation list. No authentication.",
+                    "security": [],
+                    "parameters": [
+                        { "name": "ca_id", "in": "path", "required": true, "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "DER CRL", "content": { "application/pkix-crl": { "schema": { "type": "string", "format": "binary" } } } },
+                        "404": { "description": "Unknown CA, or CRL disabled or not generated" }
+                    }
+                }
+            },
             "/api/csrf": {
                 "get": {
                     "summary": "Get CSRF token",
@@ -2517,6 +3259,20 @@ fn openapi_spec_json(base: &str) -> String {
                     "security": [{ "basicAuth": [] }, { "csrfToken": [] }],
                     "parameters": [{ "name": "ca_id", "in": "path", "required": true, "schema": { "type": "string" } }],
                     "responses": { "200": { "description": "Deleted" } }
+                }
+            },
+            "/api/cas/{ca_id}/renew/{days}": {
+                "post": {
+                    "summary": "Renew self-signed CA certificate (same key and subject, new serial and validity)",
+                    "security": [{ "basicAuth": [] }, { "csrfToken": [] }],
+                    "parameters": [
+                        { "name": "ca_id", "in": "path", "required": true, "schema": { "type": "string" } },
+                        { "name": "days", "in": "path", "required": true, "schema": { "type": "integer", "minimum": 1, "maximum": 7350 } }
+                    ],
+                    "responses": {
+                        "200": { "description": "Renewed certificate authority" },
+                        "400": { "description": "Invalid days, expiry not extended, or not a self-signed CA" }
+                    }
                 }
             },
             "/api/cas/{ca_id}/certs": {
@@ -2623,9 +3379,9 @@ fn openapi_spec_json(base: &str) -> String {
 /// Condenses verbose `openssl x509 -purpose` output into a few human-readable
 /// badges covering the things that actually matter for a CA: whether it is a CA
 /// and which key usages (server/client auth, S/MIME) it is good for.
-fn purpose_badges(purposes: &[(String, String)]) -> String {
+fn purpose_badges(lang: Lang, purposes: &[(String, String)]) -> String {
     if purposes.is_empty() {
-        return r#"<span class="muted">Unknown</span>"#.to_string();
+        return format!(r#"<span class="muted">{}</span>"#, t(lang, "common.unknown"));
     }
     let yes = |key: &str| {
         purposes
@@ -2635,27 +3391,28 @@ fn purpose_badges(purposes: &[(String, String)]) -> String {
     let is_ca = purposes
         .iter()
         .any(|(k, v)| k.to_lowercase().ends_with(" ca") && v.eq_ignore_ascii_case("Yes"));
-    let mut badges: Vec<(&str, &str)> = vec![if is_ca {
-        ("Certificate Authority", "badge-ca")
+    let mut badges: Vec<(String, &str)> = vec![if is_ca {
+        (t(lang, "badge.ca"), "badge-ca")
     } else {
-        ("End-entity", "badge-leaf")
+        (t(lang, "badge.end_entity"), "badge-leaf")
     }];
     if yes("SSL server") {
-        badges.push(("Server Auth", "badge-use"));
+        badges.push((t(lang, "badge.server_auth"), "badge-use"));
     }
     if yes("SSL client") {
-        badges.push(("Client Auth", "badge-use"));
+        badges.push((t(lang, "badge.client_auth"), "badge-use"));
     }
     if yes("S/MIME signing") || yes("S/MIME encryption") {
-        badges.push(("S/MIME", "badge-use"));
+        badges.push((t(lang, "badge.smime"), "badge-use"));
     }
     badges
         .iter()
-        .map(|(label, class)| format!(r#"<span class="badge-pill {}">{}</span>"#, class, h(label)))
+        .map(|(label, class)| format!(r#"<span class="badge-pill {class}">{label}</span>"#))
         .collect::<Vec<_>>()
         .join(" ")
 }
 
+/// `kind` is a translated, already-escaped label.
 fn san_badges(values: &[String], kind: &str) -> String {
     if values.is_empty() {
         return r#"<span class="muted">-</span>"#.to_string();
@@ -2665,7 +3422,7 @@ fn san_badges(values: &[String], kind: &str) -> String {
         .map(|value| {
             format!(
                 r#"<span class="san-badge"><span>{}</span>{}</span>"#,
-                h(kind),
+                kind,
                 h(value)
             )
         })
@@ -2681,8 +3438,8 @@ fn list_or_dash(values: &[String]) -> String {
     }
 }
 
-fn ca_key_label(profile: &str, digest_algorithm: &str) -> String {
-    let key = key_size_label(profile);
+fn ca_key_label(lang: Lang, profile: &str, digest_algorithm: &str) -> String {
+    let key = key_size_label(lang, profile);
     let digest = digest_algorithm.trim();
     if digest.is_empty() || digest.eq_ignore_ascii_case("imported") {
         key
@@ -2691,25 +3448,28 @@ fn ca_key_label(profile: &str, digest_algorithm: &str) -> String {
     }
 }
 
-fn key_size_label(profile: &str) -> String {
+fn key_size_label(lang: Lang, profile: &str) -> String {
     match profile.trim().to_ascii_lowercase().split_once(':') {
-        Some(("rsa", bits)) => format!("RSA {} bit", h(bits)),
-        Some(("ecdsa", "prime256v1")) => "ECDSA P-256".to_string(),
-        Some(("ecdsa", "secp384r1")) => "ECDSA P-384".to_string(),
-        Some(("ecdsa", "secp521r1")) => "ECDSA P-521".to_string(),
-        Some(("ecdsa", curve)) => format!("ECDSA {}", h(curve)),
+        Some(("rsa", bits)) => tf(lang, "key.rsa_bits", &[("bits", bits)]),
+        Some(("ecdsa", "prime256v1")) => tf(lang, "key.ecdsa", &[("curve", "P-256")]),
+        Some(("ecdsa", "secp384r1")) => tf(lang, "key.ecdsa", &[("curve", "P-384")]),
+        Some(("ecdsa", "secp521r1")) => tf(lang, "key.ecdsa", &[("curve", "P-521")]),
+        Some(("ecdsa", curve)) => tf(lang, "key.ecdsa", &[("curve", curve)]),
         Some((algorithm, attribute)) => format!("{} {}", h(algorithm), h(attribute)),
-        None => "Unknown".to_string(),
+        None => t(lang, "common.unknown"),
     }
 }
 
-fn validity_label(expiry_ms: i64) -> String {
+fn validity_label(lang: Lang, expiry_ms: i64) -> String {
     let date = date(expiry_ms);
     let now = chrono::Utc::now().timestamp_millis();
     let remaining_ms = expiry_ms - now;
     let (class, label) = if remaining_ms < 0 {
         let days = ((-remaining_ms) + 86_400_000 - 1) / 86_400_000;
-        ("validity-expired", format!("expired {days} day(s) ago"))
+        (
+            "validity-expired",
+            tf(lang, "validity.expired", &[("days", &days.to_string())]),
+        )
     } else {
         let days = (remaining_ms + 86_400_000 - 1) / 86_400_000;
         let class = if days <= 30 {
@@ -2718,9 +3478,9 @@ fn validity_label(expiry_ms: i64) -> String {
             "validity-ok"
         };
         let label = if days == 0 {
-            "expires today".to_string()
+            t(lang, "validity.today")
         } else {
-            format!("{days} day(s) left")
+            tf(lang, "validity.left", &[("days", &days.to_string())])
         };
         (class, label)
     };
@@ -2728,7 +3488,7 @@ fn validity_label(expiry_ms: i64) -> String {
         r#"<span class="validity"><span>{}</span><span class="validity-badge {}">{}</span></span>"#,
         h(&date),
         class,
-        h(&label)
+        label
     )
 }
 
@@ -2738,15 +3498,13 @@ fn date(ms: i64) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn h(input: &str) -> String {
+pub(crate) fn h(input: &str) -> String {
     input
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
 }
-
-const MODAL: &str = r#"<div id="confirm-modal" class="modal-backdrop" hidden><div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><h3 id="confirm-title">Please confirm</h3><p id="confirm-message"></p><div class="modal-actions"><button type="button" class="btn btn-outline-secondary" id="confirm-cancel">Cancel</button><button type="button" class="btn btn-danger" id="confirm-ok">Confirm</button></div></div></div>"#;
 
 const CSS: &str = r#"
 body{background:#f6f7f9;color:#172033;font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif}
@@ -2862,10 +3620,31 @@ label .form-control,label .form-select,textarea{margin-top:6px}
 .modal-card h3{margin:0 0 10px;font-size:20px}
 .modal-card p{margin:0 0 20px;color:#374151}
 .modal-actions{display:flex;justify-content:flex-end;gap:10px}
+.lang-menu{position:relative}
+.lang-menu summary{list-style:none;cursor:pointer;user-select:none;white-space:nowrap}
+.lang-menu summary::-webkit-details-marker{display:none}
+.lang-list{position:absolute;inset-inline-end:0;top:calc(100% + 6px);z-index:1080;background:#fff;border:1px solid #dde2ea;border-radius:8px;box-shadow:0 12px 32px rgba(15,23,42,.14);padding:6px;display:grid;gap:2px;min-width:170px}
+.lang-option{padding:7px 12px;border-radius:6px;color:#263244;text-decoration:none;font-weight:600}
+.lang-option:hover{background:#f3f6fb;color:#172033}
+.lang-option.active{background:#eaf0ff;color:#1d4ed8}
+[dir=rtl] .admin-menu .tab-btn{text-align:right}
+[dir=rtl] .inline{margin-left:0;margin-right:6px}
 @media(max-width:760px){.toolbar{display:block}.grid2{grid-template-columns:1fr}.grid3{grid-template-columns:1fr}.actions{margin-top:12px}.topbar{padding:12px 18px}.crumbs{font-size:17px}.meta{grid-template-columns:1fr}.section-head{display:block}.admin-shell{grid-template-columns:1fr}.admin-menu{position:static;grid-template-columns:repeat(2,minmax(0,1fr))}.admin-menu .tab-btn{text-align:center}.nuke-row{display:block}.nuke-row form{margin-top:12px}}
 "#;
 
 const JS: &str = r#"
+// Translated strings for this script, rendered by the server into the page.
+const I18N = JSON.parse(document.getElementById('minica-i18n').textContent);
+const fmt = (template, args) => template.replace(/\{(\w+)\}/g, (m, k) => (k in args ? args[k] : m));
+
+// Language links return to the current page (the server only accepts a
+// same-origin path under the base path; without JS it uses the Referer).
+document.querySelectorAll('[data-lang-link]').forEach((link) => {
+  const url = new URL(link.href, location.href);
+  url.searchParams.set('return', location.pathname + location.search + location.hash);
+  link.href = url.toString();
+});
+
 document.querySelectorAll('.paged-table').forEach((table) => {
   const size = Number(table.dataset.pageSize || 10);
   const rows = Array.from(table.querySelectorAll('tbody tr'));
@@ -2878,7 +3657,7 @@ document.querySelectorAll('.paged-table').forEach((table) => {
     pager.innerHTML = '';
     const prev = document.createElement('button');
     prev.className = 'btn btn-sm btn-outline-secondary';
-    prev.textContent = 'Prev';
+    prev.textContent = I18N.prev;
     prev.disabled = page === 0;
     prev.onclick = () => { page -= 1; render(); };
     const label = document.createElement('span');
@@ -2886,7 +3665,7 @@ document.querySelectorAll('.paged-table').forEach((table) => {
     label.textContent = `${page + 1} / ${pages}`;
     const next = document.createElement('button');
     next.className = 'btn btn-sm btn-outline-secondary';
-    next.textContent = 'Next';
+    next.textContent = I18N.next;
     next.disabled = page + 1 >= pages;
     next.onclick = () => { page += 1; render(); };
     pager.append(prev, label, next);
@@ -2920,14 +3699,15 @@ document.querySelectorAll('.tabs').forEach((bar) => {
   if (hash) activate(hash);
 });
 
-// Copy a PEM panel's contents to the clipboard without needing to reveal it.
+// Copy a PEM panel's contents (or a button's own data-copy value, e.g. a
+// public URL) to the clipboard without needing to reveal it.
 document.querySelectorAll('[data-copy]').forEach((btn) => {
   btn.addEventListener('click', () => {
-    const text = btn.closest('.pem-panel')?.querySelector('.pem-text');
+    const text = btn.dataset.copy || btn.closest('.pem-panel')?.querySelector('.pem-text')?.value;
     if (!text) return;
-    navigator.clipboard.writeText(text.value).then(() => {
+    navigator.clipboard.writeText(text).then(() => {
       const original = btn.textContent;
-      btn.textContent = 'Copied';
+      btn.textContent = I18N.copied;
       setTimeout(() => { btn.textContent = original; }, 1500);
     });
   });
@@ -2939,7 +3719,7 @@ document.querySelectorAll('[data-toggle]').forEach((btn) => {
     const text = btn.closest('.pem-panel')?.querySelector('.pem-text');
     if (!text) return;
     text.hidden = !text.hidden;
-    btn.textContent = text.hidden ? 'Show' : 'Hide';
+    btn.textContent = text.hidden ? I18N.show : I18N.hide;
   });
 });
 
@@ -2974,7 +3754,7 @@ document.querySelectorAll('[data-toggle]').forEach((btn) => {
     btn.addEventListener('click', (e) => {
       e.preventDefault();
       pendingForm = btn.closest('form');
-      open(btn.dataset.confirm, btn.dataset.confirmLabel || 'Delete', btn.dataset.confirmClass || 'btn-danger');
+      open(btn.dataset.confirm, btn.dataset.confirmLabel || I18N.confirmLabel, btn.dataset.confirmClass || 'btn-danger');
     });
   });
 
@@ -2986,7 +3766,7 @@ document.querySelectorAll('[data-toggle]').forEach((btn) => {
       const days = parseInt((form.querySelector('[name=days]') || {}).value || '0', 10);
       const expiry = new Date(Date.now() + days * 86400000).toISOString().slice(0, 10);
       pendingForm = form;
-      open(`Renew this certificate for ${days} day(s)? The new expiry will be ${expiry}.`, 'Renew', 'btn-warning');
+      open(fmt(I18N.renewConfirm, { what: btn.dataset.renew || '', days, expiry }), I18N.renew, 'btn-warning');
     });
   });
 })();
@@ -3124,5 +3904,24 @@ mod error_mapping_tests {
             "missing or empty Remote-User request header",
         );
         assert!(!without.headers().contains_key(header::WWW_AUTHENTICATE));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openapi_documents_public_downloads_without_auth() {
+        let spec: serde_json::Value =
+            serde_json::from_str(&openapi_spec_json("/minica")).expect("valid spec JSON");
+        for path in ["/download/ca/{ca_id}/cert", "/{ca_id}/download", "/crl/{ca_id}"] {
+            let get = &spec["paths"][path]["get"];
+            assert!(get.is_object(), "{path} documented");
+            assert_eq!(get["security"], serde_json::json!([]), "{path} needs no auth");
+            assert!(get["responses"]["404"].is_object(), "{path} documents 404");
+        }
+        // Everything else keeps the global Basic-auth requirement.
+        assert_eq!(spec["security"], serde_json::json!([{ "basicAuth": [] }]));
     }
 }

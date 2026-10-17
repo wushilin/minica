@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod db;
+mod i18n;
 mod logging;
 mod models;
 mod openssl;
@@ -342,6 +343,10 @@ mod tests {
         }
 
         fn with_auth_and_base(auth: config::AuthConfig, base_path: &str) -> Self {
+            Self::with_options(auth, base_path, false)
+        }
+
+        fn with_options(auth: config::AuthConfig, base_path: &str, secure_cookies: bool) -> Self {
             let root = std::env::temp_dir().join(format!("minica-rust-test-{}", Uuid::new_v4()));
             fs::create_dir_all(root.join("runtime")).expect("create test runtime");
             fs::create_dir_all(root.join("openssl-work")).expect("create openssl work root");
@@ -351,7 +356,7 @@ mod tests {
                     host: "127.0.0.1".to_string(),
                     port: 0,
                     base_path: base_path.to_string(),
-                    secure_cookies: false,
+                    secure_cookies,
                 },
                 public_base_url: Some("http://localhost/minica".to_string()),
                 crl: config::CrlConfig::default(),
@@ -2079,6 +2084,931 @@ mod tests {
         assert_pem(
             cert["key_pem"].as_str().unwrap().as_bytes(),
             "BEGIN PRIVATE KEY",
+        );
+    }
+
+    async fn create_test_ca(env: &TestEnv, csrf: &Csrf, common_name: &str) -> Value {
+        let response = env
+            .json(
+                "PUT",
+                "/minica/api/cas",
+                Some(("admin", "adminpass")),
+                Some(csrf),
+                ecdsa_ca_payload(common_name),
+            )
+            .await;
+        response.assert_status(StatusCode::OK);
+        response.json()
+    }
+
+    #[tokio::test]
+    async fn ca_certificate_is_public_but_key_material_is_not() {
+        let env = TestEnv::new();
+        let csrf = env.get_csrf().await;
+        let ca = create_test_ca(&env, &csrf, "public.lifecycle.test").await;
+        let ca_id = ca["id"].as_str().unwrap().to_string();
+        let cert_pem = ca["cert_pem"].as_str().unwrap().to_string();
+
+        for uri in [
+            format!("/minica/download/ca/{ca_id}/cert"),
+            format!("/minica/{ca_id}/download"),
+        ] {
+            let response = env.send("GET", &uri, None, None, None, Body::empty()).await;
+            response.assert_status(StatusCode::OK);
+            assert_eq!(response.text(), cert_pem, "{uri}");
+            assert!(!response.headers.contains_key(header::WWW_AUTHENTICATE));
+            assert!(!response.headers.contains_key(header::SET_COOKIE));
+            assert!(
+                response
+                    .header(header::CONTENT_DISPOSITION)
+                    .contains(&format!("ca-{ca_id}-cert.pem"))
+            );
+        }
+        // Key material keeps requiring a viewer.
+        for kind in ["key", "pkcs12", "password", "other"] {
+            let uri = format!("/minica/download/ca/{ca_id}/{kind}");
+            let response = env.send("GET", &uri, None, None, None, Body::empty()).await;
+            response.assert_status(StatusCode::UNAUTHORIZED);
+            assert!(response.headers.contains_key(header::WWW_AUTHENTICATE));
+        }
+        assert_download(
+            &env,
+            format!("/minica/download/ca/{ca_id}/key"),
+            StatusCode::OK,
+            |body| assert_pem(body, "PRIVATE KEY"),
+        )
+        .await;
+
+        // Unknown ids are a plain 404, never an auth challenge.
+        for uri in [
+            "/minica/download/ca/nope/cert",
+            "/minica/nope/download",
+            "/minica/Authorization/download",
+            "/minica/crl/nope",
+            "/minica/crl/Authorization",
+        ] {
+            let response = env.send("GET", uri, None, None, None, Body::empty()).await;
+            response.assert_status(StatusCode::NOT_FOUND);
+            assert!(!response.headers.contains_key(header::WWW_AUTHENTICATE));
+            assert!(!response.text().contains("nope"));
+        }
+
+        // The alias does not shadow other routes.
+        let crl = env
+            .send(
+                "GET",
+                &format!("/minica/crl/{ca_id}"),
+                None,
+                None,
+                None,
+                Body::empty(),
+            )
+            .await;
+        crl.assert_status(StatusCode::OK);
+        assert_eq!(crl.header(header::CONTENT_TYPE), "application/pkix-crl");
+        for uri in [
+            "/minica/cas/new",
+            "/minica/admin",
+            &format!("/minica/cas/{ca_id}"),
+        ] {
+            let response = env.send("GET", uri, None, None, None, Body::empty()).await;
+            response.assert_status(StatusCode::UNAUTHORIZED);
+        }
+        let viewer_detail = env
+            .send(
+                "GET",
+                &format!("/minica/cas/{ca_id}"),
+                Some(("viewer", "viewerpass")),
+                None,
+                None,
+                Body::empty(),
+            )
+            .await;
+        viewer_detail.assert_status(StatusCode::OK);
+        let detail = viewer_detail.text();
+        assert!(
+            detail.contains(&format!("http://localhost/minica/{ca_id}/download")),
+            "public URL shown on the CA page"
+        );
+        assert!(
+            detail.contains(&format!("http://localhost/minica/download/ca/{ca_id}/cert")),
+            "long-form public URL shown on the CA page"
+        );
+        assert!(
+            detail.contains(&format!(r#"data-copy="http://localhost/minica/{ca_id}/download""#)),
+            "public URL has a copy button"
+        );
+        assert!(!detail.contains("/renew\""), "viewers get no renew form");
+        let admin_page = env
+            .send(
+                "GET",
+                "/minica/admin",
+                Some(("admin", "adminpass")),
+                None,
+                None,
+                Body::empty(),
+            )
+            .await;
+        admin_page.assert_status(StatusCode::OK);
+        let api_alias = env
+            .send(
+                "GET",
+                &format!("/minica/api/cas/{ca_id}/download"),
+                Some(("viewer", "viewerpass")),
+                None,
+                None,
+                Body::empty(),
+            )
+            .await;
+        api_alias.assert_status(StatusCode::NOT_FOUND);
+        assert_eq!(api_alias.api_envelope()["error"]["code"], "not_found");
+        let api_download = env
+            .send(
+                "GET",
+                "/minica/api/download",
+                None,
+                None,
+                None,
+                Body::empty(),
+            )
+            .await;
+        api_download.assert_status(StatusCode::NOT_FOUND);
+        api_download.api_envelope();
+
+        // A soft-deleted CA is no longer published.
+        env.json(
+            "DELETE",
+            &format!("/minica/api/cas/{ca_id}"),
+            Some(("admin", "adminpass")),
+            Some(&csrf),
+            json!({}),
+        )
+        .await
+        .assert_status(StatusCode::OK);
+        for uri in [
+            format!("/minica/download/ca/{ca_id}/cert"),
+            format!("/minica/{ca_id}/download"),
+        ] {
+            let response = env.send("GET", &uri, None, None, None, Body::empty()).await;
+            response.assert_status(StatusCode::NOT_FOUND);
+        }
+    }
+
+    #[tokio::test]
+    async fn ca_renewal_via_api_and_form_is_admin_only() {
+        let env = TestEnv::new();
+        let csrf = env.get_csrf().await;
+        let ca = create_test_ca(&env, &csrf, "renew.lifecycle.test").await;
+        let ca_id = ca["id"].as_str().unwrap().to_string();
+        let uri = format!("/minica/api/cas/{ca_id}/renew/400");
+
+        let viewer = env
+            .json(
+                "POST",
+                &uri,
+                Some(("viewer", "viewerpass")),
+                Some(&csrf),
+                json!({}),
+            )
+            .await;
+        viewer.assert_status(StatusCode::FORBIDDEN);
+        let no_csrf = env
+            .json("POST", &uri, Some(("admin", "adminpass")), None, json!({}))
+            .await;
+        no_csrf.assert_status(StatusCode::BAD_REQUEST);
+        assert_eq!(no_csrf.api_envelope()["error"]["code"], "csrf_invalid");
+        let bad_days = env
+            .json(
+                "POST",
+                &format!("/minica/api/cas/{ca_id}/renew/abc"),
+                Some(("admin", "adminpass")),
+                Some(&csrf),
+                json!({}),
+            )
+            .await;
+        bad_days.assert_status(StatusCode::BAD_REQUEST);
+        let not_longer = env
+            .json(
+                "POST",
+                &format!("/minica/api/cas/{ca_id}/renew/5"),
+                Some(("admin", "adminpass")),
+                Some(&csrf),
+                json!({}),
+            )
+            .await;
+        not_longer.assert_status(StatusCode::BAD_REQUEST);
+        let get = env
+            .send(
+                "GET",
+                &uri,
+                Some(("admin", "adminpass")),
+                None,
+                None,
+                Body::empty(),
+            )
+            .await;
+        get.assert_status(StatusCode::METHOD_NOT_ALLOWED);
+
+        let renewed = env
+            .json(
+                "POST",
+                &uri,
+                Some(("admin", "adminpass")),
+                Some(&csrf),
+                json!({}),
+            )
+            .await;
+        renewed.assert_status(StatusCode::OK);
+        let renewed = renewed.json();
+        assert_eq!(renewed["id"], ca_id);
+        assert_eq!(renewed["valid_days"], 400);
+        assert_ne!(renewed["cert_pem"], ca["cert_pem"]);
+        let public = env
+            .send(
+                "GET",
+                &format!("/minica/{ca_id}/download"),
+                None,
+                None,
+                None,
+                Body::empty(),
+            )
+            .await;
+        public.assert_status(StatusCode::OK);
+        assert_eq!(public.text(), renewed["cert_pem"].as_str().unwrap());
+
+        // The admin CA page offers the renew form; the form route works too.
+        let page = env
+            .send(
+                "GET",
+                &format!("/minica/cas/{ca_id}"),
+                Some(("admin", "adminpass")),
+                None,
+                None,
+                Body::empty(),
+            )
+            .await;
+        page.assert_status(StatusCode::OK);
+        assert!(page.text().contains(&format!("/minica/cas/{ca_id}/renew")));
+        let form_body = format!("_csrf={}&days=500", csrf.token);
+        let viewer_form = env
+            .send(
+                "POST",
+                &format!("/minica/cas/{ca_id}/renew"),
+                Some(("viewer", "viewerpass")),
+                Some(&csrf),
+                Some("application/x-www-form-urlencoded"),
+                Body::from(form_body.clone()),
+            )
+            .await;
+        viewer_form.assert_status(StatusCode::FORBIDDEN);
+        let form = env
+            .send(
+                "POST",
+                &format!("/minica/cas/{ca_id}/renew"),
+                Some(("admin", "adminpass")),
+                Some(&csrf),
+                Some("application/x-www-form-urlencoded"),
+                Body::from(form_body),
+            )
+            .await;
+        form.assert_status(StatusCode::SEE_OTHER);
+        assert_eq!(
+            form.header(header::LOCATION),
+            format!("/minica/cas/{ca_id}")
+        );
+        assert!(form.header(header::SET_COOKIE).contains("minica_flash"));
+        let after = env
+            .send(
+                "GET",
+                &format!("/minica/api/cas/{ca_id}"),
+                Some(("viewer", "viewerpass")),
+                None,
+                None,
+                Body::empty(),
+            )
+            .await;
+        assert_eq!(after.json()["valid_days"], 500);
+
+        let swagger = env
+            .send(
+                "GET",
+                "/minica/swagger",
+                Some(("admin", "adminpass")),
+                None,
+                None,
+                Body::empty(),
+            )
+            .await;
+        swagger.assert_status(StatusCode::OK);
+        assert!(swagger.text().contains("/api/cas/{ca_id}/renew/{days}"));
+    }
+
+    /// Minimal `application/x-www-form-urlencoded` encoding for test bodies.
+    fn form_encode(value: &str) -> String {
+        value
+            .bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
+    }
+
+    fn set_cookies(response: &TestResponse) -> Vec<String> {
+        response
+            .headers
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(str::to_string))
+            .collect()
+    }
+
+    fn lang_cookie(response: &TestResponse) -> Option<String> {
+        set_cookies(response)
+            .into_iter()
+            .find(|c| c.starts_with("minica_lang="))
+    }
+
+    #[tokio::test]
+    async fn language_switch_sets_a_long_lived_cookie_and_redirects_safely() {
+        let env = TestEnv::new();
+
+        // No auth needed; the cookie is scoped like the CSRF cookie but Lax.
+        let switch = env
+            .request_with_headers("GET", "/minica/lang/de?return=/minica/admin%23x", &[])
+            .await;
+        switch.assert_status(StatusCode::SEE_OTHER);
+        assert_eq!(switch.header(header::LOCATION), "/minica/admin#x");
+        let cookie = lang_cookie(&switch).expect("language cookie");
+        assert_eq!(
+            cookie,
+            "minica_lang=de; Max-Age=34560000; Path=/minica; SameSite=Lax; HttpOnly"
+        );
+
+        // Open redirects and paths outside the base path fall back to home.
+        for target in [
+            "//evil.example/x",
+            "/\\evil.example",
+            "https://evil.example/minica",
+            "/other",
+            "/minicax",
+            "/minica/lang/fr",
+            "minica/cas",
+        ] {
+            let uri = format!("/minica/lang/ja?return={}", form_encode(target));
+            let response = env.request_with_headers("GET", &uri, &[]).await;
+            response.assert_status(StatusCode::SEE_OTHER);
+            assert_eq!(response.header(header::LOCATION), "/minica/cas", "{target}");
+        }
+
+        // Referer is used only when same-origin.
+        let same = env
+            .request_with_headers(
+                "GET",
+                "/minica/lang/fr",
+                &[
+                    ("host", "ca.example:8443"),
+                    ("referer", "https://ca.example:8443/minica/inspect?a=1"),
+                ],
+            )
+            .await;
+        assert_eq!(same.header(header::LOCATION), "/minica/inspect?a=1");
+        for referer in [
+            "https://evil.example/minica/inspect",
+            "https://ca.example:8443.evil.example/minica/inspect",
+            "https://ca.example:8443@evil.example/minica/inspect",
+        ] {
+            let response = env
+                .request_with_headers(
+                    "GET",
+                    "/minica/lang/fr",
+                    &[("host", "ca.example:8443"), ("referer", referer)],
+                )
+                .await;
+            assert_eq!(response.header(header::LOCATION), "/minica/cas", "{referer}");
+        }
+
+        // Unknown codes are rejected and set nothing.
+        let unknown = env
+            .request_with_headers("GET", "/minica/lang/xx", &[])
+            .await;
+        unknown.assert_status(StatusCode::BAD_REQUEST);
+        assert!(lang_cookie(&unknown).is_none());
+        assert!(unknown.text().contains(r#"<html lang="en" dir="ltr">"#));
+
+        let auth = basic_auth("admin", "adminpass");
+        // Default: English, and no language cookie is invented.
+        let plain = env
+            .request_with_headers("GET", "/minica/cas", &[("authorization", &auth)])
+            .await;
+        plain.assert_status(StatusCode::OK);
+        assert!(plain.text().contains(r#"<html lang="en" dir="ltr">"#));
+        assert!(plain.text().contains("Certificate Authorities"));
+        assert!(lang_cookie(&plain).is_none());
+
+        // Accept-Language picks the best match.
+        let ja = env
+            .request_with_headers(
+                "GET",
+                "/minica/cas",
+                &[("authorization", &auth), ("accept-language", "xx, ja;q=0.8, en;q=0.5")],
+            )
+            .await;
+        assert!(ja.text().contains(r#"<html lang="ja" dir="ltr">"#));
+        assert!(lang_cookie(&ja).is_none());
+        let hant = env
+            .request_with_headers(
+                "GET",
+                "/minica/cas",
+                &[("authorization", &auth), ("accept-language", "zh-HK")],
+            )
+            .await;
+        assert!(hant.text().contains(r#"<html lang="zh-TW""#));
+
+        // The cookie wins over the header and is refreshed on every page,
+        // including error pages.
+        let cookie_page = env
+            .request_with_headers(
+                "GET",
+                "/minica/cas",
+                &[
+                    ("authorization", &auth),
+                    ("accept-language", "ja"),
+                    ("cookie", "minica_lang=ar"),
+                ],
+            )
+            .await;
+        assert!(cookie_page.text().contains(r#"<html lang="ar" dir="rtl">"#));
+        assert!(
+            lang_cookie(&cookie_page)
+                .is_some_and(|c| c.starts_with("minica_lang=ar; Max-Age=34560000;"))
+        );
+        let unauthorized = env
+            .request_with_headers("GET", "/minica/cas", &[("cookie", "minica_lang=de")])
+            .await;
+        unauthorized.assert_status(StatusCode::UNAUTHORIZED);
+        assert!(unauthorized.text().contains(r#"<html lang="de""#));
+        assert!(lang_cookie(&unauthorized).is_some());
+        // An invalid cookie value is ignored, never echoed.
+        let bad = env
+            .request_with_headers(
+                "GET",
+                "/minica/cas",
+                &[("authorization", &auth), ("cookie", "minica_lang=evil; x=1")],
+            )
+            .await;
+        assert!(bad.text().contains(r#"<html lang="en""#));
+        assert!(lang_cookie(&bad).is_none());
+
+        // The switcher is on every page, each language in its own name.
+        for name in ["日本語", "Deutsch", "العربية", "繁體中文", "हिन्दी"] {
+            assert!(plain.text().contains(name), "{name}");
+        }
+        assert!(plain.text().contains(r#"href="/minica/lang/zh-CN""#));
+        assert!(!plain.text().contains("/lang/qps"));
+
+        // API errors stay English regardless of the language.
+        let api = env
+            .request_with_headers("GET", "/minica/api/cas", &[("cookie", "minica_lang=de")])
+            .await;
+        api.assert_status(StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            api.api_envelope()["error"]["message"],
+            "missing Authorization header"
+        );
+
+        // Secure cookies follow server.secure_cookies.
+        let secure_env = TestEnv::with_options(
+            config::AuthConfig {
+                users: Some(basic_users()),
+                headers: None,
+            },
+            "/minica",
+            true,
+        );
+        let secure = secure_env
+            .request_with_headers("GET", "/minica/lang/de", &[])
+            .await;
+        assert!(lang_cookie(&secure).is_some_and(|c| c.ends_with("SameSite=Lax; Secure; HttpOnly")));
+    }
+
+    /// Fixture data for the rendered-page language tests.
+    struct PageFixture {
+        ca_id: String,
+        cert_id: String,
+        ca_pem: String,
+        /// Values the fixture created that appear verbatim in pages
+        /// (ids, subjects, URLs, digest names); stripped by the
+        /// untranslated-text guard.
+        data: Vec<String>,
+    }
+
+    /// Creates letter-free fixture data: a CA, a cert, a DB user, plus a
+    /// deleted CA and cert so the admin console renders every table.
+    async fn page_fixture(env: &TestEnv, csrf: &Csrf) -> PageFixture {
+        let admin = Some(("admin", "adminpass"));
+        let ca = env
+            .json("PUT", "/minica/api/cas", admin, Some(csrf), ca_payload("1.2.3"))
+            .await;
+        ca.assert_status(StatusCode::OK);
+        let ca = ca.json();
+        let ca_id = ca["id"].as_str().unwrap().to_string();
+        let mut cert_body = cert_payload("4.5.6");
+        cert_body["dns_list"] = json!([]);
+        cert_body["ip_list"] = json!(["10.0.0.1"]);
+        let cert = env
+            .json(
+                "PUT",
+                &format!("/minica/api/cas/{ca_id}/certs"),
+                admin,
+                Some(csrf),
+                cert_body.clone(),
+            )
+            .await;
+        cert.assert_status(StatusCode::OK);
+        let cert = cert.json();
+        let cert_id = cert["id"].as_str().unwrap().to_string();
+        let deleted_cert = env
+            .json(
+                "PUT",
+                &format!("/minica/api/cas/{ca_id}/certs"),
+                admin,
+                Some(csrf),
+                {
+                    let mut body = cert_body;
+                    body["common_name"] = json!("7.8.9");
+                    body
+                },
+            )
+            .await
+            .json();
+        let deleted_ca = env
+            .json("PUT", "/minica/api/cas", admin, Some(csrf), ca_payload("9.9.9"))
+            .await
+            .json();
+        for uri in [
+            format!(
+                "/minica/api/cas/{ca_id}/certs/{}",
+                deleted_cert["id"].as_str().unwrap()
+            ),
+            format!("/minica/api/cas/{}", deleted_ca["id"].as_str().unwrap()),
+        ] {
+            env.json("DELETE", &uri, admin, Some(csrf), json!({}))
+                .await
+                .assert_status(StatusCode::OK);
+        }
+        env.send(
+            "POST",
+            "/minica/admin/users",
+            admin,
+            Some(csrf),
+            Some("application/x-www-form-urlencoded"),
+            Body::from(format!(
+                "_csrf={}&username=123456&password=123456789&role=viewer",
+                csrf.token
+            )),
+        )
+        .await
+        .assert_status(StatusCode::SEE_OTHER);
+
+        let mut data = Vec::new();
+        for value in [&ca, &cert, &deleted_cert, &deleted_ca] {
+            for field in ["id", "subject", "crl_url"] {
+                if let Some(text) = value[field].as_str() {
+                    data.push(text.to_string());
+                }
+            }
+        }
+        data.push(format!("http://localhost/minica/{ca_id}/download"));
+        data.push(format!("http://localhost/minica/download/ca/{ca_id}/cert"));
+        data.push("sha256".to_string());
+        PageFixture {
+            ca_id,
+            cert_id,
+            ca_pem: ca["cert_pem"].as_str().unwrap().to_string(),
+            data,
+        }
+    }
+
+    /// Renders every major HTML page in `code` and returns
+    /// `(page name, expected status, response)`.
+    async fn render_pages(
+        env: &TestEnv,
+        csrf: &Csrf,
+        fixture: &PageFixture,
+        code: &str,
+    ) -> Vec<(String, StatusCode, TestResponse)> {
+        let auth = basic_auth("admin", "adminpass");
+        let cookie = format!("{}; minica_lang={code}", csrf.cookie);
+        let (ca, cert) = (&fixture.ca_id, &fixture.cert_id);
+        let get = |uri: String| {
+            let (auth, cookie) = (auth.clone(), cookie.clone());
+            async move {
+                env.request_with_headers(
+                    "GET",
+                    &uri,
+                    &[("authorization", &auth), ("cookie", &cookie)],
+                )
+                .await
+            }
+        };
+        let post = |uri: String, body: String, cookie: String| {
+            let auth = auth.clone();
+            async move {
+                let response = env
+                    .app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header(header::AUTHORIZATION, auth)
+                            .header(header::COOKIE, cookie)
+                            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                            .body(Body::from(body))
+                            .expect("build request"),
+                    )
+                    .await
+                    .expect("route request");
+                TestResponse::from_response(response).await
+            }
+        };
+        let mut pages = Vec::new();
+        for (name, uri) in [
+            ("ca list", "/minica/cas".to_string()),
+            ("new ca", "/minica/cas/new".to_string()),
+            ("import ca", "/minica/cas/import".to_string()),
+            ("ca detail", format!("/minica/cas/{ca}")),
+            ("new cert", format!("/minica/cas/{ca}/certs/new")),
+            ("import cert", format!("/minica/cas/{ca}/certs/import")),
+            ("cert detail", format!("/minica/cas/{ca}/certs/{cert}")),
+            ("inspect", "/minica/inspect".to_string()),
+            ("admin console", "/minica/admin".to_string()),
+            ("swagger", "/minica/swagger".to_string()),
+        ] {
+            pages.push((name.to_string(), StatusCode::OK, get(uri).await));
+        }
+        pages.push((
+            "error page".to_string(),
+            StatusCode::NOT_FOUND,
+            get("/minica/cas/123".to_string()).await,
+        ));
+        pages.push((
+            "public error page".to_string(),
+            StatusCode::NOT_FOUND,
+            get("/minica/123/download".to_string()).await,
+        ));
+        pages.push((
+            "unknown language".to_string(),
+            StatusCode::BAD_REQUEST,
+            get("/minica/lang/123".to_string()).await,
+        ));
+        pages.push((
+            "inspect result".to_string(),
+            StatusCode::OK,
+            post(
+                "/minica/inspect".to_string(),
+                format!(
+                    "_csrf={}&cert_pem={}",
+                    csrf.token,
+                    form_encode(&fixture.ca_pem)
+                ),
+                cookie.clone(),
+            )
+            .await,
+        ));
+        pages.push((
+            "form error banner".to_string(),
+            StatusCode::OK,
+            post(
+                "/minica/cas".to_string(),
+                format!(
+                    "_csrf={}&common_name=1&country_code=12&state=&city=&organization=1&organization_unit=&valid_days=0&digest_algorithm=sha256&key_profile=rsa%3A2048&password=",
+                    csrf.token
+                ),
+                cookie.clone(),
+            )
+            .await,
+        ));
+        // A flash message after an action, rendered on the next page.
+        let renew = post(
+            format!("/minica/cas/{ca}/certs/{cert}/renew"),
+            format!("_csrf={}&days=30", csrf.token),
+            cookie.clone(),
+        )
+        .await;
+        renew.assert_status(StatusCode::SEE_OTHER);
+        let flash = set_cookies(&renew)
+            .into_iter()
+            .find(|c| c.starts_with("minica_flash="))
+            .expect("flash cookie");
+        let flash = flash.split(';').next().unwrap().to_string();
+        let flash_page = env
+            .request_with_headers(
+                "GET",
+                &format!("/minica/cas/{ca}/certs/{cert}"),
+                &[
+                    ("authorization", &auth),
+                    ("cookie", &format!("{cookie}; {flash}")),
+                ],
+            )
+            .await;
+        assert!(flash_page.text().contains("flash-panel"), "{code}: no flash");
+        pages.push(("flash message".to_string(), StatusCode::OK, flash_page));
+        pages
+    }
+
+    #[tokio::test]
+    async fn every_page_renders_in_every_language() {
+        let env = TestEnv::new();
+        let csrf = env.get_csrf().await;
+        let fixture = page_fixture(&env, &csrf).await;
+        for lang in i18n::Lang::all() {
+            let code = lang.code();
+            let expected_html = format!(r#"<html lang="{code}" dir="{}">"#, lang.dir());
+            for (name, status, response) in render_pages(&env, &csrf, &fixture, code).await {
+                let text = response.text();
+                assert_eq!(response.status, status, "{code} {name}: {text}");
+                assert!(text.contains(&expected_html), "{code} {name}: missing {expected_html}");
+                assert!(!text.contains("⟦missing:"), "{code} {name}: missing key in {text}");
+                assert!(
+                    lang_cookie(&response).is_some(),
+                    "{code} {name}: language cookie not refreshed"
+                );
+            }
+        }
+        // Spot checks that the pages really are translated.
+        let pages = render_pages(&env, &csrf, &fixture, "de").await;
+        let list = pages[0].2.text();
+        assert!(list.contains("Zertifizierungsstellen"), "{list}");
+        let flash = pages.last().unwrap().2.text();
+        assert!(!flash.contains("Renewed certificate"), "{flash}");
+    }
+
+    /// Text visible to users that is not wrapped in pseudo-locale markers:
+    /// text nodes plus the placeholder/title/aria-label/confirmation
+    /// attributes and button values. Excluded, explicitly: <pre>, <textarea>,
+    /// <code>, <script>, <style> content; elements marked `translate="no"`
+    /// (language names, algorithm names, OpenSSL output); `.error-detail`
+    /// (untranslated service error text); the brand "MiniCA" and the data
+    /// values the test created.
+    fn untranslated_text(html: &str, data: &[String]) -> Vec<String> {
+        let mut html = html.to_string();
+        // Longest first, so a URL is removed before the id inside it.
+        let mut values: Vec<&str> = data.iter().map(String::as_str).chain(["MiniCA"]).collect();
+        values.sort_by_key(|v| std::cmp::Reverse(v.len()));
+        for value in values {
+            html = html.replace(&web::h(value), "").replace(value, "");
+        }
+        let strip_entities = |text: &str| {
+            let mut out = String::new();
+            let mut rest = text;
+            while let Some(start) = rest.find('&') {
+                out.push_str(&rest[..start]);
+                let after = &rest[start + 1..];
+                match after.find(';') {
+                    Some(end)
+                        if end <= 8
+                            && after[..end]
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '#') =>
+                    {
+                        out.push(' ');
+                        rest = &after[end + 1..];
+                    }
+                    _ => {
+                        out.push('&');
+                        rest = after;
+                    }
+                }
+            }
+            out.push_str(rest);
+            out
+        };
+        // Letters outside ⟪…⟫ markers; `depth` carries across text nodes so
+        // a translation wrapping inline markup still counts as marked.
+        let unmarked = |text: &str, depth: &mut i32| {
+            let mut bad = false;
+            for c in strip_entities(text).chars() {
+                match c {
+                    i18n::PSEUDO_OPEN => *depth += 1,
+                    i18n::PSEUDO_CLOSE => *depth -= 1,
+                    c if *depth == 0 && c.is_ascii_alphabetic() => bad = true,
+                    _ => {}
+                }
+            }
+            bad
+        };
+        let attr = |tag: &str, name: &str| -> Option<String> {
+            let needle = format!(" {name}=\"");
+            let start = tag.find(&needle)? + needle.len();
+            let end = tag[start..].find('"')? + start;
+            Some(tag[start..end].to_string())
+        };
+        let mut problems = Vec::new();
+        let mut depth = 0;
+        // (tag name, nesting) of an excluded element being skipped.
+        let mut skipping: Option<(String, usize)> = None;
+        let mut rest = html.as_str();
+        while !rest.is_empty() {
+            let Some(lt) = rest.find('<') else {
+                if skipping.is_none() && unmarked(rest, &mut depth) {
+                    problems.push(rest.trim().to_string());
+                }
+                break;
+            };
+            let text = &rest[..lt];
+            if skipping.is_none() && unmarked(text, &mut depth) {
+                problems.push(text.trim().to_string());
+            }
+            let gt = rest[lt..].find('>').expect("unterminated tag") + lt;
+            let tag = &rest[lt..=gt];
+            rest = &rest[gt + 1..];
+            if tag.starts_with("<!") {
+                continue;
+            }
+            let closing = tag.starts_with("</");
+            let name: String = tag[if closing { 2 } else { 1 }..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect::<String>()
+                .to_ascii_lowercase();
+            if let Some((skip_name, nesting)) = &mut skipping {
+                if *skip_name == name {
+                    if closing {
+                        *nesting -= 1;
+                    } else {
+                        *nesting += 1;
+                    }
+                    if *nesting == 0 {
+                        skipping = None;
+                    }
+                }
+                continue;
+            }
+            if closing {
+                continue;
+            }
+            if matches!(name.as_str(), "script" | "style" | "pre" | "textarea" | "code") {
+                let end = rest
+                    .find(&format!("</{name}"))
+                    .unwrap_or_else(|| panic!("unclosed <{name}>"));
+                rest = &rest[end..];
+                continue;
+            }
+            let excluded = tag.contains(r#" translate="no""#)
+                || attr(tag, "class").is_some_and(|c| c.split(' ').any(|c| c == "error-detail"));
+            if excluded {
+                skipping = Some((name, 1));
+                continue;
+            }
+            let mut checked = vec![
+                "placeholder",
+                "title",
+                "aria-label",
+                "data-confirm",
+                "data-confirm-label",
+                "data-renew",
+            ];
+            let is_button = name == "button"
+                || (name == "input"
+                    && attr(tag, "type").is_some_and(|t| t == "submit" || t == "button"));
+            if is_button {
+                checked.push("value");
+            }
+            for attribute in checked {
+                if let Some(value) = attr(tag, attribute)
+                    && unmarked(&value, &mut 0)
+                {
+                    problems.push(format!("{attribute}=\"{value}\" in {tag}"));
+                }
+            }
+        }
+        problems
+    }
+
+    #[tokio::test]
+    async fn pseudo_locale_reveals_no_hard_coded_text() {
+        let env = TestEnv::new();
+        let csrf = env.get_csrf().await;
+        let fixture = page_fixture(&env, &csrf).await;
+        // The guard itself must notice plain English.
+        assert!(!untranslated_text("<p>⟪ok⟫</p><b>oops</b>", &[]).is_empty());
+        assert!(untranslated_text(r#"<p>⟪a <span>{x}</span> b⟫</p><span translate="no">x</span>"#, &[]).is_empty());
+        let mut failures = Vec::new();
+        for (name, status, response) in render_pages(&env, &csrf, &fixture, "qps").await {
+            assert_eq!(response.status, status, "{name}: {}", response.text());
+            assert!(response.text().contains(r#"<html lang="qps""#), "{name}");
+            for problem in untranslated_text(&response.text(), &fixture.data) {
+                failures.push(format!("{name}: {problem}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "untranslated UI text:\n{}",
+            failures.join("\n")
         );
     }
 

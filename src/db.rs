@@ -907,6 +907,97 @@ impl Db {
         Ok(())
     }
 
+    /// Every certificate stored under a CA (soft-deleted ones too, since they
+    /// can be restored), with its secrets. Used to rebuild artifacts that embed
+    /// the CA certificate.
+    pub fn list_cert_secrets_for_ca(&self, ca_id: &str) -> Result<Vec<(String, CertSecrets)>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, cert_pem, key_pem, csr_pem, pkcs12, password, bundle_zip
+            FROM certificates
+            WHERE ca_id = ?
+            ORDER BY id
+            "#,
+        )?;
+        let rows = stmt.query_map(params![ca_id], |row| {
+            Ok((
+                row.get(0)?,
+                CertSecrets {
+                    cert_pem: row.get(1)?,
+                    key_pem: row.get(2)?,
+                    csr_pem: row.get(3)?,
+                    pkcs12: row.get(4)?,
+                    password: row.get(5)?,
+                    bundle_zip: row.get(6)?,
+                },
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Persists a renewed CA certificate: the new certificate and PKCS12, its
+    /// validity metadata, the refreshed CRL (when CRLs are enabled) and the
+    /// rebuilt bundles of its certificates, then releases the signing lock —
+    /// all in one transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn renew_ca_with_state(
+        &self,
+        ca_id: &str,
+        cert_pem: &[u8],
+        pkcs12: &[u8],
+        issue_time: i64,
+        valid_days: i64,
+        crl: Option<(&[u8], &[u8])>,
+        cert_bundles: &[(String, Vec<u8>)],
+        lock_owner: &str,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp_millis();
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
+        verify_lock_tx(&tx, ca_id, lock_owner)?;
+        let ca_rows = tx.execute(
+            r#"
+            UPDATE certificate_authorities
+            SET cert_pem = ?, pkcs12 = ?, issue_time = ?, valid_days = ?, updated_at = ?
+            WHERE id = ? AND deleted = 0
+            "#,
+            params![cert_pem, pkcs12, issue_time, valid_days, now, ca_id],
+        )?;
+        if ca_rows == 0 {
+            bail!("CA not found: {ca_id}");
+        }
+        if let Some((crl_der, crlnumber_txt)) = crl {
+            tx.execute(
+                "UPDATE certificate_authorities SET crl_der = ?, crlnumber_txt = ?, crl_updated_at = ? WHERE id = ?",
+                params![crl_der, crlnumber_txt, now, ca_id],
+            )?;
+        }
+        let mut bundle_rows = 0;
+        for (cert_id, bundle_zip) in cert_bundles {
+            bundle_rows += tx.execute(
+                "UPDATE certificates SET bundle_zip = ?, updated_at = ? WHERE id = ? AND ca_id = ?",
+                params![bundle_zip, now, cert_id, ca_id],
+            )?;
+        }
+        let lock_rows = tx.execute(
+            "DELETE FROM ca_locks WHERE ca_id = ? AND owner_id = ?",
+            params![ca_id, lock_owner],
+        )?;
+        tx.commit()?;
+        tracing::info!(
+            ca_id = %ca_id,
+            valid_days,
+            ca_rows_affected = ca_rows,
+            bundle_rows_affected = bundle_rows,
+            lock_rows_affected = lock_rows,
+            crl_refreshed = crl.is_some(),
+            "renewed certificate authority certificate"
+        );
+        Ok(())
+    }
+
     pub fn get_ca_crl(&self, ca_id: &str) -> Result<Vec<u8>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.query_row(

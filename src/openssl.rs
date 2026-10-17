@@ -671,6 +671,128 @@ impl OpenSsl {
         Ok((cert_pem, pkcs12, bundle, index_txt))
     }
 
+    /// Whether the certificate's issuer DN equals its subject DN (compared by
+    /// openssl's canonical name hash, as chain building does), i.e. a root CA
+    /// rather than an intermediate issued by some other CA.
+    pub fn is_self_issued(&self, dir: &Path, pem: &[u8]) -> Result<bool> {
+        fs::write(dir.join("inspect-issuer.pem"), pem)?;
+        let out = self.run_ok(
+            dir,
+            &[
+                "x509",
+                "-in",
+                "inspect-issuer.pem",
+                "-noout",
+                "-subject_hash",
+                "-issuer_hash",
+            ],
+        )?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let hashes: Vec<&str> = text.lines().map(str::trim).collect();
+        Ok(hashes.len() == 2 && hashes[0] == hashes[1])
+    }
+
+    /// Re-signs a self-signed CA certificate with its own key. `x509 -signkey`
+    /// keeps the subject DN and every extension (so the SKI/AKI stay the same,
+    /// the key being unchanged) and only replaces the serial, the validity
+    /// (from now) and the signature. Leaf certificates issued earlier keep
+    /// verifying, since their issuer DN and AKI still match. Returns the new
+    /// certificate PEM and the rebuilt CA PKCS12.
+    pub fn renew_ca_files(
+        &self,
+        dir: &Path,
+        ca: &CaSecrets,
+        valid_days: i64,
+        digest: &str,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        tracing::info!(
+            valid_days,
+            digest,
+            "renewing certificate authority files with openssl"
+        );
+        let digest = normalize_digest(digest)?;
+        fs::write(dir.join("ca-cert.pem"), &ca.cert_pem)?;
+        write_secret(&dir.join("ca-key.pem"), &ca.key_pem)?;
+        if !self.is_self_issued(dir, &ca.cert_pem)? {
+            bail!(
+                "only a self-signed (root) CA can be renewed here; an intermediate CA must be re-issued by its parent"
+            );
+        }
+        // `-signkey` would silently swap in a mismatched key's public key.
+        let key_pub = self
+            .run_ok(dir, &["pkey", "-in", "ca-key.pem", "-pubout"])
+            .context("CA private key could not be read")?;
+        let cert_pub = self.run_ok(dir, &["x509", "-in", "ca-cert.pem", "-noout", "-pubkey"])?;
+        if String::from_utf8_lossy(&key_pub.stdout).trim()
+            != String::from_utf8_lossy(&cert_pub.stdout).trim()
+        {
+            bail!("CA private key does not match the CA certificate");
+        }
+        let old_serial = self.run_ok(dir, &["x509", "-in", "ca-cert.pem", "-noout", "-serial"])?;
+        let serial = format!("0x{}", random_serial_hex());
+        self.run_ok(
+            dir,
+            &[
+                "x509",
+                "-in",
+                "ca-cert.pem",
+                "-signkey",
+                "ca-key.pem",
+                "-days",
+                &valid_days.to_string(),
+                "-set_serial",
+                &serial,
+                &format!("-{digest}"),
+                "-out",
+                "ca-cert-renewed.pem",
+            ],
+        )?;
+        // Older openssl ignores -set_serial with -signkey; a renewed CA must
+        // never reuse the old serial. The renewed certificate must also still
+        // verify as a trust anchor on its own.
+        let new_serial = self.run_ok(
+            dir,
+            &["x509", "-in", "ca-cert-renewed.pem", "-noout", "-serial"],
+        )?;
+        if new_serial.stdout == old_serial.stdout {
+            bail!("openssl did not assign a new serial to the renewed CA certificate");
+        }
+        self.run_ok(
+            dir,
+            &[
+                "verify",
+                "-CAfile",
+                "ca-cert-renewed.pem",
+                "ca-cert-renewed.pem",
+            ],
+        )
+        .context("renewed CA certificate does not verify against itself")?;
+        let passout = write_pass_file(dir, "ca-p12.pass", &ca.password)?;
+        self.run_ok(
+            dir,
+            &[
+                "pkcs12",
+                "-export",
+                "-out",
+                "ca-renewed.p12",
+                "-in",
+                "ca-cert-renewed.pem",
+                "-inkey",
+                "ca-key.pem",
+                "-passout",
+                &passout,
+            ],
+        )?;
+        let cert_pem = fs::read(dir.join("ca-cert-renewed.pem"))?;
+        let pkcs12 = fs::read(dir.join("ca-renewed.p12"))?;
+        tracing::info!(
+            cert_bytes = cert_pem.len(),
+            pkcs12_bytes = pkcs12.len(),
+            "renewed certificate authority files"
+        );
+        Ok((cert_pem, pkcs12))
+    }
+
     pub fn generate_crl(&self, dir: &Path, ca: &CaSecrets, crl_days: i64) -> Result<CrlRefresh> {
         tracing::info!(
             crl_days,
@@ -1248,19 +1370,33 @@ fn read_cert_secrets(cert_dir: &Path, ca_dir: &Path) -> Result<CertSecrets> {
 }
 
 fn create_bundle(cert_dir: &Path, ca_dir: &Path) -> Result<Vec<u8>> {
+    let cert = CertSecrets {
+        cert_pem: fs::read(cert_dir.join("cert.pem"))?,
+        key_pem: fs::read(cert_dir.join("cert.key"))?,
+        csr_pem: fs::read(cert_dir.join("cert.csr"))?,
+        pkcs12: fs::read(cert_dir.join("cert.p12"))?,
+        password: fs::read(cert_dir.join("password.txt"))?,
+        bundle_zip: Vec::new(),
+    };
+    build_bundle(&cert, &fs::read(ca_dir.join("ca-cert.pem"))?)
+}
+
+/// The certificate download bundle (ZIP), with `ca_cert_pem` as its `ca.pem`.
+/// Also used to refresh existing bundles after the CA certificate is renewed.
+pub fn build_bundle(cert: &CertSecrets, ca_cert_pem: &[u8]) -> Result<Vec<u8>> {
     let cursor = Cursor::new(Vec::new());
     let mut zip = ZipWriter::new(cursor);
     let opts = SimpleFileOptions::default();
-    for (fs_path, zip_name) in [
-        (cert_dir.join("cert.csr"), "cert.csr"),
-        (cert_dir.join("cert.key"), "cert.key"),
-        (cert_dir.join("cert.p12"), "cert.p12"),
-        (cert_dir.join("cert.pem"), "cert.pem"),
-        (cert_dir.join("password.txt"), "cert-p12-password.txt"),
-        (ca_dir.join("ca-cert.pem"), "ca.pem"),
+    for (bytes, zip_name) in [
+        (&cert.csr_pem[..], "cert.csr"),
+        (&cert.key_pem[..], "cert.key"),
+        (&cert.pkcs12[..], "cert.p12"),
+        (&cert.cert_pem[..], "cert.pem"),
+        (&cert.password[..], "cert-p12-password.txt"),
+        (ca_cert_pem, "ca.pem"),
     ] {
         zip.start_file(zip_name, opts)?;
-        zip.write_all(&fs::read(fs_path)?)?;
+        zip.write_all(bytes)?;
     }
     Ok(zip.finish()?.into_inner())
 }

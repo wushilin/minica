@@ -8,7 +8,7 @@ use crate::{
         Certificate, CertificateAuthority, CreateCaRequest, CreateCertRequest, CreateUserRequest,
         ImportCaRequest, ImportCertRequest, InspectResponse, UserView,
     },
-    openssl::{OpenSsl, create_subject, normalize_digest, random_password},
+    openssl::{OpenSsl, build_bundle, create_subject, normalize_digest, random_password},
 };
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -767,6 +767,99 @@ impl AppService {
         Ok(cert)
     }
 
+    /// Re-issues a root CA's certificate with the same key and subject (and so
+    /// the same SKI), a new serial and `days` of validity from now. Existing
+    /// certificates keep verifying against the renewed CA certificate.
+    #[tracing::instrument(skip(self), err, fields(span_id = %span_id(), ca_id = %ca_id, days))]
+    pub fn renew_ca(&self, ca_id: &str, days: i64) -> Result<CertificateAuthority> {
+        tracing::info!(ca_id = %ca_id, days, "renewing certificate authority");
+        validate_days(days)?;
+        let ca = self.db.get_ca(ca_id)?;
+        // Imported CAs may carry a digest we don't sign with; fall back to the
+        // historical default.
+        let digest =
+            normalize_digest(&ca.digest_algorithm).unwrap_or_else(|_| "sha512".to_string());
+        let owner = Uuid::new_v4().to_string();
+        self.db.acquire_ca_lock(ca_id, &owner, 120_000)?;
+        let result = (|| -> Result<()> {
+            // CA state is read under the lock so it cannot be stale.
+            let mut ca_secrets = self.db.get_ca_secrets(ca_id)?;
+            let work = self.openssl.workdir()?;
+            let now = Utc::now().timestamp_millis();
+            let current_pem = String::from_utf8_lossy(&ca_secrets.cert_pem).to_string();
+            let info = self.openssl.inspect_cert(work.path(), &current_pem)?;
+            let current_expiry = info_value(&info, "notAfter")
+                .and_then(|v| parse_openssl_date(&v))
+                .unwrap_or(ca.issue_time + ca.valid_days * 86_400_000);
+            if now + days * 86_400_000 <= current_expiry {
+                let min_days = ((current_expiry - now).max(0) / 86_400_000) + 1;
+                bail!(
+                    "renewal would not extend the CA certificate expiry; choose at least {min_days} days"
+                );
+            }
+            let (cert_pem, pkcs12) =
+                self.openssl
+                    .renew_ca_files(work.path(), &ca_secrets, days, &digest)?;
+            ca_secrets.cert_pem = cert_pem;
+            ca_secrets.pkcs12 = pkcs12;
+            // Same key, so the CRL could stay; it is re-signed anyway so its
+            // issuer is the current certificate and the CRL number advances.
+            let crl = if self.crl.enabled {
+                let crl_work = self.openssl.workdir()?;
+                Some(self.openssl.generate_crl(
+                    crl_work.path(),
+                    &ca_secrets,
+                    self.crl.next_update_days,
+                )?)
+            } else {
+                None
+            };
+            // Certificate bundles embed the CA certificate as `ca.pem`.
+            let bundles = self
+                .db
+                .list_cert_secrets_for_ca(ca_id)?
+                .into_iter()
+                .map(|(cert_id, cert)| {
+                    build_bundle(&cert, &ca_secrets.cert_pem).map(|bundle| (cert_id, bundle))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            self.db.renew_ca_with_state(
+                ca_id,
+                &ca_secrets.cert_pem,
+                &ca_secrets.pkcs12,
+                now,
+                days,
+                crl.as_ref()
+                    .map(|c| (c.crl_der.as_slice(), c.crlnumber_txt.as_slice())),
+                &bundles,
+                &owner,
+            )
+        })();
+        if result.is_err() {
+            tracing::warn!(ca_id = %ca_id, owner_id = %owner, "certificate authority renewal failed; releasing CA lock");
+            let _ = self.db.release_ca_lock(ca_id, &owner);
+        }
+        result?;
+        let ca = self.get_ca(ca_id)?;
+        tracing::info!(
+            ca_id = %ca_id,
+            days,
+            issue_time = ca.issue_time,
+            valid_days = ca.valid_days,
+            cert_bytes = ca.cert_pem.len(),
+            "renewed certificate authority"
+        );
+        Ok(ca)
+    }
+
+    /// Whether a CA certificate is self-signed (a root), i.e. renewable with
+    /// `renew_ca`.
+    pub fn ca_is_self_signed(&self, cert_pem: &str) -> Result<bool> {
+        let work = self.openssl.workdir()?;
+        self.openssl
+            .is_self_issued(work.path(), cert_pem.as_bytes())
+    }
+
     #[tracing::instrument(skip(self, pem), err, fields(span_id = %span_id(), pem_bytes = pem.len()))]
     pub fn cert_purposes(&self, pem: &str) -> Result<Vec<(String, String)>> {
         tracing::info!("inspecting certificate purposes");
@@ -1146,6 +1239,21 @@ impl AppService {
         self.public_base_url
             .as_ref()
             .map(|base| format!("{}/crl/{ca_id}", base.trim_end_matches('/')))
+    }
+
+    /// Long-form public download URL of the CA certificate; serves the same
+    /// PEM as [`Self::public_ca_cert_url`].
+    pub fn public_ca_cert_download_url(&self, ca_id: &str) -> Option<String> {
+        self.public_base_url
+            .as_ref()
+            .map(|base| format!("{}/download/ca/{ca_id}/cert", base.trim_end_matches('/')))
+    }
+
+    /// Public (unauthenticated) download URL of the CA certificate.
+    pub fn public_ca_cert_url(&self, ca_id: &str) -> Option<String> {
+        self.public_base_url
+            .as_ref()
+            .map(|base| format!("{}/{ca_id}/download", base.trim_end_matches('/')))
     }
 
     /// The CRL distribution point to embed in a newly signed certificate,
@@ -2279,6 +2387,240 @@ mod tests {
 
         // Restoring the original from trash would duplicate the active CN.
         assert!(service.restore_cert(&ca.id, &cert.id).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Runs openssl in a fresh workdir holding `files`; returns the exit code
+    /// and combined stdout/stderr.
+    fn openssl_files(
+        service: &AppService,
+        files: &[(&str, &[u8])],
+        args: &[&str],
+    ) -> (i32, String) {
+        let work = service.openssl.workdir().unwrap();
+        for (name, bytes) in files {
+            fs::write(work.path().join(name), bytes).unwrap();
+        }
+        let out = service
+            .openssl
+            .run_in(work.path(), args, std::time::Duration::from_secs(30))
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.exit_code, text)
+    }
+
+    fn x509_field(service: &AppService, pem: &str, args: &[&str]) -> String {
+        let mut full = vec!["x509", "-in", "c.pem", "-noout"];
+        full.extend_from_slice(args);
+        openssl_text(service, &full, ("c.pem", pem.as_bytes()))
+    }
+
+    #[test]
+    fn ca_renewal_keeps_key_subject_and_trust_chain() {
+        let (service, root) = temp_service();
+        let ca = service.create_ca(ca_request("Renewal CA", 30)).unwrap();
+        let before = service
+            .create_cert(&ca.id, cert_request("before.example.com", 10, &[]))
+            .unwrap();
+        let old_pem = ca.cert_pem.clone();
+
+        // Days are validated and the expiry must move forward.
+        for days in [0, 7351] {
+            assert!(service.renew_ca(&ca.id, days).is_err());
+        }
+        let err = service.renew_ca(&ca.id, 10).unwrap_err().to_string();
+        assert!(err.contains("would not extend"), "{err}");
+        assert!(service.renew_ca("missing", 365).is_err());
+
+        let renewed = service.renew_ca(&ca.id, 400).unwrap();
+        let new_pem = renewed.cert_pem.clone();
+        assert_ne!(new_pem, old_pem);
+        assert_eq!(renewed.valid_days, 400);
+        assert!(renewed.issue_time >= ca.issue_time);
+
+        // Byte-identical subject (DER of every attribute), same SKI/AKI and
+        // extensions, new serial, later notAfter.
+        for args in [
+            &["-subject", "-nameopt", "RFC2253,dump_all,dump_der"][..],
+            &["-subject_hash", "-issuer_hash"][..],
+            &[
+                "-ext",
+                "subjectKeyIdentifier,authorityKeyIdentifier,basicConstraints,keyUsage",
+            ][..],
+            &["-pubkey"][..],
+        ] {
+            assert_eq!(
+                x509_field(&service, &old_pem, args),
+                x509_field(&service, &new_pem, args),
+                "{args:?}"
+            );
+        }
+        let ski = x509_field(&service, &new_pem, &["-ext", "subjectKeyIdentifier"]);
+        assert!(ski.contains("Subject Key Identifier"), "{ski}");
+        assert_ne!(
+            x509_field(&service, &old_pem, &["-serial"]),
+            x509_field(&service, &new_pem, &["-serial"])
+        );
+        let not_after = |pem: &str| {
+            let text = x509_field(&service, pem, &["-enddate"]);
+            parse_openssl_date(text.trim().trim_start_matches("notAfter=")).unwrap()
+        };
+        assert!(not_after(&new_pem) > not_after(&old_pem) + 300 * 86_400_000);
+
+        // Leaves issued before renewal verify against the renewed CA, and
+        // leaves issued after it verify against the old CA certificate.
+        let after = service
+            .create_cert(&ca.id, cert_request("after.example.com", 200, &[]))
+            .unwrap();
+        assert_eq!(after.valid_days, 200, "no longer clamped to the old expiry");
+        for (ca_pem, leaf) in [(&new_pem, &before), (&old_pem, &after), (&new_pem, &after)] {
+            let (code, out) = openssl_files(
+                &service,
+                &[
+                    ("ca.pem", ca_pem.as_bytes()),
+                    ("leaf.pem", leaf.cert_pem.as_bytes()),
+                ],
+                &["verify", "-CAfile", "ca.pem", "leaf.pem"],
+            );
+            assert_eq!(code, 0, "{out}");
+        }
+
+        // Derived artifacts follow: PKCS12, existing bundles, and the CRL.
+        let secrets = service.db.get_ca_secrets(&ca.id).unwrap();
+        let (code, p12) = openssl_files(
+            &service,
+            &[("ca.p12", &secrets.pkcs12), ("pass", &secrets.password)],
+            &["pkcs12", "-in", "ca.p12", "-nokeys", "-passin", "file:pass"],
+        );
+        assert_eq!(code, 0, "{p12}");
+        let p12_cert = p12
+            .find("-----BEGIN CERTIFICATE-----")
+            .map(|i| &p12[i..])
+            .unwrap();
+        assert_eq!(p12_cert.trim(), new_pem.trim());
+        let bundle = service
+            .db
+            .get_cert_secrets(&ca.id, &before.id)
+            .unwrap()
+            .bundle_zip;
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bundle)).unwrap();
+        let mut bundled_ca = String::new();
+        std::io::Read::read_to_string(&mut zip.by_name("ca.pem").unwrap(), &mut bundled_ca)
+            .unwrap();
+        assert_eq!(bundled_ca, new_pem);
+        let (code, out) = openssl_files(
+            &service,
+            &[("c.crl", &secrets.crl_der), ("ca.pem", new_pem.as_bytes())],
+            &[
+                "crl", "-inform", "DER", "-in", "c.crl", "-CAfile", "ca.pem", "-noout",
+            ],
+        );
+        assert_eq!(code, 0, "{out}");
+        assert!(out.contains("verify OK"), "{out}");
+
+        // A backup round-trips the renewed CA unchanged.
+        let yaml = service.export_backup_yaml().unwrap();
+        let (restored, restored_root) = temp_service();
+        restored.import_backup_yaml(&yaml).unwrap();
+        let restored_ca = restored.get_ca(&ca.id).unwrap();
+        assert_eq!(restored_ca.cert_pem, new_pem);
+        assert_eq!(restored_ca.valid_days, 400);
+        assert_eq!(
+            restored.db.get_ca_secrets(&ca.id).unwrap().pkcs12,
+            secrets.pkcs12
+        );
+        let _ = fs::remove_dir_all(restored_root);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ca_renewal_refuses_intermediate_ca() {
+        let (service, root) = temp_service();
+        let parent = service.create_ca(ca_request("Parent CA", 60)).unwrap();
+        let parent_key = parent.key_pem.clone();
+
+        // Build an intermediate signed by the parent, then import it.
+        let work = service.openssl.workdir().unwrap();
+        let dir = work.path();
+        fs::write(dir.join("parent.pem"), &parent.cert_pem).unwrap();
+        fs::write(dir.join("parent.key"), &parent_key).unwrap();
+        fs::write(
+            dir.join("ext.cnf"),
+            "[v3]\nbasicConstraints = critical, CA:true\nkeyUsage = critical, keyCertSign, cRLSign\nsubjectKeyIdentifier = hash\nauthorityKeyIdentifier = keyid\n",
+        )
+        .unwrap();
+        for args in [
+            &[
+                "genpkey",
+                "-algorithm",
+                "EC",
+                "-pkeyopt",
+                "ec_paramgen_curve:P-256",
+                "-out",
+                "int.key",
+            ][..],
+            &[
+                "req",
+                "-new",
+                "-key",
+                "int.key",
+                "-subj",
+                "/C=SG/O=Org/CN=Intermediate CA",
+                "-out",
+                "int.csr",
+            ][..],
+            &[
+                "x509",
+                "-req",
+                "-in",
+                "int.csr",
+                "-CA",
+                "parent.pem",
+                "-CAkey",
+                "parent.key",
+                "-set_serial",
+                "0x1001",
+                "-days",
+                "30",
+                "-extfile",
+                "ext.cnf",
+                "-extensions",
+                "v3",
+                "-out",
+                "int.pem",
+            ][..],
+        ] {
+            let out = service
+                .openssl
+                .run_in(dir, args, std::time::Duration::from_secs(30))
+                .unwrap();
+            assert_eq!(out.exit_code, 0, "{}", String::from_utf8_lossy(&out.stderr));
+        }
+        let int_pem = fs::read_to_string(dir.join("int.pem")).unwrap();
+        let intermediate = service
+            .import_ca(ImportCaRequest {
+                cert_pem: int_pem.clone(),
+                key_pem: fs::read_to_string(dir.join("int.key")).unwrap(),
+                password: None,
+            })
+            .unwrap();
+        assert!(!service.ca_is_self_signed(&intermediate.cert_pem).unwrap());
+        assert!(service.ca_is_self_signed(&parent.cert_pem).unwrap());
+        let err = service
+            .renew_ca(&intermediate.id, 365)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("intermediate CA must be re-issued by its parent"),
+            "{err}"
+        );
+        // Nothing changed, and the CA lock was released.
+        assert_eq!(service.get_ca(&intermediate.id).unwrap().cert_pem, int_pem);
+        service.renew_ca(&parent.id, 365).unwrap();
         let _ = fs::remove_dir_all(root);
     }
 }
