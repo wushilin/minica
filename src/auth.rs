@@ -47,7 +47,11 @@ fn authenticate_basic(headers: &HeaderMap, state: &AppState) -> Result<User> {
     // a bcrypt hash or (legacy) plaintext; these exist so the very first admin
     // can log in and manage DB-backed users.
     for user in state.config.auth.basic_users() {
-        if user.username == username && verify_config_password(&user.password, password) {
+        if user.username == username
+            && verify_cached(username, password, &user.password, || {
+                verify_config_password(&user.password, password)
+            })
+        {
             return Ok(User {
                 username: user.username.clone(),
                 role: user.role,
@@ -60,7 +64,9 @@ fn authenticate_basic(headers: &HeaderMap, state: &AppState) -> Result<User> {
     // hash, so response timing does not reveal which accounts exist.
     match state.service.db().find_user(username)? {
         Some(record) => {
-            if bcrypt::verify(password, &record.password_hash).unwrap_or(false) {
+            if verify_cached(username, password, &record.password_hash, || {
+                bcrypt::verify(password, &record.password_hash).unwrap_or(false)
+            }) {
                 let role = Role::parse(&record.role).unwrap_or(Role::Viewer);
                 return Ok(User {
                     username: record.username,
@@ -74,6 +80,57 @@ fn authenticate_basic(headers: &HeaderMap, state: &AppState) -> Result<User> {
     }
 
     bail!("invalid username or password")
+}
+
+/// How long a successful password check is remembered. Basic auth re-sends
+/// the password on every request; without this each click paid a full bcrypt
+/// verification.
+const LOGIN_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+const LOGIN_CACHE_MAX: usize = 1024;
+
+/// Runs `verify` unless this exact (username, stored credential, password)
+/// succeeded within `LOGIN_CACHE_TTL`. Only successes are cached, keyed by a
+/// salted SHA-256 so no password is kept in memory. The stored credential is
+/// part of the key, so a password change misses the cache immediately; the
+/// caller still looks the account up on every request, so deleted users and
+/// role changes take effect at once.
+fn verify_cached(username: &str, password: &str, stored: &str, verify: impl FnOnce() -> bool) -> bool {
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    static SALT: OnceLock<[u8; 32]> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<HashMap<[u8; 32], Instant>>> = OnceLock::new();
+    let salt = SALT.get_or_init(|| rand::rng().random());
+    let mut hasher = Sha256::new();
+    for part in [&salt[..], username.as_bytes(), stored.as_bytes(), password.as_bytes()] {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    let key: [u8; 32] = hasher.finalize().into();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    let now = Instant::now();
+    if cache
+        .lock()
+        .is_ok_and(|cache| cache.get(&key).is_some_and(|expires| *expires > now))
+    {
+        return true;
+    }
+    if !verify() {
+        return false;
+    }
+    if let Ok(mut cache) = cache.lock() {
+        if cache.len() >= LOGIN_CACHE_MAX {
+            cache.retain(|_, expires| *expires > now);
+            if cache.len() >= LOGIN_CACHE_MAX {
+                cache.clear();
+            }
+        }
+        cache.insert(key, now + LOGIN_CACHE_TTL);
+    }
+    true
 }
 
 /// A bcrypt hash at the default cost, computed once, used to equalise timing
@@ -282,6 +339,26 @@ mod password_tests {
         assert!(!is_valid_csrf_token("short"));
         assert!(!is_valid_csrf_token("aaaaaaaaaaaaaaaa; Path=/"));
         assert!(!is_valid_csrf_token("aaaaaaaaaaaaaaaa<script>"));
+    }
+
+    #[test]
+    fn successful_logins_are_cached_per_stored_credential() {
+        let calls = std::cell::Cell::new(0);
+        let check = |ok: bool| {
+            calls.set(calls.get() + 1);
+            ok
+        };
+        let user = "cache-test-user";
+        assert!(verify_cached(user, "pw", "hash-1", || check(true)));
+        assert!(verify_cached(user, "pw", "hash-1", || check(true)));
+        assert_eq!(calls.get(), 1, "second success served from cache");
+
+        // A changed stored credential (password reset) is verified again.
+        assert!(!verify_cached(user, "pw", "hash-2", || check(false)));
+        // A wrong password is never served from cache, and failures are not cached.
+        assert!(!verify_cached(user, "other", "hash-1", || check(false)));
+        assert!(!verify_cached(user, "other", "hash-1", || check(false)));
+        assert_eq!(calls.get(), 4);
     }
 
     #[test]
