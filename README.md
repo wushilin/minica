@@ -302,6 +302,11 @@ openssl:
 
 Caveats:
 
+- **CA truststore download.** The per-CA PKCS#12 truststore is built with
+  `openssl pkcs12 -export -jdktrust`, which needs OpenSSL 3.2 or newer and is
+  not available in LibreSSL or OpenSSL 3.0/3.1 (e.g. Ubuntu 24.04, Debian 12).
+  With those, everything else works but the truststore download fails. The
+  container image ships a recent OpenSSL.
 - **PKCS#12 encryption defaults.** LibreSSL's `pkcs12 -export` still defaults
   to 3DES for keys and 40-bit RC2 for certificates (OpenSSL 3 uses AES-256 +
   PBKDF2). The resulting `.p12` bundles import fine into Windows, Java, and

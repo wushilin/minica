@@ -62,8 +62,12 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    # The truststore tests need openssl >= 3.2 (pkcs12 -jdktrust); the runner's
+    # Ubuntu 24.04 ships 3.0, Debian trixie ships 3.5.
+    container: rust:1-trixie
     steps:
       - uses: actions/checkout@v4
+      - run: apt-get update && apt-get install -y --no-install-recommends openssl
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-go@v5
