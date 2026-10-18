@@ -127,6 +127,56 @@ backup-able state, real revocation, hashed credentials, and safe concurrency.
    use. Prefer `MINICA_PASSWORD` in the environment or a `chmod 600 ~/.minica`
    over `--password`, which other local users can see in the process list.)
 
+### Running with Docker
+
+Every release is published to Docker Hub as a multi-arch image (`linux/amd64`
+and `linux/arm64`): `wushilin/minica:<version>` (e.g. `1.2.1`) and
+`wushilin/minica:latest`. It is based on Alpine with a current OpenSSL, runs as
+the unprivileged user `minica` (uid/gid `10001`), and keeps all state under
+`/data`. Podman accepts the same commands (use `docker.io/wushilin/minica:...`).
+
+1. **Hash an admin password** (the default `adminpass` is publicly known):
+   ```sh
+   docker run --rm --entrypoint /opt/minica/minica wushilin/minica:1.2.1 \
+     --gen-password 'your-admin-password'
+   # prints a bcrypt hash such as $2b$12$...
+   ```
+
+2. **Start MiniCA** with a named volume for `/data`. Single-quote the hash so
+   the shell does not expand its `$` signs:
+   ```sh
+   docker run -d --name minica --restart unless-stopped \
+     -p 9988:9988 \
+     -v minica-data:/data \
+     -e MINICA_ADMIN_PASSWORD='$2b$12$...' \
+     -e MINICA_PUBLIC_BASE_URL=http://ca.example.com:9988/minica \
+     wushilin/minica:1.2.1
+   ```
+   `MINICA_PUBLIC_BASE_URL` is the address clients use to reach MiniCA; it goes
+   into the CRL distribution URLs of issued certificates. Any other setting can
+   be changed the same way (see the variables below).
+
+3. **Open** `http://<host>:9988/minica/` and sign in as `admin` with your
+   password. The API is at `/minica/api` and Swagger at `/minica/swagger`.
+
+4. **Upgrade** by replacing the container and keeping the volume:
+   ```sh
+   docker pull wushilin/minica:<new-version>
+   docker rm -f minica
+   docker run -d --name minica ...same options... wushilin/minica:<new-version>
+   ```
+   The database is migrated automatically on startup; a copy of the old one is
+   kept next to it as `db.sqlite.pre-migrate-<timestamp>.bak`.
+
+**Using a host directory instead of a named volume:** it must be owned by
+`10001:10001`, or MiniCA exits with `Permission denied`:
+```sh
+mkdir -p /srv/minica && sudo chown -R 10001:10001 /srv/minica
+docker run -d --name minica -p 9988:9988 -v /srv/minica:/data ... wushilin/minica:1.2.1
+# rootless Podman: podman unshare chown -R 10001:10001 /srv/minica
+# (add :Z to the -v option on SELinux hosts)
+```
+
 ### Docker-friendly environment variables
 
 Any value in the config file may be written as `{{ENV:VAR:default}}`: it
@@ -183,9 +233,8 @@ the container is removed.
 - `/data/logs/minica.log` for logs
 - `/data/runtime/openssl-work` for OpenSSL temporary workdirs
 
-Released images (amd64 and arm64) are published as
-`docker.io/wushilin/minica:<version>` and `:latest`; every CI run smoke-tests
-the image with `docker/test.sh`. Set `MINICA_CONTAINER_ENGINE=docker` to run
+To use the published image, see [Running with Docker](#running-with-docker).
+Every CI run smoke-tests the image with `docker/test.sh`. Set `MINICA_CONTAINER_ENGINE=docker` to run
 that test with Docker, and `MINICA_TEST_IMAGE=<tag>` to test an image you
 already built.
 
