@@ -216,6 +216,7 @@ impl Db {
                 crl_der BLOB NOT NULL DEFAULT X'',
                 crl_updated_at INTEGER NOT NULL DEFAULT 0,
                 crlnumber_txt BLOB NOT NULL DEFAULT X'',
+                truststore BLOB NOT NULL DEFAULT X'',
                 deleted INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
@@ -292,6 +293,7 @@ impl Db {
             "ALTER TABLE certificate_authorities ADD COLUMN crlnumber_txt BLOB NOT NULL DEFAULT X''",
             "ALTER TABLE certificates ADD COLUMN revoked_at INTEGER",
             "ALTER TABLE certificates ADD COLUMN revocation_reason TEXT",
+            "ALTER TABLE certificate_authorities ADD COLUMN truststore BLOB NOT NULL DEFAULT X''",
         ] {
             add_column(&tx, sql)?;
         }
@@ -940,7 +942,8 @@ impl Db {
     /// Persists a renewed CA certificate: the new certificate and PKCS12, its
     /// validity metadata, the refreshed CRL (when CRLs are enabled) and the
     /// rebuilt bundles of its certificates, then releases the signing lock —
-    /// all in one transaction.
+    /// all in one transaction. The stored truststore holds the old
+    /// certificate, so it is cleared for the service to rebuild.
     #[allow(clippy::too_many_arguments)]
     pub fn renew_ca_with_state(
         &self,
@@ -960,7 +963,7 @@ impl Db {
         let ca_rows = tx.execute(
             r#"
             UPDATE certificate_authorities
-            SET cert_pem = ?, pkcs12 = ?, issue_time = ?, valid_days = ?, updated_at = ?
+            SET cert_pem = ?, pkcs12 = ?, truststore = X'', issue_time = ?, valid_days = ?, updated_at = ?
             WHERE id = ? AND deleted = 0
             "#,
             params![cert_pem, pkcs12, issue_time, valid_days, now, ca_id],
@@ -996,6 +999,30 @@ impl Db {
             "renewed certificate authority certificate"
         );
         Ok(())
+    }
+
+    /// The stored PKCS#12 truststore; empty when it has not been built yet
+    /// (CAs from before truststores existed, restored backups, renewals).
+    pub fn get_ca_truststore(&self, ca_id: &str) -> Result<Vec<u8>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.query_row(
+            "SELECT truststore FROM certificate_authorities WHERE id = ? AND deleted = 0",
+            params![ca_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .with_context(|| format!("CA not found: {ca_id}"))
+    }
+
+    /// Stores a truststore built from `cert_pem`, only while that is still the
+    /// CA's certificate, so one built just before a renewal is dropped.
+    pub fn set_ca_truststore(&self, ca_id: &str, cert_pem: &[u8], truststore: &[u8]) -> Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let rows = conn.execute(
+            "UPDATE certificate_authorities SET truststore = ? WHERE id = ? AND cert_pem = ? AND deleted = 0",
+            params![truststore, ca_id, cert_pem],
+        )?;
+        Ok(rows > 0)
     }
 
     pub fn get_ca_crl(&self, ca_id: &str) -> Result<Vec<u8>> {
@@ -1545,6 +1572,7 @@ fn schema_columns_present(conn: &Connection) -> Result<bool> {
                 "crl_der",
                 "crl_updated_at",
                 "crlnumber_txt",
+                "truststore",
                 "deleted",
                 "created_at",
                 "updated_at",
