@@ -1,5 +1,5 @@
-# Build MiniCA (server + mcacli) for Linux, macOS, Windows and FreeBSD on
-# x86_64 and aarch64. Every push and PR runs tests and builds all targets.
+# Build MiniCA (server + mcacli) for Linux, macOS and Windows on x86_64 and
+# aarch64, and FreeBSD on x86_64. Every push and PR runs tests and builds all targets.
 # A push to main whose Cargo.toml version has no matching v<version> tag yet
 # also publishes a GitHub Release with the archives and pushes the container
 # image to docker.io/wushilin/minica:<version> and ghcr.io/wushilin/minica:<version>
@@ -94,7 +94,6 @@ jobs:
           - { name: windows-x86_64, os: windows-latest,    target: x86_64-pc-windows-msvc,     goos: windows, goarch: amd64, exe: .exe }
           - { name: windows-aarch64, os: windows-latest,   target: aarch64-pc-windows-msvc,    goos: windows, goarch: arm64, exe: .exe }
           - { name: freebsd-x86_64, os: ubuntu-latest,     target: x86_64-unknown-freebsd,     goos: freebsd, goarch: amd64, freebsd: amd64 }
-          - { name: freebsd-aarch64, os: ubuntu-latest,    target: aarch64-unknown-freebsd,    goos: freebsd, goarch: arm64, freebsd: aarch64 }
     env:
       STAGE: minica-${{ needs.version.outputs.version }}-${{ matrix.name }}
     defaults:
@@ -137,8 +136,7 @@ jobs:
           cargo build --locked --release --target ${{ matrix.target }}
           cp "target/${{ matrix.target }}/release/minica${{ matrix.exe }}" "$STAGE/"
 
-      # Rust has no hosted cross toolchain for aarch64 FreeBSD, so both FreeBSD
-      # targets build natively in a VM, using the rust package from pkg.
+      # FreeBSD builds natively in a VM, using the rust package from pkg.
       - name: Build minica (FreeBSD VM)
         if: ${{ matrix.freebsd }}
         uses: vmactions/freebsd-vm@v1
