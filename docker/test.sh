@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
-# End-to-end container smoke test using Podman.
+# End-to-end container smoke test (Podman by default, Docker with
+# MINICA_CONTAINER_ENGINE=docker).
 #
-# Builds the MiniCA image, runs it with a disposable persistent /data volume,
+# Builds the MiniCA image (or uses MINICA_TEST_IMAGE, already built), runs it with a disposable persistent /data volume,
 # creates a CA through the API, then verifies the Go CLI can issue and download
 # a certificate through Basic auth.
 #
@@ -11,7 +12,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE_TAG="${IMAGE_TAG:-minica:test}"
+IMAGE_TAG="${MINICA_TEST_IMAGE:-${IMAGE_TAG:-minica:test}}"
+PREBUILT="${MINICA_TEST_IMAGE:-}"
+ENGINE="${MINICA_CONTAINER_ENGINE:-podman}"
 ADMIN_USER="${MINICA_TEST_ADMIN_USER:-admin}"
 ADMIN_PASSWORD="${MINICA_TEST_ADMIN_PASSWORD:-adminpass}"
 HOST_PORT="${MINICA_TEST_PORT:-}"
@@ -24,8 +27,8 @@ KEEP_OUT="${MINICA_TEST_KEEP_OUT:-}"
 
 cleanup() {
     set +e
-    podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1
-    podman volume rm "$VOLUME_NAME" >/dev/null 2>&1
+    "$ENGINE" rm -f "$CONTAINER_NAME" >/dev/null 2>&1
+    "$ENGINE" volume rm "$VOLUME_NAME" >/dev/null 2>&1
     if [ -n "$KEEP_OUT" ]; then
         echo "   kept test output: $OUT_DIR" >&2
     else
@@ -83,7 +86,7 @@ json_value() {
     sed -n "s/.*\"$key\":\"\\([^\"]*\\)\".*/\\1/p" | head -n1
 }
 
-require_cmd podman
+require_cmd "$ENGINE"
 require_cmd curl
 require_cmd go
 
@@ -93,14 +96,18 @@ if [ -z "$HOST_PORT" ]; then
 fi
 BASE_URL="http://127.0.0.1:$HOST_PORT/minica"
 
-echo ">> Building image $IMAGE_TAG"
-"$ROOT/docker/build.sh" "$IMAGE_TAG"
+if [ -n "$PREBUILT" ]; then
+    echo ">> Using prebuilt image $IMAGE_TAG"
+else
+    echo ">> Building image $IMAGE_TAG"
+    "$ROOT/docker/build.sh" "$IMAGE_TAG"
+fi
 
 echo ">> Creating disposable volume $VOLUME_NAME"
-podman volume create "$VOLUME_NAME" >/dev/null
+"$ENGINE" volume create "$VOLUME_NAME" >/dev/null
 
 echo ">> Starting container $CONTAINER_NAME on $BASE_URL"
-podman run -d \
+"$ENGINE" run -d \
     --name "$CONTAINER_NAME" \
     -p "$HOST_PORT:9988" \
     -v "$VOLUME_NAME:/data" \
@@ -119,7 +126,7 @@ for _ in $(seq 1 60); do
 done
 if [ "$ready" -ne 1 ]; then
     echo "error: MiniCA did not become ready" >&2
-    podman logs "$CONTAINER_NAME" >&2 || true
+    "$ENGINE" logs "$CONTAINER_NAME" >&2 || true
     exit 1
 fi
 
@@ -201,12 +208,12 @@ check_bundle "$reuse_out" docker-test-reuse
 
 echo ">> Verifying persisted /data volume contents"
 for dir in runtime sqlite logs; do
-    if ! podman run --rm --entrypoint /bin/bash -v "$VOLUME_NAME:/data:ro" "$IMAGE_TAG" -lc "test -d /data/$dir"; then
+    if ! "$ENGINE" run --rm --entrypoint /bin/bash -v "$VOLUME_NAME:/data:ro" "$IMAGE_TAG" -lc "test -d /data/$dir"; then
         echo "error: expected /data/$dir to exist in volume" >&2
         exit 1
     fi
 done
-if ! podman run --rm --entrypoint /bin/bash -v "$VOLUME_NAME:/data:ro" "$IMAGE_TAG" -lc "test -s /data/sqlite/db.sqlite"; then
+if ! "$ENGINE" run --rm --entrypoint /bin/bash -v "$VOLUME_NAME:/data:ro" "$IMAGE_TAG" -lc "test -s /data/sqlite/db.sqlite"; then
     echo "error: expected /data/sqlite/db.sqlite to exist in volume" >&2
     exit 1
 fi

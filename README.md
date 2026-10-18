@@ -183,6 +183,12 @@ the container is removed.
 - `/data/logs/minica.log` for logs
 - `/data/runtime/openssl-work` for OpenSSL temporary workdirs
 
+Released images (amd64 and arm64) are published as
+`docker.io/wushilin/minica:<version>` and `:latest`; every CI run smoke-tests
+the image with `docker/test.sh`. Set `MINICA_CONTAINER_ENGINE=docker` to run
+that test with Docker, and `MINICA_TEST_IMAGE=<tag>` to test an image you
+already built.
+
 Build the local image with Podman:
 
 ```sh

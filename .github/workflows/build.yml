@@ -1,8 +1,16 @@
 # Build MiniCA (server + mcacli) for Linux, macOS, Windows and FreeBSD on
 # x86_64 and aarch64. Every push and PR runs tests and builds all targets.
 # A push to main whose Cargo.toml version has no matching v<version> tag yet
-# also publishes a GitHub Release with the archives, so bumping the version
-# is all it takes to cut a release.
+# also publishes a GitHub Release with the archives and pushes the container
+# image to docker.io/wushilin/minica:<version> (and :latest), so bumping the
+# version is all it takes to cut a release. The image is smoke-tested on every
+# run (docker/test.sh) on both amd64 and arm64.
+#
+# A manual run with publish_docker=true pushes the image for the current
+# version even when its tag already exists (e.g. to publish an older release).
+#
+# Pushing needs the repository secret DOCKERHUB_TOKEN: a Docker Hub access
+# token for the wushilin account with Read & Write scope.
 name: build
 
 on:
@@ -10,6 +18,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      publish_docker:
+        description: Push the Docker image for the current Cargo.toml version
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -27,6 +40,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
       release: ${{ steps.v.outputs.release }}
+      docker: ${{ steps.v.outputs.docker }}
     steps:
       - uses: actions/checkout@v4
       - id: v
@@ -39,7 +53,12 @@ jobs:
             release=true
           fi
           echo "release=$release" >> "$GITHUB_OUTPUT"
-          echo "version $version, release $release"
+          docker=$release
+          if [[ "${{ inputs.publish_docker }}" == true ]]; then
+            docker=true
+          fi
+          echo "docker=$docker" >> "$GITHUB_OUTPUT"
+          echo "version $version, release $release, docker $docker"
 
   test:
     runs-on: ubuntu-latest
@@ -170,3 +189,82 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "v$VERSION" \
             --generate-notes
+
+  # Build the image from the CI-built musl binaries on a native runner per
+  # architecture and smoke-test it; on release, also push it as
+  # <version>-<arch> for the manifest job below.
+  docker:
+    needs: [version, test, build]
+    name: docker ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, os: ubuntu-latest,    name: linux-x86_64,  target: x86_64-unknown-linux-musl }
+          - { arch: arm64, os: ubuntu-24.04-arm, name: linux-aarch64, target: aarch64-unknown-linux-musl }
+    env:
+      IMAGE: docker.io/wushilin/minica
+      VERSION: ${{ needs.version.outputs.version }}
+      STAGE: minica-${{ needs.version.outputs.version }}-${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.STAGE }}
+          path: dist
+      - name: Stage server binary
+        run: |
+          mkdir -p "target/${{ matrix.target }}/release"
+          tar -xzf "dist/$STAGE.tar.gz" -C dist
+          install -m 0755 "dist/$STAGE/minica" "target/${{ matrix.target }}/release/minica"
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cli/go.mod
+          cache-dependency-path: cli/go.mod
+      - name: Build image
+        run: |
+          docker build -f docker/Dockerfile \
+            --platform linux/${{ matrix.arch }} \
+            --build-arg RUST_TARGET=${{ matrix.target }} \
+            -t minica:test .
+      - name: Smoke test
+        env:
+          MINICA_CONTAINER_ENGINE: docker
+          MINICA_TEST_IMAGE: minica:test
+        run: docker/test.sh
+      - uses: docker/login-action@v3
+        if: needs.version.outputs.docker == 'true'
+        with:
+          username: wushilin
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Push ${{ matrix.arch }} image
+        if: needs.version.outputs.docker == 'true'
+        run: |
+          docker tag minica:test "$IMAGE:$VERSION-${{ matrix.arch }}"
+          docker push "$IMAGE:$VERSION-${{ matrix.arch }}"
+
+  # Combine the per-arch images into one multi-arch tag once the GitHub
+  # Release is out (release is skipped on a manual publish_docker run).
+  docker-manifest:
+    needs: [version, docker, release]
+    if: >-
+      always() && needs.version.outputs.docker == 'true' &&
+      needs.docker.result == 'success' &&
+      contains(fromJSON('["success", "skipped"]'), needs.release.result)
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: docker.io/wushilin/minica
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: wushilin
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Publish multi-arch manifest
+        run: |
+          docker buildx imagetools create \
+            -t "$IMAGE:$VERSION" -t "$IMAGE:latest" \
+            "$IMAGE:$VERSION-amd64" "$IMAGE:$VERSION-arm64"
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
