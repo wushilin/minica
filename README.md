@@ -110,7 +110,9 @@ backup-able state, real revocation, hashed credentials, and safe concurrency.
    ./minica --start -c config.yaml
    ```
    The UI and API are served under `base_path` (default `/minica`); Swagger is at
-   `/minica/swagger`. Run `minica --help` to see all actions
+   `/minica/swagger`. `/` redirects to `/minica/`, a public (no login) directory
+   of CA cards with filtering, paging and CA certificate downloads; its
+   **Login** button leads to the signed-in UI at `/minica/cas`. Run `minica --help` to see all actions
    (`--start`, `--gen-config`, `--gen-password`, `--verify-password`).
 
 3. **Issue certs from the CLI.** See [cli/README.md](./cli/README.md):

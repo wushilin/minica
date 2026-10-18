@@ -286,12 +286,12 @@ async fn start_server(config: Config) -> Result<()> {
 const DEFAULT_ADMIN_PASSWORD: &str = "adminpass";
 
 /// Mounts the web router under `server.base_path` plus root-level redirects to
-/// the landing page. A root base path (normalised to "") is merged instead of
+/// the landing page (the public CA index at `{base}/`). A root base path (normalised to "") is merged instead of
 /// nested, because `Router::nest` panics on "/" and the web router already
 /// serves "/" itself.
 fn app_router(config: &Config, state: Arc<AppState>) -> Router {
     let base = config.server.base_path.as_str();
-    let landing = format!("{base}/cas");
+    let landing = format!("{base}/");
     let landing_index = landing.clone();
     let router = Router::new().route(
         "/index.html",
@@ -300,11 +300,14 @@ fn app_router(config: &Config, state: Arc<AppState>) -> Router {
     if base.is_empty() {
         router.merge(web::router(state))
     } else {
+        // A nested "/" only matches "{base}" itself, so the trailing-slash
+        // form of the index is routed here.
         router
             .route(
                 "/",
                 get(move || async move { axum::response::Redirect::to(&landing) }),
             )
+            .route(&format!("{base}/"), get(web::home).with_state(state.clone()))
             .nest(base, web::router(state))
     }
 }
@@ -826,11 +829,13 @@ mod tests {
                 "",
             );
             let home = env.request_with_headers("GET", "/", &[]).await;
-            assert!(home.status.is_redirection(), "{}", home.status);
-            assert_eq!(home.header(header::LOCATION), "/cas");
+            home.assert_status(StatusCode::OK);
+            let html = home.text();
+            assert!(html.contains(r#"class="brand" href="/""#), "{html}");
+            assert!(html.contains(r#"href="/cas">Login</a>"#), "{html}");
 
             let index = env.request_with_headers("GET", "/index.html", &[]).await;
-            assert_eq!(index.header(header::LOCATION), "/cas");
+            assert_eq!(index.header(header::LOCATION), "/");
 
             let page = env
                 .request_with_headers(
@@ -2099,6 +2104,110 @@ mod tests {
             .await;
         response.assert_status(StatusCode::OK);
         response.json()
+    }
+
+    #[tokio::test]
+    async fn public_index_lists_filters_and_pages_cas_without_login() {
+        let env = TestEnv::new();
+        for uri in ["/", "/index.html"] {
+            let response = env.send("GET", uri, None, None, None, Body::empty()).await;
+            assert!(response.status.is_redirection(), "{uri}: {}", response.status);
+            assert_eq!(response.header(header::LOCATION), "/minica/", "{uri}");
+        }
+
+        let empty = env.send("GET", "/minica/", None, None, None, Body::empty()).await;
+        empty.assert_status(StatusCode::OK);
+        let html = empty.text();
+        assert!(html.contains("No certificate authorities have been published yet."), "{html}");
+        assert!(html.contains(r#"href="/minica/cas">Login</a>"#), "{html}");
+
+        let csrf = env.get_csrf().await;
+        let mut ids = Vec::new();
+        for i in 0..13 {
+            let ca = create_test_ca(&env, &csrf, &format!("pub-{i:02}.example")).await;
+            ids.push(ca["id"].as_str().unwrap().to_string());
+        }
+        create_test_ca(&env, &csrf, "Other <Root>").await;
+
+        let page1 = env.send("GET", "/minica/", None, None, None, Body::empty()).await;
+        page1.assert_status(StatusCode::OK);
+        assert!(!page1.headers.contains_key(header::WWW_AUTHENTICATE));
+        let html = page1.text();
+        assert_eq!(html.matches(r#"class="ca-card""#).count(), 12, "{html}");
+        assert!(html.contains("Showing 1–12 of 14"), "{html}");
+        assert!(html.contains(r#"href="/minica/?page=2">Next</a>"#), "{html}");
+        // Newest first, as on the signed-in list; names are escaped.
+        assert!(html.contains("Other &lt;Root&gt;"), "{html}");
+        assert!(html.contains(&format!(r#"href="/minica/{}/download""#, ids[12])), "{html}");
+        assert!(!html.contains("PRIVATE KEY"), "{html}");
+
+        let page2 = env.send("GET", "/minica/?page=2", None, None, None, Body::empty()).await;
+        let html = page2.text();
+        assert_eq!(html.matches(r#"class="ca-card""#).count(), 2, "{html}");
+        assert!(html.contains(&format!(r#"href="/minica/{}/download""#, ids[0])), "{html}");
+
+        // Out-of-range and malformed pages clamp instead of failing.
+        let clamped = env.send("GET", "/minica/?page=99", None, None, None, Body::empty()).await;
+        assert!(clamped.text().contains("Showing 13–14 of 14"));
+        let bad = env.send("GET", "/minica/?page=x", None, None, None, Body::empty()).await;
+        assert!(bad.text().contains("Showing 1–12 of 14"));
+
+        // Case-insensitive substring filter; paging links keep the filter.
+        let filtered = env.send("GET", "/minica/?q=PUB-1", None, None, None, Body::empty()).await;
+        let html = filtered.text();
+        assert_eq!(html.matches(r#"class="ca-card""#).count(), 3, "{html}");
+        assert!(html.contains(r#"value="PUB-1""#), "{html}");
+        assert!(!html.contains(r#"class="pager""#), "{html}");
+        let filtered = env.send("GET", "/minica/?q=pub&page=2", None, None, None, Body::empty()).await;
+        let html = filtered.text();
+        assert!(html.contains("Showing 13–13 of 13"), "{html}");
+        assert!(html.contains(r#"href="/minica/?q=pub">Prev</a>"#), "{html}");
+
+        let none = env.send("GET", "/minica/?q=%3Cnope%3E", None, None, None, Body::empty()).await;
+        let html = none.text();
+        assert!(html.contains("No certificate authorities match &quot;&lt;nope&gt;&quot;."), "{html}");
+        assert!(!html.contains("<nope>"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn signed_in_ca_list_filters_and_pages() {
+        let env = TestEnv::new();
+        let csrf = env.get_csrf().await;
+        for i in 0..21 {
+            create_test_ca(&env, &csrf, &format!("list-{i:02}.example")).await;
+        }
+        create_test_ca(&env, &csrf, "Zeta Root").await;
+        let admin = basic_auth("admin", "adminpass");
+        let get = |uri: &'static str| {
+            let admin = admin.clone();
+            let env = &env;
+            async move {
+                let response = env
+                    .request_with_headers("GET", uri, &[("authorization", &admin)])
+                    .await;
+                response.assert_status(StatusCode::OK);
+                response.text()
+            }
+        };
+
+        let html = get("/minica/cas").await;
+        assert_eq!(html.matches(r#"<tr><td><a class="row-link""#).count(), 20, "{html}");
+        assert!(html.contains("Showing 1–20 of 22"), "{html}");
+        assert!(html.contains(r#"action="/minica/cas""#), "{html}");
+        assert!(html.contains(r#"href="/minica/cas?page=2">Next</a>"#), "{html}");
+
+        let html = get("/minica/cas?page=2").await;
+        assert_eq!(html.matches(r#"<tr><td><a class="row-link""#).count(), 2, "{html}");
+
+        let html = get("/minica/cas?q=zeta").await;
+        assert_eq!(html.matches(r#"<tr><td><a class="row-link""#).count(), 1, "{html}");
+        assert!(html.contains("Zeta Root"), "{html}");
+        assert!(html.contains(r#"href="/minica/cas">Clear</a>"#), "{html}");
+        assert!(!html.contains(r#"class="pager""#), "{html}");
+
+        let html = get("/minica/cas?q=nothing").await;
+        assert!(html.contains("No certificate authorities match &quot;nothing&quot;."), "{html}");
+        assert!(!html.contains("<table"), "{html}");
     }
 
     #[tokio::test]
