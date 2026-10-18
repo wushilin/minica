@@ -1036,7 +1036,10 @@ impl OpenSsl {
         tracing::debug!(workdir = %dir.display(), "creating PKCS12 truststore");
         fs::write(dir.join("truststore-cert.pem"), cert_pem)?;
         let passout = write_pass_file(dir, "truststore.pass", password.as_bytes())?;
-        self.run_ok(
+        // `-jdktrust` is an OpenSSL 3.2 addition (LibreSSL has none), and no
+        // older flag can set the attribute. If it fails, build the store
+        // natively instead.
+        let out = self.run_in(
             dir,
             &[
                 "pkcs12",
@@ -1053,8 +1056,16 @@ impl OpenSsl {
                 "-passout",
                 &passout,
             ],
+            Duration::from_secs(self.config.timeout_seconds),
         )?;
-        Ok(fs::read(dir.join("truststore.p12"))?)
+        if out.exit_code == 0 {
+            return Ok(fs::read(dir.join("truststore.p12"))?);
+        }
+        tracing::info!(
+            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+            "openssl pkcs12 -jdktrust unavailable (needs OpenSSL 3.2+); building the truststore natively"
+        );
+        crate::pkcs12::truststore(cert_pem, alias, password)
     }
 
     pub fn inspect_cert_text(&self, dir: &Path, pem: &str) -> Result<String> {
