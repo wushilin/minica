@@ -2,15 +2,17 @@
 # x86_64 and aarch64. Every push and PR runs tests and builds all targets.
 # A push to main whose Cargo.toml version has no matching v<version> tag yet
 # also publishes a GitHub Release with the archives and pushes the container
-# image to docker.io/wushilin/minica:<version> (and :latest), so bumping the
-# version is all it takes to cut a release. The image is smoke-tested on every
+# image to docker.io/wushilin/minica:<version> and ghcr.io/wushilin/minica:<version>
+# (and :latest on both), so bumping the version is all it takes to cut a
+# release. The image is smoke-tested on every
 # run (docker/test.sh) on both amd64 and arm64.
 #
 # A manual run with publish_docker=true pushes the image for the current
 # version even when its tag already exists (e.g. to publish an older release).
 #
-# Pushing needs the repository secret DOCKERHUB_TOKEN: a Docker Hub access
-# token for the wushilin account with Read & Write scope.
+# Pushing to Docker Hub needs the repository secret DOCKERHUB_TOKEN: a Docker
+# Hub access token for the wushilin account with Read & Write scope. GHCR uses
+# the workflow's GITHUB_TOKEN.
 name: build
 
 on:
@@ -201,6 +203,9 @@ jobs:
     needs: [version, test, build]
     name: docker ${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -208,7 +213,7 @@ jobs:
           - { arch: amd64, os: ubuntu-latest,    name: linux-x86_64,  target: x86_64-unknown-linux-musl }
           - { arch: arm64, os: ubuntu-24.04-arm, name: linux-aarch64, target: aarch64-unknown-linux-musl }
     env:
-      IMAGE: docker.io/wushilin/minica
+      IMAGES: docker.io/wushilin/minica ghcr.io/wushilin/minica
       VERSION: ${{ needs.version.outputs.version }}
       STAGE: minica-${{ needs.version.outputs.version }}-${{ matrix.name }}
     steps:
@@ -231,6 +236,7 @@ jobs:
           docker build -f docker/Dockerfile \
             --platform linux/${{ matrix.arch }} \
             --build-arg RUST_TARGET=${{ matrix.target }} \
+            --label org.opencontainers.image.source=https://github.com/${{ github.repository }} \
             -t minica:test .
       - name: Smoke test
         env:
@@ -242,11 +248,19 @@ jobs:
         with:
           username: wushilin
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/login-action@v3
+        if: needs.version.outputs.docker == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
       - name: Push ${{ matrix.arch }} image
         if: needs.version.outputs.docker == 'true'
         run: |
-          docker tag minica:test "$IMAGE:$VERSION-${{ matrix.arch }}"
-          docker push "$IMAGE:$VERSION-${{ matrix.arch }}"
+          for image in $IMAGES; do
+            docker tag minica:test "$image:$VERSION-${{ matrix.arch }}"
+            docker push "$image:$VERSION-${{ matrix.arch }}"
+          done
 
   # Combine the per-arch images into one multi-arch tag once the GitHub
   # Release is out (release is skipped on a manual publish_docker run).
@@ -257,8 +271,10 @@ jobs:
       needs.docker.result == 'success' &&
       contains(fromJSON('["success", "skipped"]'), needs.release.result)
     runs-on: ubuntu-latest
+    permissions:
+      packages: write
     env:
-      IMAGE: docker.io/wushilin/minica
+      IMAGES: docker.io/wushilin/minica ghcr.io/wushilin/minica
       VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: docker/setup-buildx-action@v3
@@ -266,9 +282,16 @@ jobs:
         with:
           username: wushilin
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Publish multi-arch manifest
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Publish multi-arch manifests
         run: |
-          docker buildx imagetools create \
-            -t "$IMAGE:$VERSION" -t "$IMAGE:latest" \
-            "$IMAGE:$VERSION-amd64" "$IMAGE:$VERSION-arm64"
-          docker buildx imagetools inspect "$IMAGE:$VERSION"
+          for image in $IMAGES; do
+            docker buildx imagetools create \
+              -t "$image:$VERSION" -t "$image:latest" \
+              "$image:$VERSION-amd64" "$image:$VERSION-arm64"
+            docker buildx imagetools inspect "$image:$VERSION"
+          done
