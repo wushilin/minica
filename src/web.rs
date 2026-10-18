@@ -163,14 +163,277 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-pub async fn home(State(state): State<Arc<AppState>>) -> Redirect {
-    Redirect::to(&u(&state, "/cas"))
+/// CA cards per page on the public index.
+const PUBLIC_PAGE_SIZE: usize = 12;
+
+/// Table rows per page on the signed-in CA list.
+const CA_LIST_PAGE_SIZE: usize = 20;
+
+/// `?q=&page=` for the CA lists.
+#[derive(Deserialize)]
+pub struct CaListQuery {
+    q: Option<String>,
+    /// Kept as text so a malformed value falls back to page 1 instead of a 400.
+    page: Option<String>,
 }
 
-async fn ca_list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+/// One page of a CA list after the name filter (a case-insensitive substring
+/// of the common name). Out-of-range pages clamp to the nearest one.
+struct CaPage<'a> {
+    filter: String,
+    matched: Vec<&'a crate::models::CertificateAuthority>,
+    page: usize,
+    pages: usize,
+    start: usize,
+    size: usize,
+}
+
+impl<'a> CaPage<'a> {
+    fn new(
+        cas: &'a [crate::models::CertificateAuthority],
+        query: &CaListQuery,
+        size: usize,
+    ) -> Self {
+        let filter = query.q.as_deref().unwrap_or("").trim().to_string();
+        let needle = filter.to_lowercase();
+        let matched: Vec<_> = cas
+            .iter()
+            .filter(|ca| needle.is_empty() || ca.common_name.to_lowercase().contains(&needle))
+            .collect();
+        let pages = matched.len().div_ceil(size).max(1);
+        let page = query
+            .page
+            .as_deref()
+            .and_then(|p| p.parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, pages);
+        Self {
+            filter,
+            matched,
+            page,
+            pages,
+            start: (page - 1) * size,
+            size,
+        }
+    }
+
+    fn shown(&self) -> &[&'a crate::models::CertificateAuthority] {
+        &self.matched[self.start..self.matched.len().min(self.start + self.size)]
+    }
+
+    /// The GET filter form submitting to `action`, with a Clear link and the
+    /// "Showing x–y of n" summary.
+    fn filter_form(&self, lang: Lang, action: &str) -> String {
+        let clear = if self.filter.is_empty() {
+            String::new()
+        } else {
+            format!(
+                r#"<a class="btn btn-outline-secondary" href="{action}">{}</a>"#,
+                t(lang, "public.filter_clear")
+            )
+        };
+        let summary = if self.matched.is_empty() {
+            String::new()
+        } else {
+            tf(
+                lang,
+                "public.showing",
+                &[
+                    ("from", &(self.start + 1).to_string()),
+                    ("to", &(self.start + self.shown().len()).to_string()),
+                    ("total", &self.matched.len().to_string()),
+                ],
+            )
+        };
+        format!(
+            r#"<form class="ca-filter" method="get" action="{action}" role="search"><input class="form-control" type="search" name="q" value="{}" placeholder="{}" aria-label="{}"><button class="btn btn-primary" type="submit">{}</button>{clear}<span class="muted ca-filter-summary">{summary}</span></form>"#,
+            h(&self.filter),
+            t(lang, "public.filter_placeholder"),
+            t(lang, "public.filter_placeholder"),
+            t(lang, "public.filter_submit"),
+        )
+    }
+
+    fn no_match(&self, lang: Lang) -> String {
+        format!(
+            r#"<section class="empty"><p>{}</p></section>"#,
+            tf(lang, "public.no_match", &[("query", &self.filter)])
+        )
+    }
+
+    /// Page links back to `action`; empty when everything fits on one page.
+    fn pager(&self, lang: Lang, action: &str) -> String {
+        if self.pages > 1 {
+            ca_pager(lang, action, &self.filter, self.page, self.pages)
+        } else {
+            String::new()
+        }
+    }
+}
+
+/// `{base}/`: the public CA directory. Needs no account, like the CA
+/// certificate downloads it links to; only public metadata is rendered.
+/// Filtering (case-insensitive substring of the common name) and paging
+/// happen server side, so the page works without JS.
+pub async fn home(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<CaListQuery>,
+) -> Response {
+    let lang = request_lang(&headers);
+    let task_state = state.clone();
+    let cas = match blocking(move || task_state.service.list_cas()).await {
+        Ok(cas) => cas,
+        Err(err) => {
+            tracing::error!(error = %err, "public CA list failed");
+            return error_page(
+                &state,
+                &headers,
+                lang,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &t(lang, "error.title.server"),
+            );
+        }
+    };
+    let list = CaPage::new(&cas, &query, PUBLIC_PAGE_SIZE);
+    let base = state.config.server.base_path.trim_end_matches('/');
+    let index = format!("{base}/");
+    let mut body = format!(
+        r#"<div class="toolbar"><div><h1>{}</h1><p class="muted">{}</p></div></div>"#,
+        t(lang, "ca.list.title"),
+        t(lang, "public.subtitle")
+    );
+    if !cas.is_empty() {
+        body.push_str(&list.filter_form(lang, &index));
+    }
+    if cas.is_empty() {
+        body.push_str(&format!(
+            r#"<section class="empty"><h2>{}</h2><p>{}</p></section>"#,
+            t(lang, "ca.list.empty_title"),
+            t(lang, "public.empty")
+        ));
+    } else if list.matched.is_empty() {
+        body.push_str(&list.no_match(lang));
+    } else {
+        body.push_str(r#"<div class="ca-cards">"#);
+        for ca in list.shown() {
+            let crl = ca
+                .crl_url
+                .as_ref()
+                .map(|url| {
+                    format!(
+                        r#"<a class="btn btn-outline-secondary" href="{}">{}</a>"#,
+                        h(url),
+                        t(lang, "field.crl")
+                    )
+                })
+                .unwrap_or_default();
+            body.push_str(&format!(
+                r#"<article class="ca-card"><h2 class="ca-card-title">{}</h2><div class="subject">{}</div><dl class="ca-card-meta"><dt>{}</dt><dd>{}</dd><dt>{}</dt><dd>{}</dd><dt>{}</dt><dd>{}</dd></dl><div class="ca-card-actions"><a class="btn btn-primary" href="{base}/{}/download">{}</a>{crl}</div></article>"#,
+                h(&ca.common_name),
+                h(&ca.subject),
+                t(lang, "field.issued"),
+                date(ca.issue_time),
+                t(lang, "field.valid_until"),
+                validity_label(lang, ca.issue_time + ca.valid_days * 86_400_000),
+                t(lang, "field.key"),
+                ca_key_label(lang, &ca.key_profile, &ca.digest_algorithm),
+                url_encode(&ca.id),
+                t(lang, "public.download_cert"),
+            ));
+        }
+        body.push_str("</div>");
+        body.push_str(&list.pager(lang, &index));
+    }
+    let login = format!(
+        r#"<a class="topbar-link topbar-login" href="{base}/cas">{}</a>"#,
+        t(lang, "nav.login")
+    );
+    let mut response = Html(layout_with(base, lang, &body, &index, "", &login)).into_response();
+    refresh_lang_cookie(&state, &headers, &mut response);
+    response
+}
+
+/// Prev / numbered / Next links for a CA list. Shows the first and last
+/// page plus two either side of the current one, with gaps elided.
+fn ca_pager(lang: Lang, index: &str, filter: &str, page: usize, pages: usize) -> String {
+    let href = |p: usize| {
+        let mut params = Vec::new();
+        if !filter.is_empty() {
+            params.push(format!("q={}", url_encode(filter)));
+        }
+        if p > 1 {
+            params.push(format!("page={p}"));
+        }
+        if params.is_empty() {
+            index.to_string()
+        } else {
+            format!("{index}?{}", params.join("&amp;"))
+        }
+    };
+    let step = |label: String, target: Option<usize>| match target {
+        Some(p) => format!(
+            r#"<a class="btn btn-sm btn-outline-secondary" href="{}">{label}</a>"#,
+            href(p)
+        ),
+        None => format!(
+            r#"<span class="btn btn-sm btn-outline-secondary disabled" aria-disabled="true">{label}</span>"#
+        ),
+    };
+    let mut out = format!(
+        r#"<nav class="pager" aria-label="{}">"#,
+        t(lang, "public.pages")
+    );
+    out.push_str(&step(t(lang, "pager.prev"), (page > 1).then(|| page - 1)));
+    let mut last_shown = 0;
+    for p in 1..=pages {
+        if p != 1 && p != pages && p.abs_diff(page) > 2 {
+            continue;
+        }
+        if p > last_shown + 1 {
+            out.push_str(r#"<span class="muted">…</span>"#);
+        }
+        last_shown = p;
+        if p == page {
+            out.push_str(&format!(
+                r#"<span class="btn btn-sm btn-primary" aria-current="page">{p}</span>"#
+            ));
+        } else {
+            out.push_str(&format!(
+                r#"<a class="btn btn-sm btn-outline-secondary" href="{}">{p}</a>"#,
+                href(p)
+            ));
+        }
+    }
+    out.push_str(&step(t(lang, "pager.next"), (page < pages).then(|| page + 1)));
+    out.push_str("</nav>");
+    out
+}
+
+/// Percent-encodes everything but RFC 3986 unreserved characters, for query
+/// values and path segments.
+fn url_encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+async fn ca_list(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<CaListQuery>,
+) -> Response {
     let lang = request_lang(&headers);
     page_response(state, headers, move |state, user, _csrf| {
         let cas = state.service.list_cas()?;
+        let list = CaPage::new(&cas, &query, CA_LIST_PAGE_SIZE);
+        let action = u(state, "/cas");
         let mut body = breadcrumb(lang, &[(t(lang, "crumb.home"), None)]);
         let write_actions = if user.role.can_write() {
             format!(
@@ -210,7 +473,11 @@ async fn ca_list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
                     t(lang, "ca.list.empty_viewer")
                 ));
             }
+        } else if list.matched.is_empty() {
+            body.push_str(&list.filter_form(lang, &action));
+            body.push_str(&list.no_match(lang));
         } else {
+            body.push_str(&list.filter_form(lang, &action));
             body.push_str(&format!(
                 r#"<table class="table table-hover align-middle"><thead><tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th></tr></thead><tbody>"#,
                 t(lang, "field.common_name"),
@@ -219,7 +486,7 @@ async fn ca_list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
                 t(lang, "field.algorithm"),
                 t(lang, "ca.list.certs")
             ));
-            for ca in cas {
+            for ca in list.shown() {
                 body.push_str(&format!(
                     r#"<tr><td><a class="row-link" href="{}"><strong>{}</strong></a><div class="tiny">{}</div></td><td class="subject">{}</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
                     u(state, &format!("/cas/{}", ca.id)),
@@ -232,6 +499,7 @@ async fn ca_list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
                 ));
             }
             body.push_str("</tbody></table>");
+            body.push_str(&list.pager(lang, &action));
         }
         Ok(body)
     })
@@ -2859,7 +3127,7 @@ fn cert_form_fields(lang: Lang, csrf: &str, v: &SubjectValues) -> String {
 }
 
 fn layout(base: &str, lang: Lang, content: &str, is_admin: bool) -> String {
-    let admin_link = if is_admin {
+    let links = if is_admin {
         format!(
             r#"<a class="topbar-link" href="{}/swagger">{}</a><a class="topbar-link" href="{}/admin">{}</a>"#,
             base,
@@ -2870,6 +3138,19 @@ fn layout(base: &str, lang: Lang, content: &str, is_admin: bool) -> String {
     } else {
         String::new()
     };
+    layout_with(base, lang, content, &format!("{base}/cas"), &links, "")
+}
+
+/// The page shell. `home` is the brand link target; `links` and `trailing`
+/// (trusted HTML) go in the top bar before and after the language menu.
+fn layout_with(
+    base: &str,
+    lang: Lang,
+    content: &str,
+    home: &str,
+    links: &str,
+    trailing: &str,
+) -> String {
     let switcher = lang_switcher(base, lang);
     let modal = format!(
         r#"<div id="confirm-modal" class="modal-backdrop" hidden><div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><h3 id="confirm-title">{}</h3><p id="confirm-message"></p><div class="modal-actions"><button type="button" class="btn btn-outline-secondary" id="confirm-cancel">{}</button><button type="button" class="btn btn-danger" id="confirm-ok">{}</button></div></div></div>"#,
@@ -2880,7 +3161,7 @@ fn layout(base: &str, lang: Lang, content: &str, is_admin: bool) -> String {
     let strings = script_strings(lang);
     let (code, dir) = (lang.code(), lang.dir());
     format!(
-        r#"<!doctype html><html lang="{code}" dir="{dir}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>MiniCA</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"><style>{CSS}</style></head><body><header class="topbar"><a class="brand" href="{base}/cas">MiniCA</a><div class="topbar-actions">{admin_link}{switcher}</div></header><main>{content}</main>{modal}<script type="application/json" id="minica-i18n">{strings}</script><script>{JS}</script></body></html>"#
+        r#"<!doctype html><html lang="{code}" dir="{dir}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>MiniCA</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"><style>{CSS}</style></head><body><header class="topbar"><a class="brand" href="{home}">MiniCA</a><div class="topbar-actions">{links}{switcher}{trailing}</div></header><main>{content}</main>{modal}<script type="application/json" id="minica-i18n">{strings}</script><script>{JS}</script></body></html>"#
     )
 }
 
@@ -3603,6 +3884,20 @@ label .form-control,label .form-select,textarea{margin-top:6px}
 .swagger-panel .swagger-ui{font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif}
 .pager{display:flex;gap:8px;justify-content:flex-end;align-items:center;margin-top:12px}
 .pager button{min-width:34px}
+.ca-filter{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 20px}
+.ca-filter .form-control{max-width:340px}
+.ca-filter-summary{margin-inline-start:auto}
+.ca-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px}
+.ca-card{background:#fff;border:1px solid #dde2ea;border-radius:10px;padding:18px;display:flex;flex-direction:column;gap:10px;min-width:0}
+.ca-card:hover{border-color:#cdd8f0;box-shadow:0 4px 16px rgba(15,23,42,.06)}
+.ca-card-title{font-size:18px;font-weight:700;margin:0;overflow-wrap:anywhere}
+.ca-card .subject{overflow-wrap:anywhere}
+.ca-card-meta{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;margin:0;font-size:14px}
+.ca-card-meta dt{color:#6b7280;font-weight:600}
+.ca-card-meta dd{margin:0}
+.ca-card-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:auto;padding-top:6px}
+.topbar-login{background:#3257c4;border-color:#3257c4;color:#fff}
+.topbar-login:hover{background:#23408f;color:#fff}
 .raw-output{white-space:pre-wrap;background:#101828;color:#eef3ff;border-radius:8px;padding:16px;max-height:620px;overflow:auto}
 @media(max-width:900px){.download-grid{grid-template-columns:1fr}}
 .flash-panel{display:flex;align-items:center;gap:12px;padding:15px 18px;border-radius:10px;margin:0 0 22px;font-weight:600;font-size:15px;box-shadow:0 2px 12px rgba(15,23,42,.08);animation:flash-in .2s ease-out}
