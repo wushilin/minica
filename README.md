@@ -131,7 +131,8 @@ backup-able state, real revocation, hashed credentials, and safe concurrency.
 
 Every release is published to Docker Hub as a multi-arch image (`linux/amd64`
 and `linux/arm64`): `wushilin/minica:<version>` (e.g. `1.2.1`) and
-`wushilin/minica:latest`. It is based on Alpine with a current OpenSSL, runs as
+`wushilin/minica:latest`, and to the GitHub Container Registry under the same
+name (`ghcr.io/wushilin/minica:<version>`). It is based on Alpine with a current OpenSSL, runs as
 the unprivileged user `minica` (uid/gid `10001`), and keeps all state under
 `/data`. Podman accepts the same commands (use `docker.io/wushilin/minica:...`).
 
