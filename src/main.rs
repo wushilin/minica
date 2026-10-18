@@ -5,6 +5,7 @@ mod i18n;
 mod logging;
 mod models;
 mod openssl;
+mod pkcs12;
 mod service;
 mod web;
 

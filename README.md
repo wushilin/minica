@@ -183,6 +183,12 @@ the container is removed.
 - `/data/logs/minica.log` for logs
 - `/data/runtime/openssl-work` for OpenSSL temporary workdirs
 
+Released images (amd64 and arm64) are published as
+`docker.io/wushilin/minica:<version>` and `:latest`; every CI run smoke-tests
+the image with `docker/test.sh`. Set `MINICA_CONTAINER_ENGINE=docker` to run
+that test with Docker, and `MINICA_TEST_IMAGE=<tag>` to test an image you
+already built.
+
 Build the local image with Podman:
 
 ```sh
@@ -296,6 +302,12 @@ openssl:
 
 Caveats:
 
+- **CA truststore download.** The per-CA PKCS#12 truststore is built with
+  `openssl pkcs12 -export -jdktrust`, which needs OpenSSL 3.2 or newer. With
+  LibreSSL or OpenSSL 3.0/3.1 (e.g. Ubuntu 24.04, Debian 12), MiniCA builds
+  the same truststore itself (the certificate stored unencrypted, with the
+  same alias, Java trust attribute and HMAC-SHA256 MAC), so Java still loads
+  it as a `trustedCertEntry`.
 - **PKCS#12 encryption defaults.** LibreSSL's `pkcs12 -export` still defaults
   to 3DES for keys and 40-bit RC2 for certificates (OpenSSL 3 uses AES-256 +
   PBKDF2). The resulting `.p12` bundles import fine into Windows, Java, and
