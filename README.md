@@ -130,7 +130,7 @@ backup-able state, real revocation, hashed credentials, and safe concurrency.
 ### Running with Docker
 
 Every release is published to Docker Hub as a multi-arch image (`linux/amd64`
-and `linux/arm64`): `wushilin/minica:<version>` (e.g. `1.2.1`) and
+and `linux/arm64`): `wushilin/minica:<version>` (e.g. `1.2.2`) and
 `wushilin/minica:latest`, and to the GitHub Container Registry under the same
 name (`ghcr.io/wushilin/minica:<version>`). It is based on Alpine with a current OpenSSL, runs as
 the unprivileged user `minica` (uid/gid `10001`), and keeps all state under
@@ -138,7 +138,7 @@ the unprivileged user `minica` (uid/gid `10001`), and keeps all state under
 
 1. **Hash an admin password** (the default `adminpass` is publicly known):
    ```sh
-   docker run --rm --entrypoint /opt/minica/minica wushilin/minica:1.2.1 \
+   docker run --rm --entrypoint /opt/minica/minica wushilin/minica:1.2.2 \
      --gen-password 'your-admin-password'
    # prints a bcrypt hash such as $2b$12$...
    ```
@@ -151,7 +151,7 @@ the unprivileged user `minica` (uid/gid `10001`), and keeps all state under
      -v minica-data:/data \
      -e MINICA_ADMIN_PASSWORD='$2b$12$...' \
      -e MINICA_PUBLIC_BASE_URL=http://ca.example.com:9988/minica \
-     wushilin/minica:1.2.1
+     wushilin/minica:1.2.2
    ```
    `MINICA_PUBLIC_BASE_URL` is the address clients use to reach MiniCA; it goes
    into the CRL distribution URLs of issued certificates. Any other setting can
@@ -173,7 +173,7 @@ the unprivileged user `minica` (uid/gid `10001`), and keeps all state under
 `10001:10001`, or MiniCA exits with `Permission denied`:
 ```sh
 mkdir -p /srv/minica && sudo chown -R 10001:10001 /srv/minica
-docker run -d --name minica -p 9988:9988 -v /srv/minica:/data ... wushilin/minica:1.2.1
+docker run -d --name minica -p 9988:9988 -v /srv/minica:/data ... wushilin/minica:1.2.2
 # rootless Podman: podman unshare chown -R 10001:10001 /srv/minica
 # (add :Z to the -v option on SELinux hosts)
 ```
