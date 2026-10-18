@@ -2210,6 +2210,140 @@ mod tests {
         assert!(!html.contains("<table"), "{html}");
     }
 
+    /// The stored truststore column of a CA, read straight from the database.
+    fn stored_truststore(env: &TestEnv, ca_id: &str) -> Vec<u8> {
+        rusqlite::Connection::open(env.root.join("db").join("db.sqlite"))
+            .expect("open test database")
+            .query_row(
+                "SELECT truststore FROM certificate_authorities WHERE id = ?",
+                [ca_id],
+                |row| row.get(0),
+            )
+            .expect("read truststore")
+    }
+
+    /// `openssl pkcs12 -info` of a truststore opened with the published
+    /// password, with the CA's id and certificate replaced by placeholders so
+    /// two CAs' stores can be compared.
+    fn describe_truststore(env: &TestEnv, ca_id: &str, cert_pem: &str, p12: &[u8]) -> String {
+        let path = env.root.join(format!("{ca_id}.p12"));
+        fs::write(&path, p12).expect("write truststore");
+        let out = std::process::Command::new("/usr/bin/openssl")
+            .args(["pkcs12", "-info", "-nokeys", "-passin", "pass:changeit", "-in"])
+            .arg(&path)
+            .output()
+            .expect("run openssl");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let info = String::from_utf8(out.stdout).expect("utf8 openssl output");
+        assert!(info.contains(cert_pem.trim()), "{info}");
+        info.replace(cert_pem.trim(), "<cert>").replace(ca_id, "<id>")
+    }
+
+    #[tokio::test]
+    async fn truststore_download_is_the_same_for_prebuilt_and_legacy_cas() {
+        let env = TestEnv::new();
+        let csrf = env.get_csrf().await;
+        let mut cas = Vec::new();
+        for name in ["prebuilt.truststore.test", "legacy.truststore.test"] {
+            let ca = create_test_ca(&env, &csrf, name).await;
+            let id = ca["id"].as_str().unwrap().to_string();
+            let pem = ca["cert_pem"].as_str().unwrap().to_string();
+            assert!(!stored_truststore(&env, &id).is_empty(), "built at creation");
+            cas.push((id, pem, name));
+        }
+        // Simulate a CA created before truststores existed.
+        let (legacy, _, _) = &cas[1];
+        rusqlite::Connection::open(env.root.join("db").join("db.sqlite"))
+            .unwrap()
+            .execute(
+                "UPDATE certificate_authorities SET truststore = X'' WHERE id = ?",
+                [legacy],
+            )
+            .unwrap();
+        assert!(stored_truststore(&env, legacy).is_empty());
+
+        let mut seen = Vec::new();
+        for (id, pem, name) in &cas {
+            // Anonymous, like the CA certificate.
+            let uri = format!("/minica/download/ca/{id}/truststore");
+            let first = env.send("GET", &uri, None, None, None, Body::empty()).await;
+            first.assert_status(StatusCode::OK);
+            assert!(!first.headers.contains_key(header::SET_COOKIE));
+            let disposition = first
+                .header(header::CONTENT_DISPOSITION)
+                .replace(id.as_str(), "<id>");
+            let content_type = first.header(header::CONTENT_TYPE).to_string();
+            let info = describe_truststore(&env, id, pem, &first.body).replace(name, "<cn>");
+            assert!(info.contains("Trusted key usage (Oracle)"), "{info}");
+            assert!(info.contains("friendlyName: minica-<id>"), "{info}");
+
+            // Stored after the first download and served unchanged after.
+            assert_eq!(stored_truststore(&env, id), first.body);
+            let again = env.send("GET", &uri, None, None, None, Body::empty()).await;
+            assert_eq!(again.body, first.body);
+
+            let password = env
+                .send(
+                    "GET",
+                    &format!("/minica/download/ca/{id}/truststore-password"),
+                    None,
+                    None,
+                    None,
+                    Body::empty(),
+                )
+                .await;
+            password.assert_status(StatusCode::OK);
+            assert_eq!(password.text(), "changeit");
+            let password_disposition = password
+                .header(header::CONTENT_DISPOSITION)
+                .replace(id.as_str(), "<id>");
+            seen.push((disposition, content_type, info, password_disposition));
+        }
+        assert_eq!(seen[0], seen[1]);
+        assert!(seen[0].0.contains("ca-<id>-truststore.p12"), "{:?}", seen[0]);
+    }
+
+    #[tokio::test]
+    async fn ca_renewal_rebuilds_the_truststore() {
+        let env = TestEnv::new();
+        let csrf = env.get_csrf().await;
+        let ca = create_test_ca(&env, &csrf, "truststore.renew.test").await;
+        let id = ca["id"].as_str().unwrap().to_string();
+        let before = stored_truststore(&env, &id);
+
+        let renewed = env
+            .json(
+                "POST",
+                &format!("/minica/api/cas/{id}/renew/400"),
+                Some(("admin", "adminpass")),
+                Some(&csrf),
+                json!({}),
+            )
+            .await;
+        renewed.assert_status(StatusCode::OK);
+        let new_pem = renewed.api_envelope()["data"]["cert_pem"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(new_pem, ca["cert_pem"].as_str().unwrap());
+
+        let after = stored_truststore(&env, &id);
+        assert!(!after.is_empty());
+        assert_ne!(after, before);
+        let download = env
+            .send(
+                "GET",
+                &format!("/minica/download/ca/{id}/truststore"),
+                None,
+                None,
+                None,
+                Body::empty(),
+            )
+            .await;
+        download.assert_status(StatusCode::OK);
+        describe_truststore(&env, &id, &new_pem, &download.body);
+    }
+
     #[tokio::test]
     async fn ca_certificate_is_public_but_key_material_is_not() {
         let env = TestEnv::new();

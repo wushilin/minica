@@ -1023,6 +1023,40 @@ impl OpenSsl {
         Ok(info)
     }
 
+    /// A certificate-only PKCS#12 truststore holding `cert_pem` under `alias`.
+    /// The Oracle trusted-key-usage attribute (`-jdktrust`) makes Java load
+    /// the entry as a `trustedCertEntry`; without it Java ignores the cert.
+    pub fn truststore_pkcs12(
+        &self,
+        dir: &Path,
+        cert_pem: &[u8],
+        alias: &str,
+        password: &str,
+    ) -> Result<Vec<u8>> {
+        tracing::debug!(workdir = %dir.display(), "creating PKCS12 truststore");
+        fs::write(dir.join("truststore-cert.pem"), cert_pem)?;
+        let passout = write_pass_file(dir, "truststore.pass", password.as_bytes())?;
+        self.run_ok(
+            dir,
+            &[
+                "pkcs12",
+                "-export",
+                "-nokeys",
+                "-in",
+                "truststore-cert.pem",
+                "-jdktrust",
+                "anyExtendedKeyUsage",
+                "-caname",
+                alias,
+                "-out",
+                "truststore.p12",
+                "-passout",
+                &passout,
+            ],
+        )?;
+        Ok(fs::read(dir.join("truststore.p12"))?)
+    }
+
     pub fn inspect_cert_text(&self, dir: &Path, pem: &str) -> Result<String> {
         tracing::debug!(workdir = %dir.display(), "inspecting certificate text with openssl");
         fs::write(dir.join("inspect-text.pem"), pem)?;

@@ -322,14 +322,14 @@ pub async fn home(
                 .as_ref()
                 .map(|url| {
                     format!(
-                        r#"<a class="btn btn-outline-secondary" href="{}">{}</a>"#,
+                        r#"<a class="btn btn-sm btn-outline-secondary" href="{}">{}</a>"#,
                         h(url),
                         t(lang, "field.crl")
                     )
                 })
                 .unwrap_or_default();
             body.push_str(&format!(
-                r#"<article class="ca-card"><h2 class="ca-card-title">{}</h2><div class="subject">{}</div><dl class="ca-card-meta"><dt>{}</dt><dd>{}</dd><dt>{}</dt><dd>{}</dd><dt>{}</dt><dd>{}</dd></dl><div class="ca-card-actions"><a class="btn btn-primary" href="{base}/{}/download">{}</a>{crl}</div></article>"#,
+                r#"<article class="ca-card"><h2 class="ca-card-title">{}</h2><div class="subject">{}</div><dl class="ca-card-meta"><dt>{}</dt><dd>{}</dd><dt>{}</dt><dd>{}</dd><dt>{}</dt><dd>{}</dd></dl><div class="ca-card-actions"><a class="btn btn-sm btn-primary" href="{base}/{id}/download">{}</a><a class="btn btn-sm btn-outline-primary" href="{base}/download/ca/{id}/truststore">{}</a><a class="btn btn-sm btn-outline-secondary" href="{base}/download/ca/{id}/truststore-password">{}</a>{crl}</div></article>"#,
                 h(&ca.common_name),
                 h(&ca.subject),
                 t(lang, "field.issued"),
@@ -338,8 +338,10 @@ pub async fn home(
                 validity_label(lang, ca.issue_time + ca.valid_days * 86_400_000),
                 t(lang, "field.key"),
                 ca_key_label(lang, &ca.key_profile, &ca.digest_algorithm),
-                url_encode(&ca.id),
                 t(lang, "public.download_cert"),
+                t(lang, "artifact.truststore"),
+                t(lang, "artifact.truststore_password"),
+                id = url_encode(&ca.id),
             ));
         }
         body.push_str("</div>");
@@ -1806,9 +1808,16 @@ async fn download_ca(
     Path((ca_id, kind)): Path<(String, String)>,
 ) -> Response {
     // The CA certificate is public, like the CRL: relying parties need the
-    // trust anchor without an account. Key material still requires a viewer.
-    if kind == "cert" {
-        return public_ca_cert(state, headers, ca_id).await;
+    // trust anchor without an account. So is the certificate-only truststore
+    // and its fixed password. Key material still requires a viewer.
+    let public = match kind.as_str() {
+        "cert" => Some(Download::CaCert),
+        "truststore" => Some(Download::CaTruststore),
+        "truststore-password" => Some(Download::CaTruststorePassword),
+        _ => None,
+    };
+    if let Some(public) = public {
+        return public_ca_download(state, headers, ca_id, public).await;
     }
     match viewer_blocking(&state, &headers, move |state| {
         state.service.download_ca(&ca_id, ca_download_kind(&kind)?)
@@ -1826,15 +1835,21 @@ async fn public_ca_cert_download(
     headers: HeaderMap,
     Path(ca_id): Path<String>,
 ) -> Response {
-    public_ca_cert(state, headers, ca_id).await
+    public_ca_download(state, headers, ca_id, Download::CaCert).await
 }
 
-/// Serves a CA certificate PEM without authentication or CSRF. A missing or
-/// soft-deleted CA is a plain 404.
-async fn public_ca_cert(state: Arc<AppState>, headers: HeaderMap, ca_id: String) -> Response {
+/// Serves a public CA artifact (certificate PEM, truststore, truststore
+/// password) without authentication or CSRF. A missing or soft-deleted CA
+/// is a plain 404.
+async fn public_ca_download(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    ca_id: String,
+    kind: Download,
+) -> Response {
     let lang = request_lang(&headers);
     let task_state = state.clone();
-    match blocking(move || task_state.service.download_ca(&ca_id, Download::CaCert)).await {
+    match blocking(move || task_state.service.download_ca(&ca_id, kind)).await {
         Ok((name, bytes)) => download_response(name, bytes),
         Err(err) => public_error_response(
             &state,
@@ -2803,6 +2818,8 @@ fn ca_download_kind(kind: &str) -> Result<Download> {
         "key" => Ok(Download::CaKey),
         "pkcs12" => Ok(Download::CaPkcs12),
         "password" => Ok(Download::CaPassword),
+        "truststore" => Ok(Download::CaTruststore),
+        "truststore-password" => Ok(Download::CaTruststorePassword),
         _ => Err(anyhow!(UNKNOWN_CA_DOWNLOAD)),
     }
 }
@@ -3337,6 +3354,12 @@ fn ca_artifact_cards(state: &Arc<AppState>, lang: Lang, ca_id: &str) -> String {
         (t(lang, "artifact.private_key"), t(lang, "artifact.kind_secret"), "key"),
         (t(lang, "artifact.pkcs12"), t(lang, "artifact.kind_bundle"), "pkcs12"),
         (t(lang, "artifact.password"), t(lang, "artifact.kind_secret"), "password"),
+        (t(lang, "artifact.truststore"), t(lang, "artifact.kind_public"), "truststore"),
+        (
+            t(lang, "artifact.truststore_password"),
+            t(lang, "artifact.kind_public"),
+            "truststore-password",
+        ),
     ]
     .iter()
     .map(|(title, label, kind)| {
@@ -3874,7 +3897,7 @@ label .form-control,label .form-select,textarea{margin-top:6px}
 .validity-expired{background:#fdecec;color:#9b211c}
 .renew-sentence{display:flex;gap:8px;align-items:center;margin:0;flex-wrap:wrap}
 .renew-sentence .form-control{width:92px}
-.download-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:16px}
+.download-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:16px}
 .artifact{border:1px solid #dde2ea;border-radius:8px;padding:14px;display:grid;gap:8px;align-content:start}
 .artifact span{color:#6b7280;font-size:12px}
 .download-panel .section-head h2{margin-top:0}

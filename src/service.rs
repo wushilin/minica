@@ -30,11 +30,18 @@ pub struct AppService {
     reserved_usernames: Vec<String>,
 }
 
+/// Password of every CA's truststore: Java's conventional default. The store
+/// holds only the public CA certificate, so the password protects nothing and
+/// is published alongside it.
+pub const TRUSTSTORE_PASSWORD: &str = "changeit";
+
 pub enum Download {
     CaCert,
     CaKey,
     CaPkcs12,
     CaPassword,
+    CaTruststore,
+    CaTruststorePassword,
     CertBundle,
     CertPem,
     CertCsr,
@@ -279,6 +286,7 @@ impl AppService {
             digest_algorithm: digest,
         };
         self.db.insert_ca(&meta, &secrets)?;
+        self.prebuild_truststore(&id, &secrets.cert_pem);
         let ca = self.db.get_ca(&id)?;
         tracing::info!(
             ca_id = %id,
@@ -346,6 +354,7 @@ impl AppService {
                 .unwrap_or_else(|| "imported".to_string()),
         };
         self.db.insert_ca(&meta, &secrets)?;
+        self.prebuild_truststore(&id, &secrets.cert_pem);
         let ca = self.db.get_ca(&id)?;
         tracing::info!(
             ca_id = %id,
@@ -841,6 +850,7 @@ impl AppService {
         }
         result?;
         let ca = self.get_ca(ca_id)?;
+        self.prebuild_truststore(ca_id, ca.cert_pem.as_bytes());
         tracing::info!(
             ca_id = %ca_id,
             days,
@@ -913,6 +923,14 @@ impl AppService {
             Download::CaKey => (format!("ca-{ca_id}-key.pem"), secrets.key_pem),
             Download::CaPkcs12 => (format!("ca-{ca_id}.p12"), secrets.pkcs12),
             Download::CaPassword => (format!("ca-{ca_id}-password.txt"), secrets.password),
+            Download::CaTruststore => (
+                format!("ca-{ca_id}-truststore.p12"),
+                self.truststore(ca_id, &secrets.cert_pem)?,
+            ),
+            Download::CaTruststorePassword => (
+                format!("ca-{ca_id}-truststore-password.txt"),
+                TRUSTSTORE_PASSWORD.as_bytes().to_vec(),
+            ),
             _ => bail!("invalid CA download kind"),
         };
         tracing::info!(
@@ -923,6 +941,39 @@ impl AppService {
             "downloaded certificate authority artifact"
         );
         Ok(artifact)
+    }
+
+    /// The CA's stored truststore, built and stored on first use when it is
+    /// missing (CAs from before truststores existed, restored backups, or a
+    /// failed build at creation or renewal).
+    fn truststore(&self, ca_id: &str, cert_pem: &[u8]) -> Result<Vec<u8>> {
+        let stored = self.db.get_ca_truststore(ca_id)?;
+        if !stored.is_empty() {
+            return Ok(stored);
+        }
+        self.build_truststore(ca_id, cert_pem)
+    }
+
+    /// Builds the truststore for `cert_pem` and stores it.
+    fn build_truststore(&self, ca_id: &str, cert_pem: &[u8]) -> Result<Vec<u8>> {
+        let work = self.openssl.workdir()?;
+        let truststore = self.openssl.truststore_pkcs12(
+            work.path(),
+            cert_pem,
+            &format!("minica-{ca_id}"),
+            TRUSTSTORE_PASSWORD,
+        )?;
+        let stored = self.db.set_ca_truststore(ca_id, cert_pem, &truststore)?;
+        tracing::info!(ca_id = %ca_id, bytes = truststore.len(), stored, "built CA truststore");
+        Ok(truststore)
+    }
+
+    /// Builds the truststore right after the CA certificate is created or
+    /// changed. A failure only logs: the download path retries.
+    fn prebuild_truststore(&self, ca_id: &str, cert_pem: &[u8]) {
+        if let Err(err) = self.build_truststore(ca_id, cert_pem) {
+            tracing::warn!(ca_id = %ca_id, error = %err, "CA truststore build failed; will retry on download");
+        }
     }
 
     #[tracing::instrument(skip(self), err, fields(span_id = %span_id(), ca_id = %ca_id))]
@@ -1497,6 +1548,8 @@ fn download_kind_name(kind: &Download) -> &'static str {
         Download::CaKey => "ca_key",
         Download::CaPkcs12 => "ca_pkcs12",
         Download::CaPassword => "ca_password",
+        Download::CaTruststore => "ca_truststore",
+        Download::CaTruststorePassword => "ca_truststore_password",
         Download::CertBundle => "cert_bundle",
         Download::CertPem => "cert_pem",
         Download::CertCsr => "cert_csr",

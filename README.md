@@ -83,9 +83,10 @@ backup-able state, real revocation, hashed credentials, and safe concurrency.
 
 ### Honest trade-offs
 
-- **No JKS / Java truststore output.** Dropping the JDK dependency also drops
-  `keytool`-produced JKS keystores and truststores; downloads are PEM and
-  PKCS#12. If your toolchain needs JKS, convert from the PKCS#12 bundle.
+- **No JKS output.** Dropping the JDK dependency also drops `keytool`-produced
+  JKS keystores; downloads are PEM and PKCS#12. Each CA does offer a public,
+  certificate-only PKCS#12 truststore (password `changeit`) that Java loads as
+  a `trustedCertEntry`. If your toolchain needs JKS, convert from PKCS#12.
 - **CRLs are not auto-refreshed on a timer.** A CRL is regenerated on
   create/import/revoke, so a quiet CA can serve a CRL past its `nextUpdate` until
   the next change.
