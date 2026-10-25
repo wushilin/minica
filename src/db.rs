@@ -9,7 +9,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// How many `.pre-migrate-*.bak` copies of the database to keep. Each holds
 /// every private key, so older ones are pruned after a new one is made.
@@ -142,6 +142,9 @@ impl Db {
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open sqlite db {}", path.display()))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Another process (e.g. `minica --import-legacy` beside a running
+        // server) may hold a write lock briefly; wait instead of failing.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let migration_needed = !schema_is_current(&conn)?;
         let backup = if db_existed && migration_needed {
             Some(copy_db_backup(path)?)
@@ -294,6 +297,10 @@ impl Db {
             "ALTER TABLE certificates ADD COLUMN revoked_at INTEGER",
             "ALTER TABLE certificates ADD COLUMN revocation_reason TEXT",
             "ALTER TABLE certificate_authorities ADD COLUMN truststore BLOB NOT NULL DEFAULT X''",
+            // Schema 2: rows whose metadata was re-derived from the certificate
+            // (see AppService::repair_stale_metadata) carry 1; 0 means unchecked.
+            "ALTER TABLE certificate_authorities ADD COLUMN meta_version INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE certificates ADD COLUMN meta_version INTEGER NOT NULL DEFAULT 0",
         ] {
             add_column(&tx, sql)?;
         }
@@ -322,8 +329,8 @@ impl Db {
                 id, common_name, country_code, state, city, organization, organization_unit,
                 subject, issue_time, valid_days, key_profile, digest_algorithm,
                 cert_pem, key_pem, pkcs12, password, index_txt, serial_txt, crl_der, crl_updated_at,
-                crlnumber_txt, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                crlnumber_txt, created_at, updated_at, meta_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
             "#,
             params![
                 meta.id,
@@ -424,6 +431,224 @@ impl Db {
         }
         tracing::info!(ca_id = %id, rows_affected = count, "updated certificate authority metadata");
         Ok(())
+    }
+
+    pub fn ca_exists(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM certificate_authorities WHERE id = ?",
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn cert_exists(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM certificates WHERE id = ?",
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Metadata and certificate of every CA (deleted ones too) not yet checked
+    /// by the metadata repair.
+    pub fn list_cas_for_repair(&self) -> Result<Vec<(CaMeta, Vec<u8>)>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, common_name, country_code, state, city, organization, organization_unit,
+                   subject, issue_time, valid_days, key_profile, digest_algorithm, cert_pem
+            FROM certificate_authorities
+            WHERE meta_version = 0
+            ORDER BY created_at
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                CaMeta {
+                    id: row.get(0)?,
+                    common_name: row.get(1)?,
+                    country_code: row.get(2)?,
+                    state: row.get(3)?,
+                    city: row.get(4)?,
+                    organization: row.get(5)?,
+                    organization_unit: row.get(6)?,
+                    subject: row.get(7)?,
+                    issue_time: row.get(8)?,
+                    valid_days: row.get(9)?,
+                    key_profile: row.get(10)?,
+                    digest_algorithm: row.get(11)?,
+                },
+                row.get(12)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Certificate counterpart of `list_cas_for_repair`.
+    pub fn list_certs_for_repair(&self) -> Result<Vec<(CertMeta, Vec<u8>)>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, ca_id, common_name, country_code, state, city, organization, organization_unit,
+                   subject, issue_time, valid_days, dns_list, ip_list, key_profile, digest_algorithm,
+                   revoked_at, revocation_reason, cert_pem
+            FROM certificates
+            WHERE meta_version = 0
+            ORDER BY created_at
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                CertMeta {
+                    id: row.get(0)?,
+                    ca_id: row.get(1)?,
+                    common_name: row.get(2)?,
+                    country_code: row.get(3)?,
+                    state: row.get(4)?,
+                    city: row.get(5)?,
+                    organization: row.get(6)?,
+                    organization_unit: row.get(7)?,
+                    subject: row.get(8)?,
+                    issue_time: row.get(9)?,
+                    valid_days: row.get(10)?,
+                    dns_list: split_list(&row.get::<_, String>(11)?),
+                    ip_list: split_list(&row.get::<_, String>(12)?),
+                    key_profile: row.get(13)?,
+                    digest_algorithm: row.get(14)?,
+                    revoked_at: row.get(15)?,
+                    revocation_reason: row.get(16)?,
+                },
+                row.get(17)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Writes re-derived subject/validity metadata and marks the row checked.
+    pub fn update_ca_meta_repaired(&self, meta: &CaMeta) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            r#"
+            UPDATE certificate_authorities
+            SET country_code = ?, state = ?, city = ?, organization = ?, organization_unit = ?,
+                subject = ?, issue_time = ?, valid_days = ?, meta_version = 1
+            WHERE id = ?
+            "#,
+            params![
+                meta.country_code,
+                meta.state,
+                meta.city,
+                meta.organization,
+                meta.organization_unit,
+                meta.subject,
+                meta.issue_time,
+                meta.valid_days,
+                meta.id
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_cert_meta_repaired(&self, meta: &CertMeta) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            r#"
+            UPDATE certificates
+            SET country_code = ?, state = ?, city = ?, organization = ?, organization_unit = ?,
+                subject = ?, meta_version = 1
+            WHERE id = ?
+            "#,
+            params![
+                meta.country_code,
+                meta.state,
+                meta.city,
+                meta.organization,
+                meta.organization_unit,
+                meta.subject,
+                meta.id
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_ca_meta_checked(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "UPDATE certificate_authorities SET meta_version = 1 WHERE id = ?",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_cert_meta_checked(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "UPDATE certificates SET meta_version = 1 WHERE id = ?",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Test hook: rewrites a CA's metadata the way older versions stored an
+    /// import (fabricated subject parts, "now + 3650 days") and marks the row
+    /// unchecked, so the repair can be exercised.
+    #[cfg(test)]
+    pub fn fake_legacy_ca_meta(
+        &self,
+        id: &str,
+        country_code: &str,
+        organization: &str,
+        subject: &str,
+        issue_time: i64,
+        valid_days: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            r#"
+            UPDATE certificate_authorities
+            SET country_code = ?, organization = ?, subject = ?, issue_time = ?, valid_days = ?,
+                meta_version = 0
+            WHERE id = ?
+            "#,
+            params![country_code, organization, subject, issue_time, valid_days, id],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn fake_legacy_cert_meta(
+        &self,
+        id: &str,
+        country_code: &str,
+        organization: &str,
+        subject: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "UPDATE certificates SET country_code = ?, organization = ?, subject = ?, meta_version = 0 WHERE id = ?",
+            params![country_code, organization, subject, id],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn meta_versions(&self) -> Result<(Vec<i64>, Vec<i64>)> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut cas = conn.prepare("SELECT meta_version FROM certificate_authorities")?;
+        let cas = cas
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        let mut certs = conn.prepare("SELECT meta_version FROM certificates")?;
+        let certs = certs
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        Ok((cas, certs))
     }
 
     pub fn get_ca_secrets(&self, id: &str) -> Result<CaSecrets> {
@@ -586,8 +811,8 @@ impl Db {
             INSERT INTO certificates (
                 id, ca_id, common_name, country_code, state, city, organization, organization_unit,
                 subject, issue_time, valid_days, dns_list, ip_list, key_profile, digest_algorithm,
-                cert_pem, key_pem, csr_pem, pkcs12, password, bundle_zip, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                cert_pem, key_pem, csr_pem, pkcs12, password, bundle_zip, created_at, updated_at, meta_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
             "#,
             params![
                 meta.id,
@@ -1576,6 +1801,7 @@ fn schema_columns_present(conn: &Connection) -> Result<bool> {
                 "deleted",
                 "created_at",
                 "updated_at",
+                "meta_version",
             ][..],
         ),
         (
@@ -1607,6 +1833,7 @@ fn schema_columns_present(conn: &Connection) -> Result<bool> {
                 "deleted",
                 "created_at",
                 "updated_at",
+                "meta_version",
             ][..],
         ),
         (

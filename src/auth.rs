@@ -191,7 +191,7 @@ fn authenticate_headers(headers: &HeaderMap, config: &HeaderAuthConfig) -> Resul
     }
 }
 
-fn header_identity_present(headers: &HeaderMap, config: &HeaderAuthConfig) -> bool {
+pub fn header_identity_present(headers: &HeaderMap, config: &HeaderAuthConfig) -> bool {
     header_value(headers, &config.username).is_some()
 }
 

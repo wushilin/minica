@@ -1,5 +1,6 @@
 use crate::{
     AppState, auth,
+    config::FormTemplate,
     i18n::{Lang, t, tf, tf_html, tr},
     models::{
         CreateCaRequest, CreateCertRequest, CreateUserRequest, ImportCaRequest, ImportCertRequest,
@@ -141,6 +142,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin", get(admin_console))
         .route("/swagger", get(swagger_page))
         .route("/lang/{code}", get(switch_lang))
+        .route("/logout", get(logout))
         .route("/admin/backup", get(admin_backup_export))
         .route(
             "/admin/backup/restore",
@@ -524,7 +526,18 @@ fn ca_form_page(
         t(lang, "ca.new.title"),
         error.map(|e| error_banner(lang, e)).unwrap_or_default(),
         u(state, "/cas"),
-        ca_form_fields(lang, csrf, &t(lang, "ca.new.submit"), "", values)
+        ca_form_fields(
+            lang,
+            csrf,
+            &t(lang, "ca.new.submit"),
+            &template_picker(
+                lang,
+                "ca-templates",
+                &state.config.templates.ca,
+                &state.config.templates.defaults,
+            ),
+            values
+        )
     )
 }
 
@@ -536,7 +549,7 @@ async fn new_ca_form(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
             lang,
             &csrf,
             None,
-            &SubjectValues::default(),
+            &SubjectValues::from_template(&state.config.templates.defaults),
         ))
     })
     .await
@@ -870,7 +883,86 @@ fn cert_form_page(
         t(lang, "cert.new.title"),
         error.map(|e| error_banner(lang, e)).unwrap_or_default(),
         u(state, &format!("/cas/{ca_id}/certs")),
-        cert_form_fields(lang, csrf, values)
+        cert_form_fields(
+            lang,
+            csrf,
+            &template_picker(
+                lang,
+                "cert-templates",
+                &state.config.templates.certificate,
+                &state
+                    .service
+                    .get_ca(ca_id)
+                    .map(|ca| cert_form_base(state, &ca))
+                    .unwrap_or_else(|_| state.config.templates.defaults.clone()),
+            ),
+            values
+        )
+    )
+}
+
+/// What the New Certificate form starts from: the configured defaults, and
+/// for anything they leave unset the issuing CA's own subject attributes
+/// (a certificate usually belongs to the organisation of its CA).
+fn cert_form_base(state: &Arc<AppState>, ca: &crate::models::CertificateAuthority) -> FormTemplate {
+    let ca_values = FormTemplate {
+        country_code: Some(ca.country_code.clone()),
+        state: Some(ca.state.clone()),
+        city: Some(ca.city.clone()),
+        organization: Some(ca.organization.clone()),
+        organization_unit: Some(ca.organization_unit.clone()),
+        ..FormTemplate::default()
+    };
+    state.config.templates.defaults.over(&ca_values)
+}
+
+/// A preset drop-down for a creation form, plus the resolved preset values
+/// as JSON for the page script (which copies them into the fields). Empty
+/// when no presets are configured. `id` names the JSON block.
+fn template_picker(lang: Lang, id: &str, presets: &[FormTemplate], base: &FormTemplate) -> String {
+    if presets.is_empty() {
+        return String::new();
+    }
+    let options: String = presets
+        .iter()
+        .enumerate()
+        .map(|(index, preset)| {
+            format!(
+                r#"<option value="{index}">{}</option>"#,
+                h(preset.name.as_deref().unwrap_or_default())
+            )
+        })
+        .collect();
+    let json = serde_json::Value::Array(
+        presets
+            .iter()
+            .map(|preset| {
+                let resolved = preset.over(base);
+                let mut values = serde_json::Map::new();
+                let mut put = |key: &str, value: Option<String>| {
+                    if let Some(value) = value {
+                        values.insert(key.to_string(), serde_json::Value::String(value));
+                    }
+                };
+                put("country_code", resolved.country_code);
+                put("state", resolved.state);
+                put("city", resolved.city);
+                put("organization", resolved.organization);
+                put("organization_unit", resolved.organization_unit);
+                put("valid_days", resolved.valid_days.map(|days| days.to_string()));
+                put("digest_algorithm", resolved.digest_algorithm);
+                put("key_profile", resolved.key_profile);
+                serde_json::Value::Object(values)
+            })
+            .collect(),
+    )
+    .to_string()
+    .replace('<', "\\u003c");
+    format!(
+        r#"<label class="template-picker">{} <span class="muted">{}</span><select class="form-select" data-template-picker="{id}"><option value="">{}</option>{options}</select></label><script type="application/json" id="{id}">{json}</script>"#,
+        t(lang, "field.template"),
+        t(lang, "template.help"),
+        t(lang, "template.custom")
     )
 }
 
@@ -889,7 +981,7 @@ async fn new_cert_form(
             &ca.common_name,
             &csrf,
             None,
-            &SubjectValues::default(),
+            &SubjectValues::from_template(&cert_form_base(state, &ca)),
         ))
     })
     .await
@@ -913,6 +1005,19 @@ async fn create_cert_form(
         Err(err) => return error_response(&state, &headers, err),
     };
     match created {
+        Ok(cert) if cert.valid_days < form.valid_days => redirect_with_flash(
+            &state,
+            &u(&state, &format!("/cas/{ca_id}#ca-certs")),
+            "success",
+            &tr(
+                lang,
+                "flash.cert_created_clamped",
+                &[
+                    ("name", &cert.common_name),
+                    ("days", &cert.valid_days.to_string()),
+                ],
+            ),
+        ),
         Ok(cert) => redirect_with_flash(
             &state,
             &u(&state, &format!("/cas/{ca_id}#ca-certs")),
@@ -1183,13 +1288,20 @@ async fn renew_cert_form(
     let lang = request_lang(&headers);
     mutate_form_response(state, headers, form._csrf.clone(), move |state| {
         let cert = state.service.renew_cert(&ca_id, &cert_id, form.days)?;
+        // The validity is capped at the CA certificate's expiry; say so
+        // instead of echoing the requested number of days.
+        let args = [
+            ("name", cert.common_name.as_str()),
+            ("days", &cert.valid_days.to_string()),
+        ];
+        let notice = if cert.valid_days < form.days {
+            tr(lang, "flash.cert_renewed_clamped", &args)
+        } else {
+            tr(lang, "flash.cert_renewed", &args)
+        };
         Ok((
             Redirect::to(&u(state, &format!("/cas/{ca_id}/certs/{cert_id}"))),
-            tr(
-                lang,
-                "flash.cert_renewed",
-                &[("name", &cert.common_name), ("days", &form.days.to_string())],
-            ),
+            notice,
         ))
     })
     .await
@@ -1907,6 +2019,36 @@ async fn download_cert(
     }
 }
 
+/// `GET {base}/logout`: ends a Basic-auth session. Browsers keep Basic
+/// credentials until a request that carried them is answered 401, so this
+/// always answers 401 with the challenge, whatever credentials arrived. The
+/// browser drops its cached password, shows its sign-in dialog (Cancel
+/// closes it) and then this page. Needs no auth or CSRF: it only forgets.
+/// Under reverse-proxy header auth the proxy owns the session, so the UI
+/// does not offer this link there.
+async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let lang = request_lang(&headers);
+    let base = state.config.server.base_path.trim_end_matches('/');
+    let body = format!(
+        r#"<section class="empty"><h1>{}</h1><p>{}</p><p><a class="btn btn-primary" href="{base}/cas">{}</a> <a class="btn btn-outline-secondary" href="{base}/">{}</a></p></section>"#,
+        t(lang, "logout.title"),
+        t(lang, "logout.message"),
+        t(lang, "logout.sign_in_again"),
+        t(lang, "logout.home")
+    );
+    let mut response = (
+        StatusCode::UNAUTHORIZED,
+        Html(layout_with(base, lang, &body, &format!("{base}/"), "", "")),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        header::HeaderValue::from_static(r#"Basic realm="MiniCA""#),
+    );
+    refresh_lang_cookie(&state, &headers, &mut response);
+    response
+}
+
 /// `GET {base}/lang/{code}`: stores the UI language in the `minica_lang`
 /// cookie and goes back to the page the switch was made from. Needs no auth
 /// (pages may be behind a 401) and no CSRF: it only sets a preference.
@@ -2384,8 +2526,14 @@ fn render_page(
         .map(|(kind, message)| flash_html(lang, kind, message))
         .unwrap_or_default();
     let body = format!("{panel}{content}");
-    let mut response =
-        Html(layout(&state.config.server.base_path, lang, &body, is_admin)).into_response();
+    let mut response = Html(layout(
+        &state.config.server.base_path,
+        lang,
+        &body,
+        is_admin,
+        basic_session(state, headers),
+    ))
+    .into_response();
     append_cookie(&mut response, cookie_header(state, token));
     if flash.is_some() {
         append_cookie(&mut response, flash_clear_cookie(state));
@@ -2680,6 +2828,7 @@ fn error_page(
             &state.config.server.base_path,
             lang,
             &format!("<h1>{title}</h1><p>{message_html}</p>"),
+            false,
             false,
         )),
     )
@@ -3018,6 +3167,34 @@ impl Default for SubjectValues {
     }
 }
 
+impl SubjectValues {
+    /// Form values from a template, with the built-in defaults for anything
+    /// it leaves unset.
+    fn from_template(template: &FormTemplate) -> Self {
+        let base = Self::default();
+        Self {
+            country_code: template.country_code.clone().unwrap_or(base.country_code),
+            state: template.state.clone().unwrap_or(base.state),
+            city: template.city.clone().unwrap_or(base.city),
+            organization: template.organization.clone().unwrap_or(base.organization),
+            organization_unit: template
+                .organization_unit
+                .clone()
+                .unwrap_or(base.organization_unit),
+            valid_days: template
+                .valid_days
+                .map(|days| days.to_string())
+                .unwrap_or(base.valid_days),
+            digest_algorithm: template
+                .digest_algorithm
+                .clone()
+                .unwrap_or(base.digest_algorithm),
+            key_profile: template.key_profile.clone().unwrap_or(base.key_profile),
+            ..base
+        }
+    }
+}
+
 impl From<&CaForm> for SubjectValues {
     fn from(f: &CaForm) -> Self {
         Self {
@@ -3128,10 +3305,11 @@ fn ca_form_fields(lang: Lang, csrf: &str, submit: &str, extra: &str, v: &Subject
     )
 }
 
-fn cert_form_fields(lang: Lang, csrf: &str, v: &SubjectValues) -> String {
+fn cert_form_fields(lang: Lang, csrf: &str, picker: &str, v: &SubjectValues) -> String {
     format!(
-        r#"<input type="hidden" name="_csrf" value="{}"><div class="grid2">{}<label>{} <span class="muted">{}</span><input class="form-control" name="dns_list" value="{}"></label><label>{} <span class="muted">{}</span><input class="form-control" name="ip_list" value="{}"></label></div><button class="btn btn-primary">{}</button>"#,
+        r#"<input type="hidden" name="_csrf" value="{}">{}<div class="grid2">{}<label>{} <span class="muted">{}</span><input class="form-control" name="dns_list" value="{}"></label><label>{} <span class="muted">{}</span><input class="form-control" name="ip_list" value="{}"></label></div><button class="btn btn-primary">{}</button>"#,
         h(csrf),
+        picker,
         subject_fields_common(lang, v),
         t(lang, "field.dns_sans"),
         t(lang, "field.comma_separated"),
@@ -3143,7 +3321,9 @@ fn cert_form_fields(lang: Lang, csrf: &str, v: &SubjectValues) -> String {
     )
 }
 
-fn layout(base: &str, lang: Lang, content: &str, is_admin: bool) -> String {
+/// The signed-in page shell. `show_logout` adds the sign-out link (Basic
+/// auth sessions only; a proxy-authenticated session is ended at the proxy).
+fn layout(base: &str, lang: Lang, content: &str, is_admin: bool, show_logout: bool) -> String {
     let links = if is_admin {
         format!(
             r#"<a class="topbar-link" href="{}/swagger">{}</a><a class="topbar-link" href="{}/admin">{}</a>"#,
@@ -3155,7 +3335,31 @@ fn layout(base: &str, lang: Lang, content: &str, is_admin: bool) -> String {
     } else {
         String::new()
     };
-    layout_with(base, lang, content, &format!("{base}/cas"), &links, "")
+    let trailing = if show_logout {
+        format!(
+            r#"<a class="topbar-link topbar-logout" href="{base}/logout">{}</a>"#,
+            t(lang, "nav.logout")
+        )
+    } else {
+        String::new()
+    };
+    layout_with(base, lang, content, &format!("{base}/cas"), &links, &trailing)
+}
+
+/// Whether this request is a Basic-auth session (so "sign out" can work):
+/// Basic auth is enabled and no reverse-proxy identity header is present.
+fn basic_session(state: &AppState, headers: &HeaderMap) -> bool {
+    state
+        .config
+        .auth
+        .users
+        .as_ref()
+        .is_some_and(|users| users.enabled)
+        && !state
+            .config
+            .auth
+            .active_headers()
+            .is_some_and(|config| auth::header_identity_present(headers, config))
 }
 
 /// The page shell. `home` is the brand link target; `links` and `trailing`
@@ -3919,6 +4123,9 @@ label .form-control,label .form-select,textarea{margin-top:6px}
 .ca-card-meta dt{color:#6b7280;font-weight:600}
 .ca-card-meta dd{margin:0}
 .ca-card-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:auto;padding-top:6px}
+.topbar-logout{color:#5b6b8c;border-color:#d7dde9}
+.topbar-logout:hover{background:#f3f5fa;color:#23408f}
+.template-picker{display:block;margin-bottom:16px;max-width:420px}
 .topbar-login{background:#3257c4;border-color:#3257c4;color:#fff}
 .topbar-login:hover{background:#23408f;color:#fff}
 .raw-output{white-space:pre-wrap;background:#101828;color:#eef3ff;border-radius:8px;padding:16px;max-height:620px;overflow:auto}
@@ -4088,6 +4295,24 @@ document.querySelectorAll('[data-toggle]').forEach((btn) => {
     });
   });
 })();
+
+// Preset drop-downs on the creation forms copy the chosen preset's values
+// into the fields (see template_picker). Choosing "custom" leaves them as is.
+document.querySelectorAll('[data-template-picker]').forEach((select) => {
+  const data = document.getElementById(select.dataset.templatePicker);
+  const form = select.closest('form');
+  if (!data || !form) return;
+  let presets = [];
+  try { presets = JSON.parse(data.textContent); } catch (e) { return; }
+  select.addEventListener('change', () => {
+    const preset = presets[parseInt(select.value, 10)];
+    if (!preset) return;
+    Object.keys(preset).forEach((name) => {
+      const field = form.querySelector('[name="' + name + '"]');
+      if (field) field.value = preset[name];
+    });
+  });
+});
 
 // Flash message panels: dismissible by button, and auto-hide after a while.
 document.querySelectorAll('.flash-panel').forEach((panel) => {

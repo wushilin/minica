@@ -92,3 +92,20 @@ auth:
       - '{{ENV:MINICA_TRUSTED_REMOTE_8:-}}'
       - '{{ENV:MINICA_TRUSTED_REMOTE_9:-}}'
       - '{{ENV:MINICA_TRUSTED_REMOTE_10:-}}'
+
+# Pre-filled values of the "New CA" / "New Certificate" forms. Unset variables
+# keep the built-in defaults; the certificate form inherits anything left
+# unset here from the issuing CA's subject. Named presets (templates.ca /
+# templates.certificate) are lists and cannot be expressed as variables: mount
+# your own config file over /opt/minica/config.yaml to use them (see
+# config.yaml.example).
+templates:
+  defaults:
+    country_code: '{{ENV:MINICA_DEFAULT_COUNTRY_CODE:}}'
+    state: '{{ENV:MINICA_DEFAULT_STATE:}}'
+    city: '{{ENV:MINICA_DEFAULT_CITY:}}'
+    organization: '{{ENV:MINICA_DEFAULT_ORGANIZATION:}}'
+    organization_unit: '{{ENV:MINICA_DEFAULT_ORGANIZATION_UNIT:}}'
+    valid_days: '{{ENV:MINICA_DEFAULT_VALID_DAYS:}}'
+    digest_algorithm: '{{ENV:MINICA_DEFAULT_DIGEST:}}'
+    key_profile: '{{ENV:MINICA_DEFAULT_KEY_PROFILE:}}'

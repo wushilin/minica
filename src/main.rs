@@ -2,6 +2,7 @@ mod auth;
 mod config;
 mod db;
 mod i18n;
+mod legacy;
 mod logging;
 mod models;
 mod openssl;
@@ -60,6 +61,13 @@ struct Cli {
     /// password (hidden) and the hash. Or pass both: --verify-password <PASSWORD> <HASH>
     #[arg(long, group = "action", num_args = 0..=2, value_names = ["PASSWORD", "HASH"])]
     verify_password: Option<Vec<String>>,
+
+    /// Import the data directory of a MiniCA 1.0.x (Kotlin) installation — its
+    /// `minica.root`, or the `CAs` folder inside it — into the database named by
+    /// the config file (-c). Keeps ids and PKCS#12 passwords; re-runs skip what
+    /// is already there. Stop the server first.
+    #[arg(long, group = "action", value_name = "DIR")]
+    import_legacy: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -104,6 +112,12 @@ async fn main() -> Result<()> {
         }
         eprintln!("MISMATCH: password does not match the hash");
         std::process::exit(1);
+    }
+
+    // --import-legacy DIR: one-off migration of a 1.0.x file tree.
+    if let Some(dir) = cli.import_legacy {
+        let config = Config::load(&cli.config)?;
+        return import_legacy(config, &dir);
     }
 
     // --start: load config and run the server.
@@ -246,21 +260,18 @@ async fn start_server(config: Config) -> Result<()> {
         compress = config.logging.compress,
         "logging initialized"
     );
-    tracing::info!(runtime_folder = %config.runtime.folder.display(), "creating runtime folder");
-    std::fs::create_dir_all(&config.runtime.folder)?;
-    tracing::info!(openssl_working_root = %config.openssl.working_root.display(), "creating openssl working root");
-    std::fs::create_dir_all(&config.openssl.working_root)?;
-    let db = Db::open(&config.db_path())?;
-    let openssl = OpenSsl::new(config.openssl.clone());
-    openssl.check()?;
-    openssl.reap_workdirs()?;
-    let service = AppService::new(
-        db,
-        openssl,
-        config.public_base_url.clone(),
-        config.crl.clone(),
-    )
-    .with_reserved_usernames(config.auth.basic_users().iter().map(|u| u.username.clone()));
+    let service = build_service(&config)?;
+    // Metadata written by older versions is re-derived from the certificates
+    // once (imported CAs used to be recorded as issued now for 3650 days).
+    match service.repair_stale_metadata() {
+        Ok((0, 0)) => {}
+        Ok((cas, certs)) => tracing::warn!(
+            repaired_cas = cas,
+            repaired_certs = certs,
+            "repaired metadata of imported entities from their certificates"
+        ),
+        Err(err) => tracing::warn!(error = %err, "metadata repair failed; continuing"),
+    }
     let state = Arc::new(AppState {
         config: config.clone(),
         service,
@@ -280,6 +291,64 @@ async fn start_server(config: Config) -> Result<()> {
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .await?;
+    Ok(())
+}
+
+/// Opens the database and openssl wrapper named by `config` and builds the
+/// service on them (shared by `--start` and `--import-legacy`).
+fn build_service(config: &Config) -> Result<AppService> {
+    tracing::info!(runtime_folder = %config.runtime.folder.display(), "creating runtime folder");
+    std::fs::create_dir_all(&config.runtime.folder)?;
+    tracing::info!(openssl_working_root = %config.openssl.working_root.display(), "creating openssl working root");
+    std::fs::create_dir_all(&config.openssl.working_root)?;
+    let db = Db::open(&config.db_path())?;
+    let openssl = OpenSsl::new(config.openssl.clone());
+    openssl.check()?;
+    openssl.reap_workdirs()?;
+    Ok(AppService::new(
+        db,
+        openssl,
+        config.public_base_url.clone(),
+        config.crl.clone(),
+    )
+    .with_reserved_usernames(config.auth.basic_users().iter().map(|u| u.username.clone())))
+}
+
+/// `--import-legacy DIR`: walks a 1.0.x data directory and imports it, printing
+/// a report. Exit status 1 when anything failed (the rest is still imported;
+/// a re-run skips what succeeded).
+fn import_legacy(config: Config, dir: &std::path::Path) -> Result<()> {
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")))
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .init();
+    let service = build_service(&config)?;
+    eprintln!(
+        "Importing MiniCA 1.0.x data from {} into {} ...",
+        dir.display(),
+        config.db_path().display()
+    );
+    let report = legacy::import_tree(&service, dir)?;
+    println!(
+        "Imported {} certificate authorit{} and {} certificate{}.",
+        report.cas_imported,
+        if report.cas_imported == 1 { "y" } else { "ies" },
+        report.certs_imported,
+        if report.certs_imported == 1 { "" } else { "s" }
+    );
+    for skipped in &report.skipped {
+        println!("skipped  {skipped}");
+    }
+    for failure in &report.failures {
+        println!("FAILED   {failure}");
+    }
+    if !report.is_success() {
+        eprintln!(
+            "{} item(s) failed; fix the cause and run the import again (imported items are skipped).",
+            report.failures.len()
+        );
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -351,6 +420,15 @@ mod tests {
         }
 
         fn with_options(auth: config::AuthConfig, base_path: &str, secure_cookies: bool) -> Self {
+            Self::with_templates(auth, base_path, secure_cookies, config::TemplatesConfig::default())
+        }
+
+        fn with_templates(
+            auth: config::AuthConfig,
+            base_path: &str,
+            secure_cookies: bool,
+            templates: config::TemplatesConfig,
+        ) -> Self {
             let root = std::env::temp_dir().join(format!("minica-rust-test-{}", Uuid::new_v4()));
             fs::create_dir_all(root.join("runtime")).expect("create test runtime");
             fs::create_dir_all(root.join("openssl-work")).expect("create openssl work root");
@@ -377,6 +455,7 @@ mod tests {
                 },
                 auth,
                 logging: config::LoggingConfig::default(),
+                templates,
             };
 
             let db = Db::open(&config.db_path()).expect("open test database");
@@ -1759,7 +1838,7 @@ mod tests {
         let backup_yaml = backup.json()["yaml"].as_str().unwrap().to_string();
         assert!(backup_yaml.contains("format_version: 1"));
         assert!(backup_yaml.contains("app_version:"));
-        assert!(backup_yaml.contains("schema_version: 1"));
+        assert!(backup_yaml.contains("schema_version: 2"));
         assert!(backup_yaml.contains("ca.lifecycle.test"));
         assert!(backup_yaml.contains("leaf.lifecycle.test"));
         assert!(backup_yaml.contains("second.lifecycle.test"));
@@ -2272,7 +2351,8 @@ mod tests {
             assert!(!first.headers.contains_key(header::SET_COOKIE));
             let disposition = first
                 .header(header::CONTENT_DISPOSITION)
-                .replace(id.as_str(), "<id>");
+                .replace(id.as_str(), "<id>")
+                .replace(name, "<cn>");
             let content_type = first.header(header::CONTENT_TYPE).to_string();
             let info = describe_truststore(&env, id, pem, &first.body).replace(name, "<cn>");
             assert!(info.contains("Trusted key usage (Oracle)"), "{info}");
@@ -2297,11 +2377,296 @@ mod tests {
             assert_eq!(password.text(), "changeit");
             let password_disposition = password
                 .header(header::CONTENT_DISPOSITION)
-                .replace(id.as_str(), "<id>");
+                .replace(id.as_str(), "<id>")
+                .replace(name, "<cn>");
             seen.push((disposition, content_type, info, password_disposition));
         }
         assert_eq!(seen[0], seen[1]);
-        assert!(seen[0].0.contains("ca-<id>-truststore.p12"), "{:?}", seen[0]);
+        assert!(seen[0].0.contains("<cn>-truststore.p12"), "{:?}", seen[0]);
+    }
+
+    #[tokio::test]
+    async fn logout_forgets_basic_credentials_and_is_offered_only_for_basic_sessions() {
+        let env = TestEnv::new();
+        // Signed-in pages carry the sign-out link; public and error pages do not.
+        let list = env
+            .send("GET", "/minica/cas", Some(("viewer", "viewerpass")), None, None, Body::empty())
+            .await;
+        list.assert_status(StatusCode::OK);
+        assert!(list.text().contains(r#"href="/minica/logout""#), "{}", list.text());
+        let public = env.send("GET", "/minica/", None, None, None, Body::empty()).await;
+        assert!(!public.text().contains("/minica/logout"));
+
+        // The logout answer is a 401 with the Basic challenge even for valid
+        // credentials (that is what makes the browser drop them), and a page.
+        let logout = env
+            .send("GET", "/minica/logout", Some(("admin", "adminpass")), None, None, Body::empty())
+            .await;
+        logout.assert_status(StatusCode::UNAUTHORIZED);
+        assert_eq!(logout.header(header::WWW_AUTHENTICATE), r#"Basic realm="MiniCA""#);
+        let html = logout.text();
+        assert!(html.contains("Signed out"), "{html}");
+        assert!(html.contains(r#"href="/minica/cas""#), "{html}");
+        assert!(!html.contains("/minica/logout"), "{html}");
+        let anonymous = env.send("GET", "/minica/logout", None, None, None, Body::empty()).await;
+        anonymous.assert_status(StatusCode::UNAUTHORIZED);
+
+        // Under reverse-proxy header auth the proxy owns the session: no link.
+        let proxied = TestEnv::with_auth(header_auth(&[]));
+        let page = proxied
+            .request_with_headers(
+                "GET",
+                "/minica/cas",
+                &[("Remote-User", "alice"), ("Remote-Groups", "admin")],
+            )
+            .await;
+        page.assert_status(StatusCode::OK);
+        assert!(!page.text().contains("/minica/logout"), "{}", page.text());
+    }
+
+    #[tokio::test]
+    async fn downloads_are_named_after_the_common_name() {
+        let env = TestEnv::new();
+        let csrf = env.get_csrf().await;
+        let ca = create_test_ca(&env, &csrf, "Homelab CA").await;
+        let ca_id = ca["id"].as_str().unwrap().to_string();
+        let cert = env
+            .json(
+                "PUT",
+                &format!("/minica/api/cas/{ca_id}/certs"),
+                Some(("admin", "adminpass")),
+                Some(&csrf),
+                json!({
+                    "common_name": "*.home.lan",
+                    "country_code": "SG",
+                    "state": "",
+                    "city": "",
+                    "organization": "Org",
+                    "organization_unit": "",
+                    "valid_days": 10,
+                    "digest_algorithm": "sha256",
+                    "key_profile": "ecdsa:prime256v1",
+                    "dns_list": ["web.home.lan"],
+                    "ip_list": []
+                }),
+            )
+            .await;
+        cert.assert_status(StatusCode::OK);
+        let cert_id = cert.json()["id"].as_str().unwrap().to_string();
+        for (uri, expected) in [
+            (format!("/minica/download/ca/{ca_id}/cert"), "Homelab_CA.pem"),
+            (format!("/minica/{ca_id}/download"), "Homelab_CA.pem"),
+            (format!("/minica/download/ca/{ca_id}/key"), "Homelab_CA.key"),
+            (format!("/minica/download/ca/{ca_id}/pkcs12"), "Homelab_CA.p12"),
+            (format!("/minica/download/ca/{ca_id}/password"), "Homelab_CA-p12-password.txt"),
+            (format!("/minica/download/ca/{ca_id}/truststore"), "Homelab_CA-truststore.p12"),
+            (format!("/minica/download/cert/{ca_id}/{cert_id}/cert"), "wildcard.home.lan.pem"),
+            (format!("/minica/download/cert/{ca_id}/{cert_id}/key"), "wildcard.home.lan.key"),
+            (format!("/minica/download/cert/{ca_id}/{cert_id}/csr"), "wildcard.home.lan.csr"),
+            (format!("/minica/download/cert/{ca_id}/{cert_id}/pkcs12"), "wildcard.home.lan.p12"),
+            (format!("/minica/download/cert/{ca_id}/{cert_id}/bundle"), "wildcard.home.lan.zip"),
+            (
+                format!("/minica/download/cert/{ca_id}/{cert_id}/password"),
+                "wildcard.home.lan-p12-password.txt",
+            ),
+        ] {
+            let response = env
+                .send("GET", &uri, Some(("viewer", "viewerpass")), None, None, Body::empty())
+                .await;
+            response.assert_status(StatusCode::OK);
+            assert_eq!(
+                response.header(header::CONTENT_DISPOSITION),
+                format!("attachment; filename=\"{expected}\""),
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn creation_forms_use_configured_defaults_and_presets() {
+        let templates: config::TemplatesConfig = serde_yaml::from_str(
+            "defaults:\n  country_code: DE\n  state: Bayern\n  organization: Homelab\n  valid_days: 398\n  key_profile: ecdsa:prime256v1\n  digest_algorithm: sha256\ncertificate:\n  - name: Web server (1 year)\n    valid_days: 365\n    organization_unit: Web\nca:\n  - name: Ten-year root\n    valid_days: 3650\n",
+        )
+        .unwrap();
+        let env = TestEnv::with_templates(
+            config::AuthConfig {
+                users: Some(basic_users()),
+                headers: None,
+            },
+            "/minica",
+            false,
+            templates,
+        );
+        let form = env
+            .send("GET", "/minica/cas/new", Some(("admin", "adminpass")), None, None, Body::empty())
+            .await;
+        form.assert_status(StatusCode::OK);
+        let html = form.text();
+        for expected in [
+            r#"name="country_code" value="DE""#,
+            r#"name="state" value="Bayern""#,
+            r#"name="organization" value="Homelab""#,
+            r#"name="valid_days" value="398""#,
+            r#"<option value="ecdsa:prime256v1" selected"#,
+            r#"<option value="sha256" selected"#,
+            r#"data-template-picker="ca-templates""#,
+            "Ten-year root",
+            r#"id="ca-templates""#,
+            r#""valid_days":"3650""#,
+        ] {
+            assert!(html.contains(expected), "missing {expected}: {html}");
+        }
+        assert!(!html.contains("Web server"), "cert presets stay off the CA form");
+
+        // The certificate form resolves presets over the defaults, and the
+        // CA's own subject fills whatever the defaults leave unset (city).
+        let csrf = env.get_csrf().await;
+        let ca = create_test_ca(&env, &csrf, "Template CA").await;
+        let ca_id = ca["id"].as_str().unwrap();
+        let form = env
+            .send(
+                "GET",
+                &format!("/minica/cas/{ca_id}/certs/new"),
+                Some(("admin", "adminpass")),
+                None,
+                None,
+                Body::empty(),
+            )
+            .await;
+        form.assert_status(StatusCode::OK);
+        let html = form.text();
+        for expected in [
+            r#"name="country_code" value="DE""#,
+            r#"name="organization" value="Homelab""#,
+            &format!(r#"name="city" value="{}""#, ca["city"].as_str().unwrap()),
+            r#"name="valid_days" value="398""#,
+            r#"data-template-picker="cert-templates""#,
+            "Web server (1 year)",
+            r#""valid_days":"365""#,
+            r#""organization_unit":"Web""#,
+            r#""country_code":"DE""#,
+        ] {
+            assert!(html.contains(expected), "missing {expected}: {html}");
+        }
+
+        // Without any configuration the certificate form inherits the CA's subject.
+        let plain = TestEnv::new();
+        let csrf = plain.get_csrf().await;
+        let ca = create_test_ca(&plain, &csrf, "Inherit CA").await;
+        let form = plain
+            .send(
+                "GET",
+                &format!("/minica/cas/{}/certs/new", ca["id"].as_str().unwrap()),
+                Some(("admin", "adminpass")),
+                None,
+                None,
+                Body::empty(),
+            )
+            .await;
+        let html = form.text();
+        assert!(
+            html.contains(&format!(
+                r#"name="organization" value="{}""#,
+                ca["organization"].as_str().unwrap()
+            )),
+            "{html}"
+        );
+        assert!(!html.contains(r#"data-template-picker=""#), "{html}");
+    }
+
+    #[tokio::test]
+    async fn renewal_flash_reports_the_effective_validity_when_capped() {
+        let env = TestEnv::new();
+        let csrf = env.get_csrf().await;
+        let ca = env
+            .json(
+                "PUT",
+                "/minica/api/cas",
+                Some(("admin", "adminpass")),
+                Some(&csrf),
+                json!({
+                    "common_name": "short.renew.test",
+                    "country_code": "SG",
+                    "state": "",
+                    "city": "",
+                    "organization": "Org",
+                    "organization_unit": "",
+                    "valid_days": 40,
+                    "digest_algorithm": "sha256",
+                    "key_profile": "ecdsa:prime256v1"
+                }),
+            )
+            .await;
+        ca.assert_status(StatusCode::OK);
+        let ca_id = ca.json()["id"].as_str().unwrap().to_string();
+        let cert = env
+            .json(
+                "PUT",
+                &format!("/minica/api/cas/{ca_id}/certs"),
+                Some(("admin", "adminpass")),
+                Some(&csrf),
+                json!({
+                    "common_name": "leaf.renew.test",
+                    "country_code": "SG",
+                    "state": "",
+                    "city": "",
+                    "organization": "Org",
+                    "organization_unit": "",
+                    "valid_days": 10,
+                    "digest_algorithm": "sha256",
+                    "key_profile": "ecdsa:prime256v1",
+                    "dns_list": [],
+                    "ip_list": []
+                }),
+            )
+            .await;
+        cert.assert_status(StatusCode::OK);
+        let cert_id = cert.json()["id"].as_str().unwrap().to_string();
+        let renew = env
+            .send(
+                "POST",
+                &format!("/minica/cas/{ca_id}/certs/{cert_id}/renew"),
+                Some(("admin", "adminpass")),
+                Some(&csrf),
+                Some("application/x-www-form-urlencoded"),
+                Body::from(format!("_csrf={}&days=3650", csrf.token)),
+            )
+            .await;
+        assert!(renew.status.is_redirection(), "{}", renew.text());
+        let flash = renew
+            .headers
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find(|cookie| cookie.starts_with("minica_flash="))
+            .expect("flash cookie")
+            .to_string();
+        let encoded = flash
+            .trim_start_matches("minica_flash=")
+            .split(';')
+            .next()
+            .unwrap();
+        let decoded = String::from_utf8(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(encoded)
+                .expect("base64 flash"),
+        )
+        .unwrap();
+        assert!(decoded.contains("days only"), "{decoded}");
+        assert!(!decoded.contains("3650"), "{decoded}");
+        // The stored validity is the effective one.
+        let detail = env
+            .send(
+                "GET",
+                &format!("/minica/api/cas/{ca_id}/certs/{cert_id}"),
+                Some(("admin", "adminpass")),
+                None,
+                None,
+                Body::empty(),
+            )
+            .await;
+        let days = detail.json()["valid_days"].as_i64().unwrap();
+        assert!((38..=40).contains(&days), "{days}");
     }
 
     #[tokio::test]
@@ -2365,7 +2730,7 @@ mod tests {
             assert!(
                 response
                     .header(header::CONTENT_DISPOSITION)
-                    .contains(&format!("ca-{ca_id}-cert.pem"))
+                    .contains("public.lifecycle.test.pem")
             );
         }
         // Key material keeps requiring a viewer.
