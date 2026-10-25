@@ -420,15 +420,6 @@ mod tests {
         }
 
         fn with_options(auth: config::AuthConfig, base_path: &str, secure_cookies: bool) -> Self {
-            Self::with_templates(auth, base_path, secure_cookies, config::TemplatesConfig::default())
-        }
-
-        fn with_templates(
-            auth: config::AuthConfig,
-            base_path: &str,
-            secure_cookies: bool,
-            templates: config::TemplatesConfig,
-        ) -> Self {
             let root = std::env::temp_dir().join(format!("minica-rust-test-{}", Uuid::new_v4()));
             fs::create_dir_all(root.join("runtime")).expect("create test runtime");
             fs::create_dir_all(root.join("openssl-work")).expect("create openssl work root");
@@ -455,7 +446,6 @@ mod tests {
                 },
                 auth,
                 logging: config::LoggingConfig::default(),
-                templates,
             };
 
             let db = Db::open(&config.db_path()).expect("open test database");
@@ -1838,7 +1828,7 @@ mod tests {
         let backup_yaml = backup.json()["yaml"].as_str().unwrap().to_string();
         assert!(backup_yaml.contains("format_version: 1"));
         assert!(backup_yaml.contains("app_version:"));
-        assert!(backup_yaml.contains("schema_version: 2"));
+        assert!(backup_yaml.contains("schema_version: 3"));
         assert!(backup_yaml.contains("ca.lifecycle.test"));
         assert!(backup_yaml.contains("leaf.lifecycle.test"));
         assert!(backup_yaml.contains("second.lifecycle.test"));
@@ -2483,20 +2473,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn creation_forms_use_configured_defaults_and_presets() {
-        let templates: config::TemplatesConfig = serde_yaml::from_str(
-            "defaults:\n  country_code: DE\n  state: Bayern\n  organization: Homelab\n  valid_days: 398\n  key_profile: ecdsa:prime256v1\n  digest_algorithm: sha256\ncertificate:\n  - name: Web server (1 year)\n    valid_days: 365\n    organization_unit: Web\nca:\n  - name: Ten-year root\n    valid_days: 3650\n",
-        )
-        .unwrap();
-        let env = TestEnv::with_templates(
-            config::AuthConfig {
-                users: Some(basic_users()),
-                headers: None,
-            },
-            "/minica",
-            false,
-            templates,
+    async fn templates_are_managed_in_the_ui_and_api_and_fill_the_forms() {
+        let env = TestEnv::new();
+        let csrf = env.get_csrf().await;
+
+        // Signed-in users see the (empty) list and the nav link; only admins
+        // get the New Template button or may write.
+        let list = env
+            .send("GET", "/minica/templates", Some(("viewer", "viewerpass")), None, None, Body::empty())
+            .await;
+        list.assert_status(StatusCode::OK);
+        let html = list.text();
+        assert!(html.contains(r#"href="/minica/templates""#), "{html}");
+        assert!(html.contains("No templates yet"), "{html}");
+        assert!(!html.contains("/minica/templates/new"), "{html}");
+        let denied = env
+            .json(
+                "PUT",
+                "/minica/api/templates",
+                Some(("viewer", "viewerpass")),
+                Some(&csrf),
+                json!({ "name": "nope" }),
+            )
+            .await;
+        denied.assert_status(StatusCode::FORBIDDEN);
+        let form = env
+            .send("GET", "/minica/templates/new", Some(("viewer", "viewerpass")), None, None, Body::empty())
+            .await;
+        form.assert_status(StatusCode::FORBIDDEN);
+
+        // Admin: create via the API (default, both forms) and via the HTML form
+        // (certificate-only preset); blank fields are unset.
+        let created = env
+            .json(
+                "PUT",
+                "/minica/api/templates",
+                Some(("admin", "adminpass")),
+                Some(&csrf),
+                json!({
+                    "name": "Homelab defaults",
+                    "is_default": true,
+                    "country_code": "de",
+                    "state": "Bayern",
+                    "organization": "Homelab",
+                    "valid_days": 398,
+                    "key_profile": "ecdsa:prime256v1",
+                    "digest_algorithm": "sha256"
+                }),
+            )
+            .await;
+        created.assert_status(StatusCode::OK);
+        let default_template = created.json();
+        assert_eq!(default_template["scope"], "both");
+        assert_eq!(default_template["country_code"], "DE");
+        assert!(default_template["city"].is_null());
+        let default_id = default_template["id"].as_str().unwrap().to_string();
+
+        let body = format!(
+            "_csrf={}&name=Web+server+%281+year%29&scope=certificate&valid_days=365&organization_unit=Web&country_code=&state=&city=&organization=&digest_algorithm=&key_profile=",
+            csrf.token
         );
+        let posted = env
+            .send(
+                "POST",
+                "/minica/templates",
+                Some(("admin", "adminpass")),
+                Some(&csrf),
+                Some("application/x-www-form-urlencoded"),
+                Body::from(body),
+            )
+            .await;
+        posted.assert_status(StatusCode::SEE_OTHER);
+        assert_eq!(posted.header(header::LOCATION), "/minica/templates");
+
+        let listed = env
+            .send("GET", "/minica/api/templates", Some(("viewer", "viewerpass")), None, None, Body::empty())
+            .await;
+        listed.assert_status(StatusCode::OK);
+        let templates = listed.json().as_array().unwrap().clone();
+        assert_eq!(templates.len(), 2);
+        let web = templates.iter().find(|t| t["name"] == "Web server (1 year)").unwrap();
+        assert_eq!(web["scope"], "certificate");
+        assert_eq!(web["valid_days"], 365);
+        assert_eq!(web["organization_unit"], "Web");
+        assert!(web["organization"].is_null(), "{web}");
+        let web_id = web["id"].as_str().unwrap().to_string();
+
+        // Validation: duplicate names (ignoring case), bad days, bad profile.
+        for payload in [
+            json!({ "name": "homelab DEFAULTS" }),
+            json!({ "name": "x", "valid_days": 0 }),
+            json!({ "name": "y", "key_profile": "rsa:1024" }),
+            json!({ "name": "z", "scope": "everything" }),
+        ] {
+            let response = env
+                .json("PUT", "/minica/api/templates", Some(("admin", "adminpass")), Some(&csrf), payload.clone())
+                .await;
+            response.assert_status(StatusCode::BAD_REQUEST);
+        }
+
+        // The CA form: the default applies, the cert-only preset is absent.
         let form = env
             .send("GET", "/minica/cas/new", Some(("admin", "adminpass")), None, None, Body::empty())
             .await;
@@ -2510,17 +2586,14 @@ mod tests {
             r#"<option value="ecdsa:prime256v1" selected"#,
             r#"<option value="sha256" selected"#,
             r#"data-template-picker="ca-templates""#,
-            "Ten-year root",
-            r#"id="ca-templates""#,
-            r#""valid_days":"3650""#,
+            "Homelab defaults",
         ] {
             assert!(html.contains(expected), "missing {expected}: {html}");
         }
-        assert!(!html.contains("Web server"), "cert presets stay off the CA form");
+        assert!(!html.contains("Web server"), "cert-only templates stay off the CA form");
 
-        // The certificate form resolves presets over the defaults, and the
-        // CA's own subject fills whatever the defaults leave unset (city).
-        let csrf = env.get_csrf().await;
+        // The certificate form: default over the CA's subject (city comes from
+        // the CA), and the preset resolves over that base.
         let ca = create_test_ca(&env, &csrf, "Template CA").await;
         let ca_id = ca["id"].as_str().unwrap();
         let form = env
@@ -2544,12 +2617,80 @@ mod tests {
             "Web server (1 year)",
             r#""valid_days":"365""#,
             r#""organization_unit":"Web""#,
-            r#""country_code":"DE""#,
+            &format!(r#""organization":"{}""#, ca["organization"].as_str().unwrap()),
         ] {
             assert!(html.contains(expected), "missing {expected}: {html}");
         }
 
-        // Without any configuration the certificate form inherits the CA's subject.
+        // Making the preset the default clears the flag on the overlapping one.
+        let updated = env
+            .json(
+                "POST",
+                &format!("/minica/api/templates/{web_id}"),
+                Some(("admin", "adminpass")),
+                Some(&csrf),
+                json!({ "name": "Web server (1 year)", "scope": "certificate", "is_default": true, "valid_days": 365 }),
+            )
+            .await;
+        updated.assert_status(StatusCode::OK);
+        let fetched = env
+            .send(
+                "GET",
+                &format!("/minica/api/templates/{default_id}"),
+                Some(("admin", "adminpass")),
+                None,
+                None,
+                Body::empty(),
+            )
+            .await;
+        assert_eq!(fetched.json()["is_default"], false);
+
+        // The edit page shows the saved values; delete removes the row.
+        let edit = env
+            .send(
+                "GET",
+                &format!("/minica/templates/{web_id}"),
+                Some(("admin", "adminpass")),
+                None,
+                None,
+                Body::empty(),
+            )
+            .await;
+        edit.assert_status(StatusCode::OK);
+        let html = edit.text();
+        assert!(html.contains(r#"name="name" value="Web server (1 year)""#), "{html}");
+        assert!(html.contains(r#"name="is_default" value="1" checked"#), "{html}");
+        let deleted = env
+            .send(
+                "DELETE",
+                &format!("/minica/api/templates/{web_id}"),
+                Some(("admin", "adminpass")),
+                Some(&csrf),
+                None,
+                Body::empty(),
+            )
+            .await;
+        deleted.assert_status(StatusCode::OK);
+        let gone = env
+            .send(
+                "GET",
+                &format!("/minica/api/templates/{web_id}"),
+                Some(("admin", "adminpass")),
+                None,
+                None,
+                Body::empty(),
+            )
+            .await;
+        gone.assert_status(StatusCode::NOT_FOUND);
+
+        // Templates travel with backups.
+        let backup = env
+            .send("GET", "/minica/api/backup", Some(("admin", "adminpass")), None, None, Body::empty())
+            .await;
+        backup.assert_status(StatusCode::OK);
+        assert!(backup.text().contains("Homelab defaults"), "{}", backup.text());
+
+        // Without templates the certificate form inherits the CA's subject.
         let plain = TestEnv::new();
         let csrf = plain.get_csrf().await;
         let ca = create_test_ca(&plain, &csrf, "Inherit CA").await;

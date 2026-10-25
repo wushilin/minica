@@ -21,124 +21,6 @@ pub struct Config {
     pub auth: AuthConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
-    /// Pre-filled form values and named presets for the New CA / New
-    /// Certificate pages.
-    #[serde(default)]
-    pub templates: TemplatesConfig,
-}
-
-/// `templates:` section. `defaults` pre-fills both creation forms; `ca` and
-/// `certificate` are named presets offered in a drop-down on the respective
-/// form (fields a preset leaves out keep the defaults). Nothing here changes
-/// what the API accepts; it only changes what the forms start with.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TemplatesConfig {
-    #[serde(default)]
-    pub defaults: FormTemplate,
-    #[serde(default)]
-    pub ca: Vec<FormTemplate>,
-    #[serde(default)]
-    pub certificate: Vec<FormTemplate>,
-}
-
-/// One set of form values. Every field is optional; `name` is only meaningful
-/// for presets (it is the drop-down label).
-#[derive(Clone, Debug, Default, Deserialize, serde::Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct FormTemplate {
-    #[serde(default, deserialize_with = "lenient::opt_string")]
-    pub name: Option<String>,
-    #[serde(default, deserialize_with = "lenient::opt_string")]
-    pub country_code: Option<String>,
-    #[serde(default, deserialize_with = "lenient::opt_string")]
-    pub state: Option<String>,
-    #[serde(default, deserialize_with = "lenient::opt_string")]
-    pub city: Option<String>,
-    #[serde(default, deserialize_with = "lenient::opt_string")]
-    pub organization: Option<String>,
-    #[serde(default, deserialize_with = "lenient::opt_string")]
-    pub organization_unit: Option<String>,
-    #[serde(default, deserialize_with = "lenient::opt_from_str")]
-    pub valid_days: Option<i64>,
-    #[serde(default, deserialize_with = "lenient::opt_string")]
-    pub digest_algorithm: Option<String>,
-    #[serde(default, deserialize_with = "lenient::opt_string")]
-    pub key_profile: Option<String>,
-}
-
-impl TemplatesConfig {
-    /// Presets need a non-empty, unique name; day counts must be in range.
-    fn validate(&self) -> Result<()> {
-        for (section, list) in [("templates.ca", &self.ca), ("templates.certificate", &self.certificate)] {
-            let mut seen = HashSet::new();
-            for template in list {
-                let name = template.name.as_deref().map(str::trim).unwrap_or_default();
-                if name.is_empty() {
-                    anyhow::bail!("{section}: every preset needs a name");
-                }
-                if !seen.insert(name.to_lowercase()) {
-                    anyhow::bail!("{section}: duplicate preset name {name:?}");
-                }
-                template.validate(&format!("{section} preset {name:?}"))?;
-            }
-        }
-        self.defaults.validate("templates.defaults")
-    }
-}
-
-impl FormTemplate {
-    fn validate(&self, what: &str) -> Result<()> {
-        if let Some(days) = self.valid_days.filter(|days| !(1..=7350).contains(days)) {
-            anyhow::bail!("{what}: valid_days must be in 1..7350, got {days}");
-        }
-        if let Some(code) = self
-            .country_code
-            .as_deref()
-            .filter(|code| code.trim().chars().count() > 2)
-        {
-            anyhow::bail!("{what}: country_code must be a 2-letter code, got {code:?}");
-        }
-        for (field, value) in [
-            ("name", &self.name),
-            ("country_code", &self.country_code),
-            ("state", &self.state),
-            ("city", &self.city),
-            ("organization", &self.organization),
-            ("organization_unit", &self.organization_unit),
-            ("digest_algorithm", &self.digest_algorithm),
-            ("key_profile", &self.key_profile),
-        ] {
-            if value
-                .as_deref()
-                .is_some_and(|value| value.chars().any(char::is_control))
-            {
-                anyhow::bail!("{what}: {field} must not contain control characters");
-            }
-        }
-        Ok(())
-    }
-
-    /// `self` with every unset field taken from `base`.
-    pub fn over(&self, base: &FormTemplate) -> FormTemplate {
-        FormTemplate {
-            name: self.name.clone().or_else(|| base.name.clone()),
-            country_code: self.country_code.clone().or_else(|| base.country_code.clone()),
-            state: self.state.clone().or_else(|| base.state.clone()),
-            city: self.city.clone().or_else(|| base.city.clone()),
-            organization: self.organization.clone().or_else(|| base.organization.clone()),
-            organization_unit: self
-                .organization_unit
-                .clone()
-                .or_else(|| base.organization_unit.clone()),
-            valid_days: self.valid_days.or(base.valid_days),
-            digest_algorithm: self
-                .digest_algorithm
-                .clone()
-                .or_else(|| base.digest_algorithm.clone()),
-            key_profile: self.key_profile.clone().or_else(|| base.key_profile.clone()),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -230,27 +112,6 @@ mod lenient {
             other => Err(D::Error::custom(format!(
                 "invalid type: expected a string, found {other:?}"
             ))),
-        }
-    }
-
-    /// Optional number: `null`/empty mean "not set"; strings must parse.
-    pub fn opt_from_str<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-    where
-        D: Deserializer<'de>,
-        T: FromStr + DeserializeOwned,
-        T::Err: Display,
-    {
-        match Value::deserialize(deserializer)? {
-            Value::Null => Ok(None),
-            Value::String(text) if is_null_word(&text) => Ok(None),
-            Value::String(text) => text
-                .trim()
-                .parse()
-                .map(Some)
-                .map_err(|err| D::Error::custom(format!("invalid number {text:?}: {err}"))),
-            other => serde_yaml::from_value(other)
-                .map(Some)
-                .map_err(D::Error::custom),
         }
     }
 
@@ -813,10 +674,6 @@ impl Config {
     ) -> Result<(Self, HashSet<String>)> {
         let (mut config, used_names) = parse_config_with_env(text, lookup)?;
         config.auth.validate().context("invalid auth config")?;
-        config
-            .templates
-            .validate()
-            .context("invalid templates config")?;
         config.server.base_path = normalize_base_path(&config.server.base_path);
         if let Some(base) = config.public_base_url.as_mut() {
             while base.ends_with('/') {
@@ -1033,51 +890,6 @@ mod env_token_tests {
     }
 
     const AUTH_YAML: &str = "auth:\n  users:\n    - username: admin\n      password: x\n      role: admin\n";
-
-    #[test]
-    fn templates_section_is_optional_and_env_friendly() {
-        let config = load_with(&format!("{BASE_YAML}{AUTH_YAML}"), &[]);
-        assert_eq!(config.templates.defaults, FormTemplate::default());
-        assert!(config.templates.ca.is_empty() && config.templates.certificate.is_empty());
-
-        let yaml = format!(
-            "{BASE_YAML}{AUTH_YAML}templates:\n  defaults:\n    country_code: {{{{ENV:CC:DE}}}}\n    organization: '{{{{ENV:ORG:}}}}'\n    valid_days: {{{{ENV:DAYS:398}}}}\n    key_profile: {{{{ENV:KP:ecdsa:prime256v1}}}}\n  certificate:\n    - name: Web server\n      valid_days: 365\n      organization_unit: Web\n    - name: Client\n      key_profile: rsa:2048\n      digest_algorithm: sha256\n"
-        );
-        let config = load_with(&yaml, &[("ORG", "Acme")]);
-        let defaults = &config.templates.defaults;
-        assert_eq!(defaults.country_code.as_deref(), Some("DE"));
-        assert_eq!(defaults.organization.as_deref(), Some("Acme"));
-        assert_eq!(defaults.valid_days, Some(398));
-        assert_eq!(defaults.key_profile.as_deref(), Some("ecdsa:prime256v1"));
-        assert_eq!(defaults.state, None, "unset stays unset");
-        assert_eq!(config.templates.certificate.len(), 2);
-        let web = config.templates.certificate[0].over(defaults);
-        assert_eq!(web.name.as_deref(), Some("Web server"));
-        assert_eq!(web.valid_days, Some(365), "preset wins");
-        assert_eq!(web.country_code.as_deref(), Some("DE"), "defaults fill the rest");
-        assert_eq!(web.organization_unit.as_deref(), Some("Web"));
-        // An empty env value means "not set", so the built-in default applies.
-        let config = load_with(&yaml, &[]);
-        assert_eq!(config.templates.defaults.organization, None);
-    }
-
-    #[test]
-    fn templates_are_validated() {
-        for (fragment, expected) in [
-            ("  certificate:\n    - valid_days: 10\n", "needs a name"),
-            ("  certificate:\n    - name: a\n    - name: A\n", "duplicate preset name"),
-            ("  ca:\n    - name: a\n      valid_days: 0\n", "valid_days must be in 1..7350"),
-            ("  defaults:\n    country_code: DEU\n", "2-letter"),
-            ("  defaults:\n    bogus: 1\n", "unknown field"),
-        ] {
-            let yaml = format!("{BASE_YAML}{AUTH_YAML}templates:\n{fragment}");
-            let err = Config::from_yaml_with(&yaml, lookup(&[]))
-                .err()
-                .map(|err| format!("{err:#}"))
-                .unwrap_or_default();
-            assert!(err.contains(expected), "{fragment:?}: {err}");
-        }
-    }
 
     #[test]
     fn tricky_env_values_stay_single_string_scalars() {

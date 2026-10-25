@@ -131,14 +131,15 @@ backup-able state, real revocation, hashed credentials, and safe concurrency.
    `minica --help` to see all actions (`--start`, `--gen-config`,
    `--gen-password`, `--verify-password`, `--import-legacy`).
 
-   **Form defaults and templates.** The "New CA" / "New Certificate" forms
-   start from `templates.defaults` in the config file (country, state, city,
-   organization, unit, days, digest, key profile); whatever that leaves unset
-   comes from the issuing CA's own subject on the certificate form. Named
-   presets under `templates.certificate` and `templates.ca` appear as a
-   drop-down that fills the form. See the commented example in
-   [config.yaml.example](./config.yaml.example); in Docker the defaults are the
-   `MINICA_DEFAULT_*` variables below.
+   **Templates.** The **Templates** page (top bar, every signed-in user) holds
+   global presets for the "New CA" / "New Certificate" forms: country, state,
+   city, organization, unit, validity, digest and key profile, each optional.
+   A template can apply to CAs, certificates or both, and one per form can be
+   marked *default* so it fills the form automatically; the others appear in
+   the form's Template drop-down. Administrators manage them in the UI or via
+   `/api/templates`; they are stored in the database and included in backups.
+   Fields a template leaves unset keep the form's own value, which on the
+   certificate form is the issuing CA's subject.
 
 3. **Issue certs from the CLI.** See [cli/README.md](./cli/README.md):
    ```sh
@@ -342,8 +343,6 @@ Common Docker-friendly variables:
 | `MINICA_HEADER_VIEWER_GROUP` | `user` | Group that grants viewer role. |
 | `MINICA_TRUSTED_REMOTE_1` ... `MINICA_TRUSTED_REMOTE_10` | `-` | Trusted reverse-proxy peers, as IPs or CIDRs. Unset slots are ignored. With header auth enabled, an empty trusted list is rejected at startup. |
 | `MINICA_HEADER_TRUST_ALL_REMOTES` | `false` | Explicitly trust identity headers from any peer when no trusted remote is set. Only safe if the port is reachable solely through the proxy; logs a security warning. |
-| `MINICA_DEFAULT_COUNTRY_CODE`, `MINICA_DEFAULT_STATE`, `MINICA_DEFAULT_CITY`, `MINICA_DEFAULT_ORGANIZATION`, `MINICA_DEFAULT_ORGANIZATION_UNIT` | unset | Pre-filled subject fields of the "New CA" / "New Certificate" forms (`templates.defaults`). Unset fields keep the built-in values; on the certificate form they come from the issuing CA's subject. |
-| `MINICA_DEFAULT_VALID_DAYS`, `MINICA_DEFAULT_DIGEST`, `MINICA_DEFAULT_KEY_PROFILE` | unset | Pre-filled validity (1–7350), digest (`sha256`/`sha384`/`sha512`) and key profile (`rsa:2048`, `rsa:4096`, `rsa:8192`, `ecdsa:prime256v1`, `ecdsa:secp384r1`, `ecdsa:secp521r1`) of the forms. Named presets need a mounted config file (see `templates:` in config.yaml.example). |
 
 ```sh
 podman run --rm -p 8443:8443 -v minica-data:/data \

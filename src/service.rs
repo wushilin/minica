@@ -6,7 +6,8 @@ use crate::{
     },
     models::{
         Certificate, CertificateAuthority, CreateCaRequest, CreateCertRequest, CreateUserRequest,
-        ImportCaRequest, ImportCertRequest, InspectResponse, UserView,
+        ImportCaRequest, ImportCertRequest, InspectResponse, Template, TemplateRequest,
+        TemplateScope, TemplateValues, UserView,
     },
     openssl::{
         OpenSsl, RenewalRequest, build_bundle, create_subject, escape_subject, normalize_digest,
@@ -73,7 +74,44 @@ pub struct BackupFile {
     pub warning: String,
     #[serde(default)]
     pub users: Vec<BackupUser>,
+    #[serde(default)]
+    pub templates: Vec<BackupTemplate>,
     pub certificate_authorities: Vec<BackupCa>,
+}
+
+/// A form template in a backup (same shape as `models::Template`).
+#[derive(Serialize, Deserialize)]
+pub struct BackupTemplate {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_template_scope")]
+    pub scope: String,
+    #[serde(default)]
+    pub is_default: bool,
+    #[serde(flatten)]
+    pub values: TemplateValues,
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
+fn default_template_scope() -> String {
+    TemplateScope::Both.as_str().to_string()
+}
+
+impl From<Template> for BackupTemplate {
+    fn from(template: Template) -> Self {
+        Self {
+            id: template.id,
+            name: template.name,
+            scope: template.scope,
+            is_default: template.is_default,
+            values: template.values,
+            created_at: template.created_at,
+            updated_at: template.updated_at,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1097,6 +1135,12 @@ impl AppService {
         let snapshot = self.db.backup_snapshot()?;
         let users: Vec<BackupUser> = snapshot.users.into_iter().map(BackupUser::from).collect();
         let user_count = users.len();
+        let templates: Vec<BackupTemplate> = snapshot
+            .templates
+            .into_iter()
+            .map(BackupTemplate::from)
+            .collect();
+        let template_count = templates.len();
         let mut cas_out = Vec::new();
         for (ca, certs) in snapshot.cas {
             let mut certs_out = Vec::new();
@@ -1159,6 +1203,7 @@ impl AppService {
             exported_at: Utc::now().timestamp_millis(),
             warning: "This backup includes private keys and passwords.".to_string(),
             users,
+            templates,
             certificate_authorities: cas_out,
         })
         .map_err(anyhow::Error::from)?;
@@ -1166,6 +1211,7 @@ impl AppService {
             ca_count,
             cert_count,
             user_count,
+            template_count,
             bytes = yaml.len(),
             "exported backup YAML"
         );
@@ -1321,6 +1367,87 @@ impl AppService {
         self.db.delete_user(id)?;
         tracing::info!(user_id = %id, "deleted user");
         Ok(())
+    }
+
+    pub fn list_templates(&self) -> Result<Vec<Template>> {
+        self.db.list_templates()
+    }
+
+    pub fn get_template(&self, id: &str) -> Result<Template> {
+        self.db
+            .get_template(id)?
+            .ok_or_else(|| anyhow::anyhow!("template not found: {id}"))
+    }
+
+    /// The templates offered on the creation form of `kind`: the default one
+    /// (applied automatically) and every applicable template, by name.
+    pub fn templates_for(&self, kind: TemplateScope) -> Result<(Option<Template>, Vec<Template>)> {
+        let presets: Vec<Template> = self
+            .db
+            .list_templates()?
+            .into_iter()
+            .filter(|template| template.scope().covers(kind))
+            .collect();
+        let default = presets.iter().find(|template| template.is_default).cloned();
+        Ok((default, presets))
+    }
+
+    #[tracing::instrument(skip(self, req), err, fields(span_id = %span_id(), name = %req.name))]
+    pub fn create_template(&self, req: TemplateRequest) -> Result<Template> {
+        let now = Utc::now().timestamp_millis();
+        let template = self.validate_template(req, Uuid::new_v4().to_string(), now, now)?;
+        self.db.save_template(&template, true)?;
+        tracing::info!(template_id = %template.id, name = %template.name, "created template");
+        Ok(template)
+    }
+
+    #[tracing::instrument(skip(self, req), err, fields(span_id = %span_id(), template_id = %id))]
+    pub fn update_template(&self, id: &str, req: TemplateRequest) -> Result<Template> {
+        let existing = self.get_template(id)?;
+        let now = Utc::now().timestamp_millis();
+        let template = self.validate_template(req, existing.id, existing.created_at, now)?;
+        self.db.save_template(&template, false)?;
+        tracing::info!(template_id = %template.id, name = %template.name, "updated template");
+        Ok(template)
+    }
+
+    #[tracing::instrument(skip(self), err, fields(span_id = %span_id(), template_id = %id))]
+    pub fn delete_template(&self, id: &str) -> Result<()> {
+        self.db.delete_template(id)
+    }
+
+    fn validate_template(
+        &self,
+        req: TemplateRequest,
+        id: String,
+        created_at: i64,
+        updated_at: i64,
+    ) -> Result<Template> {
+        let name = req.name.trim().to_string();
+        if name.is_empty() {
+            bail!("template name must not be empty");
+        }
+        if name.chars().count() > 100 || name.chars().any(char::is_control) {
+            bail!("template name must be at most 100 characters without control characters");
+        }
+        if self.db.template_name_taken(&name, Some(&id))? {
+            bail!("template name already exists: {name}");
+        }
+        let scope = match req.scope.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            None => TemplateScope::Both,
+            Some(scope) => TemplateScope::parse(scope)
+                .ok_or_else(|| anyhow::anyhow!("scope must be 'both', 'ca' or 'certificate'"))?,
+        };
+        let values = validate_template_values(&req.values)?;
+        Ok(Template {
+            id,
+            name,
+            scope: scope.as_str().to_string(),
+            is_default: req.is_default,
+            values,
+            created_at,
+            updated_at,
+        })
     }
 
     /// CA common names are unique among CAs (not checked against cert CNs).
@@ -2157,6 +2284,30 @@ fn backup_to_snapshot(backup: BackupFile) -> Result<BackupSnapshot> {
             created_at: user.created_at,
         });
     }
+    for template in backup.templates {
+        validate_backup_id(&template.id)?;
+        let scope = TemplateScope::parse(&template.scope).with_context(|| {
+            format!(
+                "backup template {:?} has unknown scope {:?}",
+                template.name, template.scope
+            )
+        })?;
+        let values = validate_template_values(&template.values)
+            .with_context(|| format!("backup template {:?} is invalid", template.name))?;
+        let name = template.name.trim().to_string();
+        if name.is_empty() || name.chars().any(char::is_control) {
+            bail!("backup template {:?} has an invalid name", template.id);
+        }
+        snapshot.templates.push(Template {
+            id: template.id,
+            name,
+            scope: scope.as_str().to_string(),
+            is_default: template.is_default,
+            values,
+            created_at: template.created_at,
+            updated_at: template.updated_at,
+        });
+    }
     for ca in backup.certificate_authorities {
         let ca_id = ca.meta.id.clone();
         validate_backup_id(&ca_id)?;
@@ -2273,6 +2424,56 @@ fn backup_to_snapshot(backup: BackupFile) -> Result<BackupSnapshot> {
 
 /// Ids end up in URLs and download file names; accept only what `short_id`
 /// produces (plus '-'/'_').
+/// Normalises template values and rejects anything the creation forms would
+/// not accept. Blank fields become unset.
+fn validate_template_values(values: &TemplateValues) -> Result<TemplateValues> {
+    let values = values.normalized();
+    if let Some(days) = values.valid_days.filter(|days| !(1..=7350).contains(days)) {
+        bail!("valid_days must be in 1..7350, got {days}");
+    }
+    if let Some(code) = values
+        .country_code
+        .as_deref()
+        .filter(|code| code.chars().count() != 2 || !code.chars().all(|c| c.is_ascii_alphabetic()))
+    {
+        bail!("country_code must be a 2-letter code, got {code:?}");
+    }
+    if let Some(digest) = values
+        .digest_algorithm
+        .as_deref()
+        .filter(|digest| !["sha256", "sha384", "sha512"].contains(digest))
+    {
+        bail!("digest_algorithm must be sha256, sha384 or sha512, got {digest:?}");
+    }
+    if let Some(profile) = values.key_profile.as_deref().filter(|profile| {
+        ![
+            "rsa:2048",
+            "rsa:4096",
+            "rsa:8192",
+            "ecdsa:prime256v1",
+            "ecdsa:secp384r1",
+            "ecdsa:secp521r1",
+        ]
+        .contains(profile)
+    }) {
+        bail!("key_profile is not supported: {profile:?}");
+    }
+    for (field, value) in [
+        ("country_code", &values.country_code),
+        ("state", &values.state),
+        ("city", &values.city),
+        ("organization", &values.organization),
+        ("organization_unit", &values.organization_unit),
+    ] {
+        if value.as_deref().is_some_and(|value| {
+            value.chars().any(char::is_control) || value.chars().count() > 200
+        }) {
+            bail!("{field} must be at most 200 characters without control characters");
+        }
+    }
+    Ok(values)
+}
+
 fn validate_backup_id(id: &str) -> Result<()> {
     if id.is_empty()
         || id.len() > 64
@@ -2482,6 +2683,7 @@ mod tests {
             app: "minica-rust".to_string(),
             exported_at: 0,
             warning: String::new(),
+            templates: vec![],
             users: vec![BackupUser {
                 id: "u1".to_string(),
                 username: "alice".to_string(),

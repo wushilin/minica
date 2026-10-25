@@ -1,4 +1,4 @@
-use crate::models::{Certificate, CertificateAuthority};
+use crate::models::{Certificate, CertificateAuthority, Template, TemplateValues};
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use rand::{Rng, distr::Alphanumeric};
@@ -9,7 +9,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// How many `.pre-migrate-*.bak` copies of the database to keep. Each holds
 /// every private key, so older ones are pruned after a new one is made.
@@ -95,6 +95,7 @@ pub struct BackupCertRow {
 #[derive(Clone, Default)]
 pub struct BackupSnapshot {
     pub users: Vec<UserRecord>,
+    pub templates: Vec<Template>,
     pub cas: Vec<(BackupCaRow, Vec<BackupCertRow>)>,
 }
 
@@ -268,6 +269,27 @@ impl Db {
                 role TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );
+
+            -- Schema 3: global form templates (see models::Template). Names
+            -- are unique ignoring case.
+            CREATE TABLE IF NOT EXISTS templates (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                scope TEXT NOT NULL DEFAULT 'both',
+                is_default INTEGER NOT NULL DEFAULT 0,
+                country_code TEXT,
+                state TEXT,
+                city TEXT,
+                organization TEXT,
+                organization_unit TEXT,
+                valid_days INTEGER,
+                digest_algorithm TEXT,
+                key_profile TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_templates_name
+                ON templates(name COLLATE NOCASE);
 
             -- certificates.ca_id is filtered on every CA view (list_cas' LEFT
             -- JOIN, the per-CA cert listings, and the dashboard/trash COUNT
@@ -912,13 +934,18 @@ impl Db {
         let mut conn = self.conn.lock().expect("db mutex poisoned");
         let tx = conn.transaction()?;
         let users = query_users(&tx)?;
+        let templates = query_templates(&tx)?;
         let mut cas = Vec::new();
         for ca in query_backup_cas(&tx)? {
             let certs = query_backup_certs(&tx, &ca.meta.id)?;
             cas.push((ca, certs));
         }
         tx.commit()?;
-        Ok(BackupSnapshot { users, cas })
+        Ok(BackupSnapshot {
+            users,
+            templates,
+            cas,
+        })
     }
 
     /// Restores a whole backup atomically: the emptiness check and every insert
@@ -932,6 +959,9 @@ impl Db {
         }
         for user in &snapshot.users {
             insert_user_row(&tx, user)?;
+        }
+        for template in &snapshot.templates {
+            insert_template_row(&tx, template)?;
         }
         for (ca, certs) in &snapshot.cas {
             insert_ca_row(&tx, ca)?;
@@ -949,6 +979,7 @@ impl Db {
         tx.commit()?;
         tracing::info!(
             user_count = snapshot.users.len(),
+            template_count = snapshot.templates.len(),
             ca_count = snapshot.cas.len(),
             cert_count = snapshot
                 .cas
@@ -967,13 +998,15 @@ impl Db {
         let cert_rows = tx.execute("DELETE FROM certificates", [])?;
         let ca_rows = tx.execute("DELETE FROM certificate_authorities", [])?;
         let user_rows = tx.execute("DELETE FROM users", [])?;
+        let template_rows = tx.execute("DELETE FROM templates", [])?;
         tx.commit()?;
         tracing::warn!(
             lock_rows_affected = lock_rows,
             cert_rows_affected = cert_rows,
             ca_rows_affected = ca_rows,
             user_rows_affected = user_rows,
-            total_rows_affected = lock_rows + cert_rows + ca_rows + user_rows,
+            template_rows_affected = template_rows,
+            total_rows_affected = lock_rows + cert_rows + ca_rows + user_rows + template_rows,
             "nuked all database entities"
         );
         Ok(())
@@ -1484,6 +1517,167 @@ impl Db {
         tracing::info!(user_id = %id, rows_affected = count, "deleted user");
         Ok(())
     }
+
+    pub fn list_templates(&self) -> Result<Vec<Template>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        query_templates(&conn)
+    }
+
+    pub fn get_template(&self, id: &str) -> Result<Option<Template>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.query_row(
+            &format!("{TEMPLATE_SELECT} WHERE id = ?"),
+            params![id],
+            row_to_template,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// True when another template (not `except_id`) already uses `name`,
+    /// ignoring case.
+    pub fn template_name_taken(&self, name: &str, except_id: Option<&str>) -> Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM templates WHERE name = ? COLLATE NOCASE AND id != ?",
+            params![name, except_id.unwrap_or("")],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Inserts (`new`) or replaces a template. When it is marked default, the
+    /// default flag is cleared on every other template whose scope overlaps,
+    /// in the same transaction, so each form has at most one default.
+    pub fn save_template(&self, template: &Template, new: bool) -> Result<()> {
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
+        if template.is_default {
+            let others = query_templates(&tx)?;
+            for other in others
+                .iter()
+                .filter(|other| other.id != template.id && other.is_default)
+                .filter(|other| other.scope().overlaps(template.scope()))
+            {
+                tx.execute(
+                    "UPDATE templates SET is_default = 0, updated_at = ? WHERE id = ?",
+                    params![template.updated_at, other.id],
+                )?;
+            }
+        }
+        if new {
+            insert_template_row(&tx, template)?;
+        } else {
+            let rows = tx.execute(
+                r#"
+                UPDATE templates SET
+                    name = ?, scope = ?, is_default = ?, country_code = ?, state = ?, city = ?,
+                    organization = ?, organization_unit = ?, valid_days = ?, digest_algorithm = ?,
+                    key_profile = ?, updated_at = ?
+                WHERE id = ?
+                "#,
+                params![
+                    template.name,
+                    template.scope,
+                    template.is_default as i64,
+                    template.values.country_code,
+                    template.values.state,
+                    template.values.city,
+                    template.values.organization,
+                    template.values.organization_unit,
+                    template.values.valid_days,
+                    template.values.digest_algorithm,
+                    template.values.key_profile,
+                    template.updated_at,
+                    template.id,
+                ],
+            )?;
+            if rows == 0 {
+                bail!("template not found: {}", template.id);
+            }
+        }
+        tx.commit()?;
+        tracing::info!(template_id = %template.id, name = %template.name, new, "saved template");
+        Ok(())
+    }
+
+    pub fn delete_template(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let count = conn.execute("DELETE FROM templates WHERE id = ?", params![id])?;
+        if count == 0 {
+            bail!("template not found: {id}");
+        }
+        tracing::info!(template_id = %id, rows_affected = count, "deleted template");
+        Ok(())
+    }
+}
+
+const TEMPLATE_SELECT: &str = "SELECT id, name, scope, is_default, country_code, state, city, \
+    organization, organization_unit, valid_days, digest_algorithm, key_profile, created_at, \
+    updated_at FROM templates";
+
+fn row_to_template(row: &rusqlite::Row<'_>) -> rusqlite::Result<Template> {
+    Ok(Template {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        scope: row.get(2)?,
+        is_default: row.get::<_, i64>(3)? != 0,
+        values: TemplateValues {
+            country_code: row.get(4)?,
+            state: row.get(5)?,
+            city: row.get(6)?,
+            organization: row.get(7)?,
+            organization_unit: row.get(8)?,
+            valid_days: row.get(9)?,
+            digest_algorithm: row.get(10)?,
+            key_profile: row.get(11)?,
+        },
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+    })
+}
+
+/// Every template, by name (case-insensitively).
+fn query_templates(conn: &Connection) -> Result<Vec<Template>> {
+    let mut stmt = conn.prepare(&format!("{TEMPLATE_SELECT} ORDER BY name COLLATE NOCASE"))?;
+    let rows = stmt.query_map([], row_to_template)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+fn insert_template_row(conn: &Connection, template: &Template) -> Result<()> {
+    conn.execute(
+        r#"
+        INSERT INTO templates (
+            id, name, scope, is_default, country_code, state, city, organization,
+            organization_unit, valid_days, digest_algorithm, key_profile, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+        params![
+            template.id,
+            template.name,
+            template.scope,
+            template.is_default as i64,
+            template.values.country_code,
+            template.values.state,
+            template.values.city,
+            template.values.organization,
+            template.values.organization_unit,
+            template.values.valid_days,
+            template.values.digest_algorithm,
+            template.values.key_profile,
+            template.created_at,
+            template.updated_at,
+        ],
+    )
+    .map_err(|err| {
+        if err.to_string().contains("UNIQUE") {
+            anyhow::anyhow!("template name already exists: {}", template.name)
+        } else {
+            err.into()
+        }
+    })?;
+    Ok(())
 }
 
 fn row_to_user(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserRecord> {
@@ -1612,7 +1806,8 @@ fn is_empty_conn(conn: &Connection) -> Result<bool> {
         SELECT
             (SELECT COUNT(*) FROM certificate_authorities) +
             (SELECT COUNT(*) FROM certificates) +
-            (SELECT COUNT(*) FROM users)
+            (SELECT COUNT(*) FROM users) +
+            (SELECT COUNT(*) FROM templates)
         "#,
         [],
         |row| row.get(0),
@@ -1843,6 +2038,25 @@ fn schema_columns_present(conn: &Connection) -> Result<bool> {
         (
             "users",
             &["id", "username", "password_hash", "role", "created_at"][..],
+        ),
+        (
+            "templates",
+            &[
+                "id",
+                "name",
+                "scope",
+                "is_default",
+                "country_code",
+                "state",
+                "city",
+                "organization",
+                "organization_unit",
+                "valid_days",
+                "digest_algorithm",
+                "key_profile",
+                "created_at",
+                "updated_at",
+            ][..],
         ),
     ];
 
@@ -2336,6 +2550,7 @@ mod tests {
         // before it must be rolled back.
         let broken = BackupSnapshot {
             users: vec![user.clone()],
+            templates: vec![],
             cas: vec![(ca_row.clone(), vec![cert_row.clone(), cert_row.clone()])],
         };
         assert!(db.restore_backup(&broken).is_err());
@@ -2346,6 +2561,7 @@ mod tests {
 
         let good = BackupSnapshot {
             users: vec![user],
+            templates: vec![],
             cas: vec![(ca_row, vec![cert_row])],
         };
         db.restore_backup(&good).unwrap();

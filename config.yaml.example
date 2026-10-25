@@ -82,32 +82,3 @@ auth:
   #  trusted_remotes:
   #    - 127.0.0.1
   #    - 10.0.0.0/8
-
-# Form templates (optional). `defaults` pre-fills the "New CA" and "New
-# Certificate" forms; `ca` and `certificate` are named presets offered in a
-# drop-down on the respective form (a preset only needs the fields it changes;
-# the rest come from `defaults`). Fields left out of `defaults` keep the
-# built-in values (SG / Singapore / Singapore, 365 days, sha512, rsa:4096), and
-# the certificate form inherits whatever `defaults` leaves unset from the
-# issuing CA's own subject. Nothing here restricts what the API accepts.
-#templates:
-#  defaults:
-#    country_code: DE
-#    state: Bayern
-#    city: München
-#    organization: Homelab
-#    organization_unit: ""
-#    valid_days: 398
-#    digest_algorithm: sha256       # sha256 | sha384 | sha512
-#    key_profile: ecdsa:prime256v1  # rsa:2048 | rsa:4096 | rsa:8192 | ecdsa:prime256v1 | ecdsa:secp384r1 | ecdsa:secp521r1
-#  certificate:
-#    - name: Web server (1 year)
-#      valid_days: 365
-#      organization_unit: Web
-#    - name: Client / mTLS (90 days)
-#      valid_days: 90
-#      key_profile: rsa:2048
-#  ca:
-#    - name: Ten-year root
-#      valid_days: 3650
-#      key_profile: rsa:4096
