@@ -3348,6 +3348,7 @@ mod tests {
     struct PageFixture {
         ca_id: String,
         cert_id: String,
+        template_id: String,
         ca_pem: String,
         /// Values the fixture created that appear verbatim in pages
         /// (ids, subjects, URLs, digest names); stripped by the
@@ -3423,6 +3424,19 @@ mod tests {
         .await
         .assert_status(StatusCode::SEE_OTHER);
 
+        let template = env
+            .json(
+                "PUT",
+                "/minica/api/templates",
+                admin,
+                Some(csrf),
+                json!({ "name": "5.5.5", "is_default": true, "valid_days": 100, "key_profile": "rsa:2048" }),
+            )
+            .await;
+        template.assert_status(StatusCode::OK);
+        let template = template.json();
+        let template_id = template["id"].as_str().unwrap().to_string();
+
         let mut data = Vec::new();
         for value in [&ca, &cert, &deleted_cert, &deleted_ca] {
             for field in ["id", "subject", "crl_url"] {
@@ -3434,9 +3448,12 @@ mod tests {
         data.push(format!("http://localhost/minica/{ca_id}/download"));
         data.push(format!("http://localhost/minica/download/ca/{ca_id}/cert"));
         data.push("sha256".to_string());
+        data.push("rsa:2048".to_string());
+        data.push(template_id.clone());
         PageFixture {
             ca_id,
             cert_id,
+            template_id,
             ca_pem: ca["cert_pem"].as_str().unwrap().to_string(),
             data,
         }
@@ -3495,11 +3512,19 @@ mod tests {
             ("import cert", format!("/minica/cas/{ca}/certs/import")),
             ("cert detail", format!("/minica/cas/{ca}/certs/{cert}")),
             ("inspect", "/minica/inspect".to_string()),
+            ("templates", "/minica/templates".to_string()),
+            ("new template", "/minica/templates/new".to_string()),
+            ("edit template", format!("/minica/templates/{}", fixture.template_id)),
             ("admin console", "/minica/admin".to_string()),
             ("swagger", "/minica/swagger".to_string()),
         ] {
             pages.push((name.to_string(), StatusCode::OK, get(uri).await));
         }
+        pages.push((
+            "signed out".to_string(),
+            StatusCode::UNAUTHORIZED,
+            get("/minica/logout".to_string()).await,
+        ));
         pages.push((
             "error page".to_string(),
             StatusCode::NOT_FOUND,
