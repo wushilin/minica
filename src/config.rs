@@ -889,6 +889,8 @@ mod env_token_tests {
             .0
     }
 
+    const AUTH_YAML: &str = "auth:\n  users:\n    - username: admin\n      password: x\n      role: admin\n";
+
     #[test]
     fn tricky_env_values_stay_single_string_scalars() {
         let yaml = format!(

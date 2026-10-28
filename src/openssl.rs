@@ -592,11 +592,23 @@ impl OpenSsl {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Re-signs a certificate with its existing key for `valid_days` from now.
+    ///
+    /// The signing request is rebuilt from the key, `subject` (the current
+    /// certificate's subject in `-subj` form) and the current certificate's
+    /// SANs, so a renewal reproduces exactly what the certificate says today.
+    /// Relying on the stored CSR lost SANs for certificates imported before
+    /// SAN copying existed (their CSR has none) and for CSRs made with an
+    /// openssl lacking `-copy_extensions`. The stored CSR is only the fallback
+    /// when no subject is known or the rebuild fails (e.g. a subject attribute
+    /// `req -subj` cannot express).
+    #[allow(clippy::too_many_arguments)]
     pub fn renew_cert_files(
         &self,
         dir: &Path,
         ca: &CaSecrets,
         cert: &CertSecrets,
+        renewal: &RenewalRequest<'_>,
         valid_days: i64,
         digest: &str,
         crl_url: Option<&str>,
@@ -605,6 +617,8 @@ impl OpenSsl {
         tracing::info!(
             valid_days,
             digest,
+            dns_count = renewal.dns_list.len(),
+            ip_count = renewal.ip_list.len(),
             "renewing certificate files with openssl"
         );
         let digest = normalize_digest(digest)?;
@@ -617,7 +631,46 @@ impl OpenSsl {
         let cert_dir = dir.join("cert");
         fs::create_dir(&cert_dir)?;
         write_secret(&cert_dir.join("cert.key"), &cert.key_pem)?;
-        fs::write(cert_dir.join("cert.csr"), &cert.csr_pem)?;
+        let rebuilt = match renewal.subject {
+            Some(subject) => {
+                fs::write(
+                    dir.join("openssl-cert.conf"),
+                    cert_config(renewal.dns_list, renewal.ip_list),
+                )?;
+                let out = self.run_in(
+                    dir,
+                    &[
+                        "req",
+                        "-config",
+                        "openssl-cert.conf",
+                        "-new",
+                        "-key",
+                        "cert/cert.key",
+                        &format!("-{digest}"),
+                        "-nodes",
+                        "-out",
+                        "cert/cert.csr",
+                        "-outform",
+                        "PEM",
+                        "-subj",
+                        subject,
+                    ],
+                    Duration::from_secs(self.config.timeout_seconds),
+                )?;
+                if out.exit_code != 0 {
+                    tracing::warn!(
+                        subject,
+                        stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                        "could not rebuild the signing request from the certificate; renewing from the stored CSR"
+                    );
+                }
+                out.exit_code == 0
+            }
+            None => false,
+        };
+        if !rebuilt {
+            fs::write(cert_dir.join("cert.csr"), &cert.csr_pem)?;
+        }
         self.run_ok(
             dir,
             &[
@@ -909,15 +962,19 @@ impl OpenSsl {
         Ok(refresh)
     }
 
+    /// `csr_pem` is the request the certificate was originally issued from,
+    /// when the caller has it (legacy migration); otherwise one is derived
+    /// from the certificate.
     pub fn import_cert_files(
         &self,
         dir: &Path,
         ca: &CaSecrets,
         cert_pem: &str,
         key_pem: &str,
+        csr_pem: Option<&[u8]>,
         password: &str,
     ) -> Result<CertSecrets> {
-        tracing::info!("importing certificate files with openssl");
+        tracing::info!(has_csr = csr_pem.is_some(), "importing certificate files with openssl");
         export_ca_state(dir, ca)?;
         let cert_dir = dir.join("cert");
         fs::create_dir(&cert_dir)?;
@@ -927,15 +984,23 @@ impl OpenSsl {
             .context("imported certificate was not issued by this CA")?;
         // `x509 -x509toreq -signkey` happily signs with a mismatched key, so
         // compare the public keys explicitly.
-        let key_pub = self
-            .run_ok(dir, &["pkey", "-in", "cert/cert.key", "-pubout"])
-            .context("imported private key could not be read")?;
-        let cert_pub = self.run_ok(dir, &["x509", "-in", "cert/cert.pem", "-noout", "-pubkey"])?;
-        if String::from_utf8_lossy(&key_pub.stdout).trim()
-            != String::from_utf8_lossy(&cert_pub.stdout).trim()
-        {
-            bail!("imported private key does not match the certificate");
-        }
+        self.check_key_matches_cert(dir, "cert/cert.pem", "cert/cert.key")
+            .context("imported private key does not match the certificate")?;
+        let supplied_csr = match csr_pem {
+            Some(csr) if !csr.iter().all(u8::is_ascii_whitespace) => {
+                fs::write(cert_dir.join("cert.csr"), csr)?;
+                let check = self.run_in(
+                    dir,
+                    &["req", "-in", "cert/cert.csr", "-noout", "-verify"],
+                    Duration::from_secs(self.config.timeout_seconds),
+                )?;
+                if check.exit_code != 0 {
+                    tracing::warn!("supplied signing request is unreadable; deriving one from the certificate");
+                }
+                check.exit_code == 0
+            }
+            _ => false,
+        };
         // `-copy_extensions copyall` (OpenSSL 3) carries the SANs into the CSR
         // so renewals keep them; older openssl/LibreSSL lack the option, so
         // fall back to the plain conversion there.
@@ -954,17 +1019,19 @@ impl OpenSsl {
             ]);
             args
         };
-        let copied = self.run_in(
-            dir,
-            &to_req(true),
-            Duration::from_secs(self.config.timeout_seconds),
-        )?;
-        if copied.exit_code != 0 {
-            tracing::warn!(
-                "openssl x509 -copy_extensions failed; imported certificate renewals will not keep SANs"
-            );
-            self.run_ok(dir, &to_req(false))
-                .context("failed to derive a CSR from the imported certificate")?;
+        if !supplied_csr {
+            let copied = self.run_in(
+                dir,
+                &to_req(true),
+                Duration::from_secs(self.config.timeout_seconds),
+            )?;
+            if copied.exit_code != 0 {
+                tracing::warn!(
+                    "openssl x509 -copy_extensions failed; the derived CSR carries no SANs (renewals re-read them from the certificate)"
+                );
+                self.run_ok(dir, &to_req(false))
+                    .context("failed to derive a CSR from the imported certificate")?;
+            }
         }
         let passout = write_pass_file(dir, "cert-p12.pass", password.as_bytes())?;
         self.run_ok(
@@ -993,6 +1060,36 @@ impl OpenSsl {
             "imported certificate files"
         );
         Ok(secrets)
+    }
+
+    /// Fails unless the private key in `key_file` belongs to the certificate
+    /// in `cert_file` (both relative to `dir`), by comparing public keys.
+    pub fn check_key_matches_cert(&self, dir: &Path, cert_file: &str, key_file: &str) -> Result<()> {
+        let key_pub = self
+            .run_ok(dir, &["pkey", "-in", key_file, "-pubout"])
+            .context("private key could not be read")?;
+        let cert_pub = self.run_ok(dir, &["x509", "-in", cert_file, "-noout", "-pubkey"])?;
+        if String::from_utf8_lossy(&key_pub.stdout).trim()
+            != String::from_utf8_lossy(&cert_pub.stdout).trim()
+        {
+            bail!("private key does not match the certificate");
+        }
+        Ok(())
+    }
+
+    /// False only for a certificate whose basicConstraints say `CA:FALSE`
+    /// (an end-entity certificate pasted where a CA was expected). Certificates
+    /// without the extension are accepted, as openssl itself does for v1 roots.
+    pub fn is_ca_cert(&self, dir: &Path, pem: &str) -> Result<bool> {
+        let text = self.inspect_cert_text(dir, pem)?;
+        let mut lines = text.lines();
+        while let Some(line) = lines.next() {
+            if line.contains("X509v3 Basic Constraints") {
+                let value = lines.next().unwrap_or_default();
+                return Ok(!value.contains("CA:FALSE"));
+            }
+        }
+        Ok(true)
     }
 
     pub fn inspect_cert(&self, dir: &Path, pem: &str) -> Result<Vec<(String, String)>> {
@@ -1200,6 +1297,14 @@ impl Drop for WorkDir {
     }
 }
 
+/// What a renewal must reproduce from the current certificate: its subject in
+/// `openssl -subj` form (None when it could not be read) and its SAN lists.
+pub struct RenewalRequest<'a> {
+    pub subject: Option<&'a str>,
+    pub dns_list: &'a [String],
+    pub ip_list: &'a [String],
+}
+
 pub fn random_password() -> String {
     rand::rng()
         .sample_iter(Alphanumeric)
@@ -1255,7 +1360,7 @@ pub fn create_subject(
 /// Escapes a value for `openssl -subj`. Besides the `/` RDN separator, `+`
 /// starts a multi-valued RDN (always enabled in OpenSSL 3) and `=` separates
 /// type from value, so all of them are backslash-escaped.
-fn escape_subject(input: &str) -> String {
+pub(crate) fn escape_subject(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
         if matches!(ch, '\\' | '/' | '+' | '=') {

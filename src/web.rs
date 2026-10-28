@@ -2,8 +2,9 @@ use crate::{
     AppState, auth,
     i18n::{Lang, t, tf, tf_html, tr},
     models::{
-        CreateCaRequest, CreateCertRequest, CreateUserRequest, ImportCaRequest, ImportCertRequest,
-        InspectRequest,
+        CertificateAuthority, CreateCaRequest, CreateCertRequest, CreateUserRequest,
+        ImportCaRequest, ImportCertRequest, InspectRequest, Template, TemplateRequest,
+        TemplateScope, TemplateValues,
     },
     service::Download,
 };
@@ -100,6 +101,19 @@ pub fn router(state: Arc<AppState>) -> Router {
             put(api_inspect).fallback(api_method_not_allowed),
         )
         .route(
+            "/templates",
+            get(api_list_templates)
+                .put(api_create_template)
+                .fallback(api_method_not_allowed),
+        )
+        .route(
+            "/templates/{template_id}",
+            get(api_get_template)
+                .post(api_update_template)
+                .delete(api_delete_template)
+                .fallback(api_method_not_allowed),
+        )
+        .route(
             "/backup",
             get(api_backup_export).fallback(api_method_not_allowed),
         )
@@ -138,9 +152,20 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/crl/{ca_id}", get(crl_download))
         .route("/{ca_id}/download", get(public_ca_cert_download))
         .route("/inspect", get(inspect_form).post(inspect_form_post))
+        .route("/templates", get(template_list).post(create_template_form))
+        .route("/templates/new", get(new_template_form))
+        .route(
+            "/templates/{template_id}",
+            get(edit_template_form).post(update_template_form),
+        )
+        .route(
+            "/templates/{template_id}/delete",
+            post(delete_template_form),
+        )
         .route("/admin", get(admin_console))
         .route("/swagger", get(swagger_page))
         .route("/lang/{code}", get(switch_lang))
+        .route("/logout", get(logout))
         .route("/admin/backup", get(admin_backup_export))
         .route(
             "/admin/backup/restore",
@@ -514,8 +539,9 @@ fn ca_form_page(
     csrf: &str,
     error: Option<&str>,
     values: &SubjectValues,
-) -> String {
-    format!(
+) -> Result<String> {
+    let (_, presets) = state.service.templates_for(TemplateScope::Ca)?;
+    Ok(format!(
         r#"{}<h1>{}</h1>{}<form method="post" action="{}" class="form-grid">{}</form>"#,
         breadcrumb(lang, &[
             (t(lang, "crumb.home"), Some(u(state, "/cas"))),
@@ -524,20 +550,28 @@ fn ca_form_page(
         t(lang, "ca.new.title"),
         error.map(|e| error_banner(lang, e)).unwrap_or_default(),
         u(state, "/cas"),
-        ca_form_fields(lang, csrf, &t(lang, "ca.new.submit"), "", values)
-    )
+        ca_form_fields(
+            lang,
+            csrf,
+            &t(lang, "ca.new.submit"),
+            &template_picker(lang, "ca-templates", &presets, &builtin_form_base()),
+            values
+        )
+    ))
 }
 
 async fn new_ca_form(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let lang = request_lang(&headers);
     admin_page_response(state, headers, move |state, csrf| {
-        Ok(ca_form_page(
+        let (default, _) = state.service.templates_for(TemplateScope::Ca)?;
+        let values = default.map(|template| template.values).unwrap_or_default();
+        ca_form_page(
             state,
             lang,
             &csrf,
             None,
-            &SubjectValues::default(),
-        ))
+            &SubjectValues::from_template(&values),
+        )
     })
     .await
 }
@@ -569,7 +603,7 @@ async fn create_ca_form(
             let message = err.to_string();
             let values = SubjectValues::from(&form);
             page_response(state, headers, move |state, _user, csrf| {
-                Ok(ca_form_page(state, lang, &csrf, Some(&message), &values))
+                ca_form_page(state, lang, &csrf, Some(&message), &values)
             })
             .await
         }
@@ -851,18 +885,19 @@ async fn renew_ca_form(
 fn cert_form_page(
     state: &Arc<AppState>,
     lang: Lang,
-    ca_id: &str,
-    ca_name: &str,
+    ca: &CertificateAuthority,
     csrf: &str,
     error: Option<&str>,
     values: &SubjectValues,
-) -> String {
-    format!(
+) -> Result<String> {
+    let (_, presets) = state.service.templates_for(TemplateScope::Certificate)?;
+    let ca_id = &ca.id;
+    Ok(format!(
         r#"{}<h1>{}</h1>{}<form method="post" action="{}" class="form-grid">{}</form>"#,
         breadcrumb(lang, &[
             (t(lang, "crumb.home"), Some(u(state, "/cas"))),
             (
-                tf(lang, "crumb.ca", &[("name", ca_name)]),
+                tf(lang, "crumb.ca", &[("name", &ca.common_name)]),
                 Some(u(state, &format!("/cas/{ca_id}"))),
             ),
             (t(lang, "cert.new.title"), None),
@@ -870,7 +905,97 @@ fn cert_form_page(
         t(lang, "cert.new.title"),
         error.map(|e| error_banner(lang, e)).unwrap_or_default(),
         u(state, &format!("/cas/{ca_id}/certs")),
-        cert_form_fields(lang, csrf, values)
+        cert_form_fields(
+            lang,
+            csrf,
+            &template_picker(lang, "cert-templates", &presets, &cert_form_base(ca)),
+            values
+        )
+    ))
+}
+
+/// The built-in form values (what a form shows with no template and, for a
+/// CA, no other source), as a template base so choosing a template in the
+/// drop-down always yields the same fields regardless of earlier edits.
+fn builtin_form_base() -> TemplateValues {
+    let base = SubjectValues::default();
+    TemplateValues {
+        country_code: Some(base.country_code),
+        state: Some(base.state),
+        city: Some(base.city),
+        organization: Some(base.organization),
+        organization_unit: Some(base.organization_unit),
+        valid_days: base.valid_days.parse().ok(),
+        digest_algorithm: Some(base.digest_algorithm),
+        key_profile: Some(base.key_profile),
+    }
+}
+
+/// What the New Certificate form starts from when no template applies: the
+/// issuing CA's own subject attributes (a certificate usually belongs to the
+/// organisation of its CA) over the built-in values. Templates fill in over
+/// these; nothing here is enforced when the form is submitted.
+fn cert_form_base(ca: &CertificateAuthority) -> TemplateValues {
+    TemplateValues {
+        country_code: Some(ca.country_code.clone()),
+        state: Some(ca.state.clone()),
+        city: Some(ca.city.clone()),
+        organization: Some(ca.organization.clone()),
+        organization_unit: Some(ca.organization_unit.clone()),
+        ..TemplateValues::default()
+    }
+    .over(&builtin_form_base())
+}
+
+/// A template drop-down for a creation form, plus each template's values
+/// (resolved over `base`, the form's own values) as JSON for the page script,
+/// which copies them into the fields. Empty when there are no templates.
+/// `id` names the JSON block.
+fn template_picker(lang: Lang, id: &str, presets: &[Template], base: &TemplateValues) -> String {
+    if presets.is_empty() {
+        return String::new();
+    }
+    let options: String = presets
+        .iter()
+        .enumerate()
+        .map(|(index, preset)| {
+            format!(
+                r#"<option value="{index}"{}>{}</option>"#,
+                if preset.is_default { " selected" } else { "" },
+                h(&preset.name)
+            )
+        })
+        .collect();
+    let json = serde_json::Value::Array(
+        presets
+            .iter()
+            .map(|preset| {
+                let resolved = preset.values.over(base);
+                let mut values = serde_json::Map::new();
+                let mut put = |key: &str, value: Option<String>| {
+                    if let Some(value) = value {
+                        values.insert(key.to_string(), serde_json::Value::String(value));
+                    }
+                };
+                put("country_code", resolved.country_code);
+                put("state", resolved.state);
+                put("city", resolved.city);
+                put("organization", resolved.organization);
+                put("organization_unit", resolved.organization_unit);
+                put("valid_days", resolved.valid_days.map(|days| days.to_string()));
+                put("digest_algorithm", resolved.digest_algorithm);
+                put("key_profile", resolved.key_profile);
+                serde_json::Value::Object(values)
+            })
+            .collect(),
+    )
+    .to_string()
+    .replace('<', "\\u003c");
+    format!(
+        r#"<label class="template-picker">{} <span class="muted">{}</span><select class="form-select" data-template-picker="{id}"><option value="">{}</option>{options}</select></label><script type="application/json" id="{id}">{json}</script>"#,
+        t(lang, "field.template"),
+        t(lang, "template.help"),
+        t(lang, "template.custom")
     )
 }
 
@@ -882,15 +1007,20 @@ async fn new_cert_form(
     let lang = request_lang(&headers);
     admin_page_response(state, headers, move |state, csrf| {
         let ca = state.service.get_ca(&ca_id)?;
-        Ok(cert_form_page(
+        let (default, _) = state.service.templates_for(TemplateScope::Certificate)?;
+        let base = cert_form_base(&ca);
+        let values = match default {
+            Some(template) => template.values.over(&base),
+            None => base,
+        };
+        cert_form_page(
             state,
             lang,
-            &ca_id,
-            &ca.common_name,
+            &ca,
             &csrf,
             None,
-            &SubjectValues::default(),
-        ))
+            &SubjectValues::from_template(&values),
+        )
     })
     .await
 }
@@ -913,6 +1043,19 @@ async fn create_cert_form(
         Err(err) => return error_response(&state, &headers, err),
     };
     match created {
+        Ok(cert) if cert.valid_days < form.valid_days => redirect_with_flash(
+            &state,
+            &u(&state, &format!("/cas/{ca_id}#ca-certs")),
+            "success",
+            &tr(
+                lang,
+                "flash.cert_created_clamped",
+                &[
+                    ("name", &cert.common_name),
+                    ("days", &cert.valid_days.to_string()),
+                ],
+            ),
+        ),
         Ok(cert) => redirect_with_flash(
             &state,
             &u(&state, &format!("/cas/{ca_id}#ca-certs")),
@@ -923,16 +1066,8 @@ async fn create_cert_form(
             let message = err.to_string();
             let values = SubjectValues::from(&form);
             page_response(state, headers, move |state, _user, csrf| {
-                let ca_name = state.service.ca_display_name(&ca_id);
-                Ok(cert_form_page(
-                    state,
-                    lang,
-                    &ca_id,
-                    &ca_name,
-                    &csrf,
-                    Some(&message),
-                    &values,
-                ))
+                let ca = state.service.get_ca(&ca_id)?;
+                cert_form_page(state, lang, &ca, &csrf, Some(&message), &values)
             })
             .await
         }
@@ -1183,13 +1318,20 @@ async fn renew_cert_form(
     let lang = request_lang(&headers);
     mutate_form_response(state, headers, form._csrf.clone(), move |state| {
         let cert = state.service.renew_cert(&ca_id, &cert_id, form.days)?;
+        // The validity is capped at the CA certificate's expiry; say so
+        // instead of echoing the requested number of days.
+        let args = [
+            ("name", cert.common_name.as_str()),
+            ("days", &cert.valid_days.to_string()),
+        ];
+        let notice = if cert.valid_days < form.days {
+            tr(lang, "flash.cert_renewed_clamped", &args)
+        } else {
+            tr(lang, "flash.cert_renewed", &args)
+        };
         Ok((
             Redirect::to(&u(state, &format!("/cas/{ca_id}/certs/{cert_id}"))),
-            tr(
-                lang,
-                "flash.cert_renewed",
-                &[("name", &cert.common_name), ("days", &form.days.to_string())],
-            ),
+            notice,
         ))
     })
     .await
@@ -1240,6 +1382,535 @@ async fn crl_download(
             "CRL download failed",
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Templates: global presets for the New CA / New Certificate forms. Every
+// signed-in user can see them; admins manage them.
+
+/// `<form>` fields of the template editor. Blank strings mean "not set".
+#[derive(Deserialize, Clone)]
+struct TemplateForm {
+    _csrf: String,
+    name: String,
+    #[serde(default)]
+    scope: String,
+    /// Checkbox: present (any value) when ticked.
+    #[serde(default)]
+    is_default: Option<String>,
+    #[serde(default)]
+    country_code: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    city: String,
+    #[serde(default)]
+    organization: String,
+    #[serde(default)]
+    organization_unit: String,
+    #[serde(default)]
+    valid_days: String,
+    #[serde(default)]
+    digest_algorithm: String,
+    #[serde(default)]
+    key_profile: String,
+}
+
+impl TemplateForm {
+    /// Fails only when the validity is not a whole number; everything else
+    /// is checked by the service.
+    fn into_request(self) -> Result<TemplateRequest> {
+        let valid_days = match self.valid_days.trim() {
+            "" => None,
+            text => Some(
+                text.parse::<i64>()
+                    .map_err(|_| anyhow!("valid_days must be a whole number, got {text:?}"))?,
+            ),
+        };
+        Ok(TemplateRequest {
+            name: self.name,
+            scope: empty_none(self.scope),
+            is_default: self.is_default.is_some(),
+            values: TemplateValues {
+                country_code: empty_none(self.country_code),
+                state: empty_none(self.state),
+                city: empty_none(self.city),
+                organization: empty_none(self.organization),
+                organization_unit: empty_none(self.organization_unit),
+                valid_days,
+                digest_algorithm: empty_none(self.digest_algorithm),
+                key_profile: empty_none(self.key_profile),
+            },
+        })
+    }
+}
+
+/// What the editor shows: a saved template, a rejected submission, or the
+/// blank form.
+#[derive(Clone, Default)]
+struct TemplateFormValues {
+    name: String,
+    scope: String,
+    is_default: bool,
+    country_code: String,
+    state: String,
+    city: String,
+    organization: String,
+    organization_unit: String,
+    valid_days: String,
+    digest_algorithm: String,
+    key_profile: String,
+}
+
+impl From<&Template> for TemplateFormValues {
+    fn from(template: &Template) -> Self {
+        let v = &template.values;
+        Self {
+            name: template.name.clone(),
+            scope: template.scope.clone(),
+            is_default: template.is_default,
+            country_code: v.country_code.clone().unwrap_or_default(),
+            state: v.state.clone().unwrap_or_default(),
+            city: v.city.clone().unwrap_or_default(),
+            organization: v.organization.clone().unwrap_or_default(),
+            organization_unit: v.organization_unit.clone().unwrap_or_default(),
+            valid_days: v.valid_days.map(|days| days.to_string()).unwrap_or_default(),
+            digest_algorithm: v.digest_algorithm.clone().unwrap_or_default(),
+            key_profile: v.key_profile.clone().unwrap_or_default(),
+        }
+    }
+}
+
+impl From<&TemplateForm> for TemplateFormValues {
+    fn from(form: &TemplateForm) -> Self {
+        Self {
+            name: form.name.clone(),
+            scope: form.scope.clone(),
+            is_default: form.is_default.is_some(),
+            country_code: form.country_code.clone(),
+            state: form.state.clone(),
+            city: form.city.clone(),
+            organization: form.organization.clone(),
+            organization_unit: form.organization_unit.clone(),
+            valid_days: form.valid_days.clone(),
+            digest_algorithm: form.digest_algorithm.clone(),
+            key_profile: form.key_profile.clone(),
+        }
+    }
+}
+
+fn template_scope_label(lang: Lang, scope: &str) -> String {
+    match TemplateScope::parse(scope) {
+        Some(TemplateScope::Ca) => t(lang, "template.scope_ca"),
+        Some(TemplateScope::Certificate) => t(lang, "template.scope_certificate"),
+        _ => t(lang, "template.scope_both"),
+    }
+}
+
+/// `C=DE, ST=Bayern, O=Homelab` for the list; `—` when nothing is set.
+fn template_subject_summary(values: &TemplateValues) -> String {
+    let parts: Vec<String> = [
+        ("C", &values.country_code),
+        ("ST", &values.state),
+        ("L", &values.city),
+        ("O", &values.organization),
+        ("OU", &values.organization_unit),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| value.as_deref().map(|value| format!("{key}={}", h(value))))
+    .collect();
+    if parts.is_empty() {
+        "—".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+async fn template_list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let lang = request_lang(&headers);
+    page_response(state, headers, move |state, user, csrf| {
+        let templates = state.service.list_templates()?;
+        Ok(template_list_body(
+            state,
+            lang,
+            &csrf,
+            &templates,
+            user.role.can_write(),
+        ))
+    })
+    .await
+}
+
+fn template_list_body(
+    state: &Arc<AppState>,
+    lang: Lang,
+    csrf: &str,
+    templates: &[Template],
+    is_admin: bool,
+) -> String {
+    let new_button = if is_admin {
+        format!(
+            r#"<a class="btn btn-primary" href="{}">{}</a>"#,
+            u(state, "/templates/new"),
+            t(lang, "template.new")
+        )
+    } else {
+        String::new()
+    };
+    let mut body = breadcrumb(lang, &[
+        (t(lang, "crumb.home"), Some(u(state, "/cas"))),
+        (t(lang, "nav.templates"), None),
+    ]);
+    body.push_str(&format!(
+        r#"<div class="toolbar"><div><h1>{}</h1><p class="muted">{}</p></div><div class="actions">{new_button}</div></div>"#,
+        t(lang, "nav.templates"),
+        t(lang, "template.list_help")
+    ));
+    if templates.is_empty() {
+        body.push_str(&format!(
+            r#"<section class="empty"><h2>{}</h2><p>{}</p></section>"#,
+            t(lang, "template.empty"),
+            t(lang, "template.empty_help")
+        ));
+        return body;
+    }
+    body.push_str(&format!(
+        r#"<table class="table"><thead><tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th></th></tr></thead><tbody>"#,
+        t(lang, "field.name"),
+        t(lang, "template.scope"),
+        t(lang, "template.default"),
+        t(lang, "field.subject"),
+        t(lang, "field.valid_days"),
+        t(lang, "field.key")
+    ));
+    for template in templates {
+        let key = match (&template.values.key_profile, &template.values.digest_algorithm) {
+            (None, None) => "—".to_string(),
+            (profile, digest) => format!(
+                "{} {}",
+                profile.as_deref().map(h).unwrap_or_default(),
+                digest.as_deref().map(h).unwrap_or_default()
+            )
+            .trim()
+            .to_string(),
+        };
+        let actions = if is_admin {
+            format!(
+                r#"<a class="btn btn-sm btn-outline-primary" href="{}">{}</a> <form class="inline" method="post" action="{}"><input type="hidden" name="_csrf" value="{}"><button type="submit" class="btn btn-sm btn-outline-danger" data-confirm="{}">{}</button></form>"#,
+                u(state, &format!("/templates/{}", template.id)),
+                t(lang, "action.edit"),
+                u(state, &format!("/templates/{}/delete", template.id)),
+                h(csrf),
+                tf(lang, "template.delete_confirm", &[("name", &template.name)]),
+                t(lang, "action.delete")
+            )
+        } else {
+            String::new()
+        };
+        body.push_str(&format!(
+            r#"<tr><td><strong>{}</strong></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td translate="no">{}</td><td class="text-end">{}</td></tr>"#,
+            h(&template.name),
+            template_scope_label(lang, &template.scope),
+            if template.is_default { "✓" } else { "" },
+            template_subject_summary(&template.values),
+            template
+                .values
+                .valid_days
+                .map(|days| days.to_string())
+                .unwrap_or_else(|| "—".to_string()),
+            key,
+            actions
+        ));
+    }
+    body.push_str("</tbody></table>");
+    body
+}
+
+/// The template editor. `id` is `None` for a new template.
+fn template_form_page(
+    state: &Arc<AppState>,
+    lang: Lang,
+    csrf: &str,
+    id: Option<&str>,
+    values: &TemplateFormValues,
+    error: Option<&str>,
+) -> String {
+    let (title, submit, action) = match id {
+        Some(id) => (
+            t(lang, "template.edit"),
+            t(lang, "template.submit_update"),
+            u(state, &format!("/templates/{id}")),
+        ),
+        None => (
+            t(lang, "template.new"),
+            t(lang, "template.submit_create"),
+            u(state, "/templates"),
+        ),
+    };
+    let scope_options: String = [
+        TemplateScope::Both,
+        TemplateScope::Ca,
+        TemplateScope::Certificate,
+    ]
+    .into_iter()
+    .map(|scope| {
+        let selected = TemplateScope::parse(&values.scope).unwrap_or(TemplateScope::Both) == scope;
+        format!(
+            r#"<option value="{}"{}>{}</option>"#,
+            scope.as_str(),
+            if selected { " selected" } else { "" },
+            template_scope_label(lang, scope.as_str())
+        )
+    })
+    .collect();
+    let unset = format!(
+        r#"<option value=""{}>{}</option>"#,
+        if values.digest_algorithm.is_empty() { " selected" } else { "" },
+        t(lang, "template.unset")
+    );
+    let digest = format!(
+        "{unset}{}{}{}",
+        opt("sha256", "SHA-256", &values.digest_algorithm),
+        opt("sha384", "SHA-384", &values.digest_algorithm),
+        opt("sha512", "SHA-512", &values.digest_algorithm)
+    );
+    let unset_key = format!(
+        r#"<option value=""{}>{}</option>"#,
+        if values.key_profile.is_empty() { " selected" } else { "" },
+        t(lang, "template.unset")
+    );
+    let key_profiles = format!(
+        "{unset_key}{}{}{}{}{}{}",
+        opt("rsa:2048", "RSA 2048", &values.key_profile),
+        opt("rsa:4096", "RSA 4096", &values.key_profile),
+        opt("rsa:8192", "RSA 8192", &values.key_profile),
+        opt("ecdsa:prime256v1", "ECDSA P-256 / prime256v1", &values.key_profile),
+        opt("ecdsa:secp384r1", "ECDSA P-384 / secp384r1", &values.key_profile),
+        opt("ecdsa:secp521r1", "ECDSA P-521 / secp521r1", &values.key_profile)
+    );
+    format!(
+        r#"{crumbs}<h1>{title}</h1><p class="muted">{help}</p>{error}<form method="post" action="{action}" class="form-grid"><input type="hidden" name="_csrf" value="{csrf}"><div class="grid2"><label>{l_name}<input class="form-control" name="name" value="{name}" maxlength="100" required></label><label>{l_scope}<select class="form-select" name="scope">{scope_options}</select></label><label>{l_cc}<input class="form-control" name="country_code" value="{cc}" maxlength="2"></label><label>{l_st}<input class="form-control" name="state" value="{st}"></label><label>{l_ci}<input class="form-control" name="city" value="{ci}"></label><label>{l_org}<input class="form-control" name="organization" value="{org}"></label><label>{l_ou}<input class="form-control" name="organization_unit" value="{ou}"></label><label>{l_vd}<input class="form-control" type="number" min="1" max="7350" name="valid_days" value="{vd}"></label><label>{l_digest}<select class="form-select" name="digest_algorithm">{digest}</select></label><label>{l_kp}<select class="form-select" name="key_profile">{key_profiles}</select></label></div><label class="check-row"><input type="checkbox" name="is_default" value="1"{checked}> {l_default} <span class="muted">{default_help}</span></label><button class="btn btn-primary">{submit}</button></form>"#,
+        crumbs = breadcrumb(lang, &[
+            (t(lang, "crumb.home"), Some(u(state, "/cas"))),
+            (t(lang, "nav.templates"), Some(u(state, "/templates"))),
+            (title.clone(), None),
+        ]),
+        help = t(lang, "template.leave_blank"),
+        error = error.map(|e| error_banner(lang, e)).unwrap_or_default(),
+        csrf = h(csrf),
+        l_name = t(lang, "field.name"),
+        name = h(&values.name),
+        l_scope = t(lang, "template.scope"),
+        l_cc = t(lang, "field.country_code"),
+        l_st = t(lang, "field.state"),
+        l_ci = t(lang, "field.city"),
+        l_org = t(lang, "field.organization"),
+        l_ou = t(lang, "field.organization_unit"),
+        l_vd = t(lang, "field.valid_days"),
+        l_digest = t(lang, "field.digest"),
+        l_kp = t(lang, "field.key_profile"),
+        cc = h(&values.country_code),
+        st = h(&values.state),
+        ci = h(&values.city),
+        org = h(&values.organization),
+        ou = h(&values.organization_unit),
+        vd = h(&values.valid_days),
+        checked = if values.is_default { " checked" } else { "" },
+        l_default = t(lang, "template.default"),
+        default_help = t(lang, "template.default_help"),
+    )
+}
+
+async fn new_template_form(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let lang = request_lang(&headers);
+    admin_page_response(state, headers, move |state, csrf| {
+        Ok(template_form_page(
+            state,
+            lang,
+            &csrf,
+            None,
+            &TemplateFormValues::default(),
+            None,
+        ))
+    })
+    .await
+}
+
+async fn edit_template_form(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(template_id): Path<String>,
+) -> Response {
+    let lang = request_lang(&headers);
+    admin_page_response(state, headers, move |state, csrf| {
+        let template = state.service.get_template(&template_id)?;
+        Ok(template_form_page(
+            state,
+            lang,
+            &csrf,
+            Some(&template.id),
+            &TemplateFormValues::from(&template),
+            None,
+        ))
+    })
+    .await
+}
+
+/// Shared by create and update: runs `save` and either redirects to the list
+/// with a flash or re-renders the editor with the error and the user's input.
+async fn save_template_response<F>(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    form: TemplateForm,
+    id: Option<String>,
+    save: F,
+) -> Response
+where
+    F: FnOnce(&Arc<AppState>, TemplateRequest) -> Result<Template> + Send + 'static,
+{
+    let lang = request_lang(&headers);
+    let values = TemplateFormValues::from(&form);
+    let csrf = form._csrf.clone();
+    let saved = match admin_blocking(&state, &headers, Some(csrf), move |state| {
+        Ok(form.into_request().and_then(|request| save(state, request)))
+    })
+    .await
+    {
+        Ok(saved) => saved,
+        Err(err) => return error_response(&state, &headers, err),
+    };
+    match saved {
+        Ok(template) => {
+            let name = [("name", template.name.as_str())];
+            let message = if id.is_some() {
+                tr(lang, "flash.template_updated", &name)
+            } else {
+                tr(lang, "flash.template_created", &name)
+            };
+            redirect_with_flash(&state, &u(&state, "/templates"), "success", &message)
+        }
+        Err(err) => {
+            let message = err.to_string();
+            admin_page_response(state, headers, move |state, csrf| {
+                Ok(template_form_page(
+                    state,
+                    lang,
+                    &csrf,
+                    id.as_deref(),
+                    &values,
+                    Some(&message),
+                ))
+            })
+            .await
+        }
+    }
+}
+
+async fn create_template_form(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<TemplateForm>,
+) -> Response {
+    save_template_response(
+        state,
+        headers,
+        form,
+        None,
+        |state, request| state.service.create_template(request),
+    )
+    .await
+}
+
+async fn update_template_form(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(template_id): Path<String>,
+    Form(form): Form<TemplateForm>,
+) -> Response {
+    let id = template_id.clone();
+    save_template_response(
+        state,
+        headers,
+        form,
+        Some(template_id),
+        move |state, request| state.service.update_template(&id, request),
+    )
+    .await
+}
+
+async fn delete_template_form(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(template_id): Path<String>,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let lang = request_lang(&headers);
+    mutate_form_response(state, headers, form._csrf.clone(), move |state| {
+        state.service.delete_template(&template_id)?;
+        Ok((
+            Redirect::to(&u(state, "/templates")),
+            tr(lang, "flash.template_deleted", &[]),
+        ))
+    })
+    .await
+}
+
+async fn api_list_templates(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    api_view(headers, state, |state| state.service.list_templates()).await
+}
+
+async fn api_get_template(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(template_id): Path<String>,
+) -> Response {
+    api_view(headers, state, move |state| {
+        state.service.get_template(&template_id)
+    })
+    .await
+}
+
+async fn api_create_template(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    req: Result<Json<TemplateRequest>, JsonRejection>,
+) -> Response {
+    let Json(req) = match req {
+        Ok(req) => req,
+        Err(err) => return api_json_rejection(err),
+    };
+    api_admin(Method::PUT, headers, state, move |state| {
+        state.service.create_template(req)
+    })
+    .await
+}
+
+async fn api_update_template(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(template_id): Path<String>,
+    req: Result<Json<TemplateRequest>, JsonRejection>,
+) -> Response {
+    let Json(req) = match req {
+        Ok(req) => req,
+        Err(err) => return api_json_rejection(err),
+    };
+    api_admin(Method::POST, headers, state, move |state| {
+        state.service.update_template(&template_id, req)
+    })
+    .await
+}
+
+async fn api_delete_template(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(template_id): Path<String>,
+) -> Response {
+    api_admin(Method::DELETE, headers, state, move |state| {
+        state.service.delete_template(&template_id)?;
+        Ok(serde_json::json!({ "deleted": true }))
+    })
+    .await
 }
 
 async fn admin_console(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -1907,6 +2578,36 @@ async fn download_cert(
     }
 }
 
+/// `GET {base}/logout`: ends a Basic-auth session. Browsers keep Basic
+/// credentials until a request that carried them is answered 401, so this
+/// always answers 401 with the challenge, whatever credentials arrived. The
+/// browser drops its cached password, shows its sign-in dialog (Cancel
+/// closes it) and then this page. Needs no auth or CSRF: it only forgets.
+/// Under reverse-proxy header auth the proxy owns the session, so the UI
+/// does not offer this link there.
+async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let lang = request_lang(&headers);
+    let base = state.config.server.base_path.trim_end_matches('/');
+    let body = format!(
+        r#"<section class="empty"><h1>{}</h1><p>{}</p><p><a class="btn btn-primary" href="{base}/cas">{}</a> <a class="btn btn-outline-secondary" href="{base}/">{}</a></p></section>"#,
+        t(lang, "logout.title"),
+        t(lang, "logout.message"),
+        t(lang, "logout.sign_in_again"),
+        t(lang, "logout.home")
+    );
+    let mut response = (
+        StatusCode::UNAUTHORIZED,
+        Html(layout_with(base, lang, &body, &format!("{base}/"), "", "")),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        header::HeaderValue::from_static(r#"Basic realm="MiniCA""#),
+    );
+    refresh_lang_cookie(&state, &headers, &mut response);
+    response
+}
+
 /// `GET {base}/lang/{code}`: stores the UI language in the `minica_lang`
 /// cookie and goes back to the page the switch was made from. Needs no auth
 /// (pages may be behind a 401) and no CSRF: it only sets a preference.
@@ -2384,8 +3085,14 @@ fn render_page(
         .map(|(kind, message)| flash_html(lang, kind, message))
         .unwrap_or_default();
     let body = format!("{panel}{content}");
-    let mut response =
-        Html(layout(&state.config.server.base_path, lang, &body, is_admin)).into_response();
+    let mut response = Html(layout(
+        &state.config.server.base_path,
+        lang,
+        &body,
+        is_admin,
+        basic_session(state, headers),
+    ))
+    .into_response();
     append_cookie(&mut response, cookie_header(state, token));
     if flash.is_some() {
         append_cookie(&mut response, flash_clear_cookie(state));
@@ -2680,6 +3387,7 @@ fn error_page(
             &state.config.server.base_path,
             lang,
             &format!("<h1>{title}</h1><p>{message_html}</p>"),
+            false,
             false,
         )),
     )
@@ -3018,6 +3726,34 @@ impl Default for SubjectValues {
     }
 }
 
+impl SubjectValues {
+    /// Form values from a template, with the built-in defaults for anything
+    /// it leaves unset.
+    fn from_template(template: &TemplateValues) -> Self {
+        let base = Self::default();
+        Self {
+            country_code: template.country_code.clone().unwrap_or(base.country_code),
+            state: template.state.clone().unwrap_or(base.state),
+            city: template.city.clone().unwrap_or(base.city),
+            organization: template.organization.clone().unwrap_or(base.organization),
+            organization_unit: template
+                .organization_unit
+                .clone()
+                .unwrap_or(base.organization_unit),
+            valid_days: template
+                .valid_days
+                .map(|days| days.to_string())
+                .unwrap_or(base.valid_days),
+            digest_algorithm: template
+                .digest_algorithm
+                .clone()
+                .unwrap_or(base.digest_algorithm),
+            key_profile: template.key_profile.clone().unwrap_or(base.key_profile),
+            ..base
+        }
+    }
+}
+
 impl From<&CaForm> for SubjectValues {
     fn from(f: &CaForm) -> Self {
         Self {
@@ -3076,8 +3812,9 @@ fn error_banner_html(message_html: &str) -> String {
 
 fn subject_fields_common(lang: Lang, v: &SubjectValues) -> String {
     let digest = format!(
-        "{}{}",
+        "{}{}{}",
         opt("sha512", "SHA-512", &v.digest_algorithm),
+        opt("sha384", "SHA-384", &v.digest_algorithm),
         opt("sha256", "SHA-256", &v.digest_algorithm)
     );
     let key_profiles = format!(
@@ -3128,10 +3865,11 @@ fn ca_form_fields(lang: Lang, csrf: &str, submit: &str, extra: &str, v: &Subject
     )
 }
 
-fn cert_form_fields(lang: Lang, csrf: &str, v: &SubjectValues) -> String {
+fn cert_form_fields(lang: Lang, csrf: &str, picker: &str, v: &SubjectValues) -> String {
     format!(
-        r#"<input type="hidden" name="_csrf" value="{}"><div class="grid2">{}<label>{} <span class="muted">{}</span><input class="form-control" name="dns_list" value="{}"></label><label>{} <span class="muted">{}</span><input class="form-control" name="ip_list" value="{}"></label></div><button class="btn btn-primary">{}</button>"#,
+        r#"<input type="hidden" name="_csrf" value="{}">{}<div class="grid2">{}<label>{} <span class="muted">{}</span><input class="form-control" name="dns_list" value="{}"></label><label>{} <span class="muted">{}</span><input class="form-control" name="ip_list" value="{}"></label></div><button class="btn btn-primary">{}</button>"#,
         h(csrf),
+        picker,
         subject_fields_common(lang, v),
         t(lang, "field.dns_sans"),
         t(lang, "field.comma_separated"),
@@ -3143,19 +3881,47 @@ fn cert_form_fields(lang: Lang, csrf: &str, v: &SubjectValues) -> String {
     )
 }
 
-fn layout(base: &str, lang: Lang, content: &str, is_admin: bool) -> String {
-    let links = if is_admin {
-        format!(
+/// The signed-in page shell. `show_logout` adds the sign-out link (Basic
+/// auth sessions only; a proxy-authenticated session is ended at the proxy).
+fn layout(base: &str, lang: Lang, content: &str, is_admin: bool, show_logout: bool) -> String {
+    let mut links = format!(
+        r#"<a class="topbar-link" href="{base}/templates">{}</a>"#,
+        t(lang, "nav.templates")
+    );
+    if is_admin {
+        links.push_str(&format!(
             r#"<a class="topbar-link" href="{}/swagger">{}</a><a class="topbar-link" href="{}/admin">{}</a>"#,
             base,
             t(lang, "nav.api_explorer"),
             base,
             t(lang, "nav.admin_console")
+        ));
+    }
+    let trailing = if show_logout {
+        format!(
+            r#"<a class="topbar-link topbar-logout" href="{base}/logout">{}</a>"#,
+            t(lang, "nav.logout")
         )
     } else {
         String::new()
     };
-    layout_with(base, lang, content, &format!("{base}/cas"), &links, "")
+    layout_with(base, lang, content, &format!("{base}/cas"), &links, &trailing)
+}
+
+/// Whether this request is a Basic-auth session (so "sign out" can work):
+/// Basic auth is enabled and no reverse-proxy identity header is present.
+fn basic_session(state: &AppState, headers: &HeaderMap) -> bool {
+    state
+        .config
+        .auth
+        .users
+        .as_ref()
+        .is_some_and(|users| users.enabled)
+        && !state
+            .config
+            .auth
+            .active_headers()
+            .is_some_and(|config| auth::header_identity_present(headers, config))
 }
 
 /// The page shell. `home` is the brand link target; `links` and `trailing`
@@ -3479,6 +4245,24 @@ fn openapi_spec_json(base: &str) -> String {
                     "type": "object",
                     "required": ["cert_pem"],
                     "properties": { "cert_pem": { "type": "string" } }
+                },
+                "TemplateRequest": {
+                    "type": "object",
+                    "required": ["name"],
+                    "description": "A global form template. Every field other than name is optional; unset fields leave the form's own value alone.",
+                    "properties": {
+                        "name": { "type": "string", "example": "Web server (1 year)" },
+                        "scope": { "type": "string", "enum": ["both", "ca", "certificate"], "default": "both" },
+                        "is_default": { "type": "boolean", "default": false, "description": "Pre-fill the form automatically. Only one default applies per form; setting it clears the flag on overlapping templates." },
+                        "country_code": { "type": "string", "nullable": true, "example": "DE" },
+                        "state": { "type": "string", "nullable": true },
+                        "city": { "type": "string", "nullable": true },
+                        "organization": { "type": "string", "nullable": true, "example": "Homelab" },
+                        "organization_unit": { "type": "string", "nullable": true },
+                        "valid_days": { "type": "integer", "nullable": true, "minimum": 1, "maximum": 7350, "example": 365 },
+                        "digest_algorithm": { "type": "string", "nullable": true, "enum": ["sha256", "sha384", "sha512"] },
+                        "key_profile": { "type": "string", "nullable": true, "enum": ["rsa:2048", "rsa:4096", "rsa:8192", "ecdsa:prime256v1", "ecdsa:secp384r1", "ecdsa:secp521r1"] }
+                    }
                 }
             }
         },
@@ -3653,6 +4437,38 @@ fn openapi_spec_json(base: &str) -> String {
                     "security": [{ "basicAuth": [] }, { "csrfToken": [] }],
                     "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/InspectRequest" } } } },
                     "responses": { "200": { "description": "Inspection details" } }
+                }
+            },
+            "/api/templates": {
+                "get": {
+                    "summary": "List form templates",
+                    "responses": { "200": { "description": "Templates" } }
+                },
+                "put": {
+                    "summary": "Create form template",
+                    "security": [{ "basicAuth": [] }, { "csrfToken": [] }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TemplateRequest" } } } },
+                    "responses": { "200": { "description": "Created template" } }
+                }
+            },
+            "/api/templates/{template_id}": {
+                "get": {
+                    "summary": "Get form template",
+                    "parameters": [{ "name": "template_id", "in": "path", "required": true, "schema": { "type": "string" } }],
+                    "responses": { "200": { "description": "Template" } }
+                },
+                "post": {
+                    "summary": "Update form template (full replacement)",
+                    "security": [{ "basicAuth": [] }, { "csrfToken": [] }],
+                    "parameters": [{ "name": "template_id", "in": "path", "required": true, "schema": { "type": "string" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TemplateRequest" } } } },
+                    "responses": { "200": { "description": "Updated template" } }
+                },
+                "delete": {
+                    "summary": "Delete form template",
+                    "security": [{ "basicAuth": [] }, { "csrfToken": [] }],
+                    "parameters": [{ "name": "template_id", "in": "path", "required": true, "schema": { "type": "string" } }],
+                    "responses": { "200": { "description": "Deleted" } }
                 }
             },
             "/api/backup": {
@@ -3919,6 +4735,10 @@ label .form-control,label .form-select,textarea{margin-top:6px}
 .ca-card-meta dt{color:#6b7280;font-weight:600}
 .ca-card-meta dd{margin:0}
 .ca-card-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:auto;padding-top:6px}
+.topbar-logout{color:#5b6b8c;border-color:#d7dde9}
+.topbar-logout:hover{background:#f3f5fa;color:#23408f}
+.template-picker{display:block;margin-bottom:16px;max-width:420px}
+.check-row{display:flex;align-items:center;gap:8px;margin:4px 0 16px}.check-row input{width:18px;height:18px}
 .topbar-login{background:#3257c4;border-color:#3257c4;color:#fff}
 .topbar-login:hover{background:#23408f;color:#fff}
 .raw-output{white-space:pre-wrap;background:#101828;color:#eef3ff;border-radius:8px;padding:16px;max-height:620px;overflow:auto}
@@ -4088,6 +4908,24 @@ document.querySelectorAll('[data-toggle]').forEach((btn) => {
     });
   });
 })();
+
+// Preset drop-downs on the creation forms copy the chosen preset's values
+// into the fields (see template_picker). Choosing "custom" leaves them as is.
+document.querySelectorAll('[data-template-picker]').forEach((select) => {
+  const data = document.getElementById(select.dataset.templatePicker);
+  const form = select.closest('form');
+  if (!data || !form) return;
+  let presets = [];
+  try { presets = JSON.parse(data.textContent); } catch (e) { return; }
+  select.addEventListener('change', () => {
+    const preset = presets[parseInt(select.value, 10)];
+    if (!preset) return;
+    Object.keys(preset).forEach((name) => {
+      const field = form.querySelector('[name="' + name + '"]');
+      if (field) field.value = preset[name];
+    });
+  });
+});
 
 // Flash message panels: dismissible by button, and auto-hide after a while.
 document.querySelectorAll('.flash-panel').forEach((panel) => {

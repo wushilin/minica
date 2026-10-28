@@ -1,4 +1,4 @@
-use crate::models::{Certificate, CertificateAuthority};
+use crate::models::{Certificate, CertificateAuthority, Template, TemplateValues};
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use rand::{Rng, distr::Alphanumeric};
@@ -9,7 +9,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// How many `.pre-migrate-*.bak` copies of the database to keep. Each holds
 /// every private key, so older ones are pruned after a new one is made.
@@ -95,6 +95,7 @@ pub struct BackupCertRow {
 #[derive(Clone, Default)]
 pub struct BackupSnapshot {
     pub users: Vec<UserRecord>,
+    pub templates: Vec<Template>,
     pub cas: Vec<(BackupCaRow, Vec<BackupCertRow>)>,
 }
 
@@ -142,6 +143,9 @@ impl Db {
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open sqlite db {}", path.display()))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Another process (e.g. `minica --import-legacy` beside a running
+        // server) may hold a write lock briefly; wait instead of failing.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let migration_needed = !schema_is_current(&conn)?;
         let backup = if db_existed && migration_needed {
             Some(copy_db_backup(path)?)
@@ -266,6 +270,27 @@ impl Db {
                 created_at INTEGER NOT NULL
             );
 
+            -- Schema 3: global form templates (see models::Template). Names
+            -- are unique ignoring case.
+            CREATE TABLE IF NOT EXISTS templates (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                scope TEXT NOT NULL DEFAULT 'both',
+                is_default INTEGER NOT NULL DEFAULT 0,
+                country_code TEXT,
+                state TEXT,
+                city TEXT,
+                organization TEXT,
+                organization_unit TEXT,
+                valid_days INTEGER,
+                digest_algorithm TEXT,
+                key_profile TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_templates_name
+                ON templates(name COLLATE NOCASE);
+
             -- certificates.ca_id is filtered on every CA view (list_cas' LEFT
             -- JOIN, the per-CA cert listings, and the dashboard/trash COUNT
             -- subqueries) and walked by ON DELETE CASCADE. Without an index each
@@ -294,6 +319,10 @@ impl Db {
             "ALTER TABLE certificates ADD COLUMN revoked_at INTEGER",
             "ALTER TABLE certificates ADD COLUMN revocation_reason TEXT",
             "ALTER TABLE certificate_authorities ADD COLUMN truststore BLOB NOT NULL DEFAULT X''",
+            // Schema 2: rows whose metadata was re-derived from the certificate
+            // (see AppService::repair_stale_metadata) carry 1; 0 means unchecked.
+            "ALTER TABLE certificate_authorities ADD COLUMN meta_version INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE certificates ADD COLUMN meta_version INTEGER NOT NULL DEFAULT 0",
         ] {
             add_column(&tx, sql)?;
         }
@@ -322,8 +351,8 @@ impl Db {
                 id, common_name, country_code, state, city, organization, organization_unit,
                 subject, issue_time, valid_days, key_profile, digest_algorithm,
                 cert_pem, key_pem, pkcs12, password, index_txt, serial_txt, crl_der, crl_updated_at,
-                crlnumber_txt, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                crlnumber_txt, created_at, updated_at, meta_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
             "#,
             params![
                 meta.id,
@@ -424,6 +453,224 @@ impl Db {
         }
         tracing::info!(ca_id = %id, rows_affected = count, "updated certificate authority metadata");
         Ok(())
+    }
+
+    pub fn ca_exists(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM certificate_authorities WHERE id = ?",
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn cert_exists(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM certificates WHERE id = ?",
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Metadata and certificate of every CA (deleted ones too) not yet checked
+    /// by the metadata repair.
+    pub fn list_cas_for_repair(&self) -> Result<Vec<(CaMeta, Vec<u8>)>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, common_name, country_code, state, city, organization, organization_unit,
+                   subject, issue_time, valid_days, key_profile, digest_algorithm, cert_pem
+            FROM certificate_authorities
+            WHERE meta_version = 0
+            ORDER BY created_at
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                CaMeta {
+                    id: row.get(0)?,
+                    common_name: row.get(1)?,
+                    country_code: row.get(2)?,
+                    state: row.get(3)?,
+                    city: row.get(4)?,
+                    organization: row.get(5)?,
+                    organization_unit: row.get(6)?,
+                    subject: row.get(7)?,
+                    issue_time: row.get(8)?,
+                    valid_days: row.get(9)?,
+                    key_profile: row.get(10)?,
+                    digest_algorithm: row.get(11)?,
+                },
+                row.get(12)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Certificate counterpart of `list_cas_for_repair`.
+    pub fn list_certs_for_repair(&self) -> Result<Vec<(CertMeta, Vec<u8>)>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, ca_id, common_name, country_code, state, city, organization, organization_unit,
+                   subject, issue_time, valid_days, dns_list, ip_list, key_profile, digest_algorithm,
+                   revoked_at, revocation_reason, cert_pem
+            FROM certificates
+            WHERE meta_version = 0
+            ORDER BY created_at
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                CertMeta {
+                    id: row.get(0)?,
+                    ca_id: row.get(1)?,
+                    common_name: row.get(2)?,
+                    country_code: row.get(3)?,
+                    state: row.get(4)?,
+                    city: row.get(5)?,
+                    organization: row.get(6)?,
+                    organization_unit: row.get(7)?,
+                    subject: row.get(8)?,
+                    issue_time: row.get(9)?,
+                    valid_days: row.get(10)?,
+                    dns_list: split_list(&row.get::<_, String>(11)?),
+                    ip_list: split_list(&row.get::<_, String>(12)?),
+                    key_profile: row.get(13)?,
+                    digest_algorithm: row.get(14)?,
+                    revoked_at: row.get(15)?,
+                    revocation_reason: row.get(16)?,
+                },
+                row.get(17)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Writes re-derived subject/validity metadata and marks the row checked.
+    pub fn update_ca_meta_repaired(&self, meta: &CaMeta) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            r#"
+            UPDATE certificate_authorities
+            SET country_code = ?, state = ?, city = ?, organization = ?, organization_unit = ?,
+                subject = ?, issue_time = ?, valid_days = ?, meta_version = 1
+            WHERE id = ?
+            "#,
+            params![
+                meta.country_code,
+                meta.state,
+                meta.city,
+                meta.organization,
+                meta.organization_unit,
+                meta.subject,
+                meta.issue_time,
+                meta.valid_days,
+                meta.id
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_cert_meta_repaired(&self, meta: &CertMeta) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            r#"
+            UPDATE certificates
+            SET country_code = ?, state = ?, city = ?, organization = ?, organization_unit = ?,
+                subject = ?, meta_version = 1
+            WHERE id = ?
+            "#,
+            params![
+                meta.country_code,
+                meta.state,
+                meta.city,
+                meta.organization,
+                meta.organization_unit,
+                meta.subject,
+                meta.id
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_ca_meta_checked(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "UPDATE certificate_authorities SET meta_version = 1 WHERE id = ?",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_cert_meta_checked(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "UPDATE certificates SET meta_version = 1 WHERE id = ?",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Test hook: rewrites a CA's metadata the way older versions stored an
+    /// import (fabricated subject parts, "now + 3650 days") and marks the row
+    /// unchecked, so the repair can be exercised.
+    #[cfg(test)]
+    pub fn fake_legacy_ca_meta(
+        &self,
+        id: &str,
+        country_code: &str,
+        organization: &str,
+        subject: &str,
+        issue_time: i64,
+        valid_days: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            r#"
+            UPDATE certificate_authorities
+            SET country_code = ?, organization = ?, subject = ?, issue_time = ?, valid_days = ?,
+                meta_version = 0
+            WHERE id = ?
+            "#,
+            params![country_code, organization, subject, issue_time, valid_days, id],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn fake_legacy_cert_meta(
+        &self,
+        id: &str,
+        country_code: &str,
+        organization: &str,
+        subject: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "UPDATE certificates SET country_code = ?, organization = ?, subject = ?, meta_version = 0 WHERE id = ?",
+            params![country_code, organization, subject, id],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn meta_versions(&self) -> Result<(Vec<i64>, Vec<i64>)> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut cas = conn.prepare("SELECT meta_version FROM certificate_authorities")?;
+        let cas = cas
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        let mut certs = conn.prepare("SELECT meta_version FROM certificates")?;
+        let certs = certs
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        Ok((cas, certs))
     }
 
     pub fn get_ca_secrets(&self, id: &str) -> Result<CaSecrets> {
@@ -586,8 +833,8 @@ impl Db {
             INSERT INTO certificates (
                 id, ca_id, common_name, country_code, state, city, organization, organization_unit,
                 subject, issue_time, valid_days, dns_list, ip_list, key_profile, digest_algorithm,
-                cert_pem, key_pem, csr_pem, pkcs12, password, bundle_zip, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                cert_pem, key_pem, csr_pem, pkcs12, password, bundle_zip, created_at, updated_at, meta_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
             "#,
             params![
                 meta.id,
@@ -687,13 +934,18 @@ impl Db {
         let mut conn = self.conn.lock().expect("db mutex poisoned");
         let tx = conn.transaction()?;
         let users = query_users(&tx)?;
+        let templates = query_templates(&tx)?;
         let mut cas = Vec::new();
         for ca in query_backup_cas(&tx)? {
             let certs = query_backup_certs(&tx, &ca.meta.id)?;
             cas.push((ca, certs));
         }
         tx.commit()?;
-        Ok(BackupSnapshot { users, cas })
+        Ok(BackupSnapshot {
+            users,
+            templates,
+            cas,
+        })
     }
 
     /// Restores a whole backup atomically: the emptiness check and every insert
@@ -707,6 +959,9 @@ impl Db {
         }
         for user in &snapshot.users {
             insert_user_row(&tx, user)?;
+        }
+        for template in &snapshot.templates {
+            insert_template_row(&tx, template)?;
         }
         for (ca, certs) in &snapshot.cas {
             insert_ca_row(&tx, ca)?;
@@ -724,6 +979,7 @@ impl Db {
         tx.commit()?;
         tracing::info!(
             user_count = snapshot.users.len(),
+            template_count = snapshot.templates.len(),
             ca_count = snapshot.cas.len(),
             cert_count = snapshot
                 .cas
@@ -742,13 +998,15 @@ impl Db {
         let cert_rows = tx.execute("DELETE FROM certificates", [])?;
         let ca_rows = tx.execute("DELETE FROM certificate_authorities", [])?;
         let user_rows = tx.execute("DELETE FROM users", [])?;
+        let template_rows = tx.execute("DELETE FROM templates", [])?;
         tx.commit()?;
         tracing::warn!(
             lock_rows_affected = lock_rows,
             cert_rows_affected = cert_rows,
             ca_rows_affected = ca_rows,
             user_rows_affected = user_rows,
-            total_rows_affected = lock_rows + cert_rows + ca_rows + user_rows,
+            template_rows_affected = template_rows,
+            total_rows_affected = lock_rows + cert_rows + ca_rows + user_rows + template_rows,
             "nuked all database entities"
         );
         Ok(())
@@ -1259,6 +1517,167 @@ impl Db {
         tracing::info!(user_id = %id, rows_affected = count, "deleted user");
         Ok(())
     }
+
+    pub fn list_templates(&self) -> Result<Vec<Template>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        query_templates(&conn)
+    }
+
+    pub fn get_template(&self, id: &str) -> Result<Option<Template>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.query_row(
+            &format!("{TEMPLATE_SELECT} WHERE id = ?"),
+            params![id],
+            row_to_template,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// True when another template (not `except_id`) already uses `name`,
+    /// ignoring case.
+    pub fn template_name_taken(&self, name: &str, except_id: Option<&str>) -> Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM templates WHERE name = ? COLLATE NOCASE AND id != ?",
+            params![name, except_id.unwrap_or("")],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Inserts (`new`) or replaces a template. When it is marked default, the
+    /// default flag is cleared on every other template whose scope overlaps,
+    /// in the same transaction, so each form has at most one default.
+    pub fn save_template(&self, template: &Template, new: bool) -> Result<()> {
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
+        if template.is_default {
+            let others = query_templates(&tx)?;
+            for other in others
+                .iter()
+                .filter(|other| other.id != template.id && other.is_default)
+                .filter(|other| other.scope().overlaps(template.scope()))
+            {
+                tx.execute(
+                    "UPDATE templates SET is_default = 0, updated_at = ? WHERE id = ?",
+                    params![template.updated_at, other.id],
+                )?;
+            }
+        }
+        if new {
+            insert_template_row(&tx, template)?;
+        } else {
+            let rows = tx.execute(
+                r#"
+                UPDATE templates SET
+                    name = ?, scope = ?, is_default = ?, country_code = ?, state = ?, city = ?,
+                    organization = ?, organization_unit = ?, valid_days = ?, digest_algorithm = ?,
+                    key_profile = ?, updated_at = ?
+                WHERE id = ?
+                "#,
+                params![
+                    template.name,
+                    template.scope,
+                    template.is_default as i64,
+                    template.values.country_code,
+                    template.values.state,
+                    template.values.city,
+                    template.values.organization,
+                    template.values.organization_unit,
+                    template.values.valid_days,
+                    template.values.digest_algorithm,
+                    template.values.key_profile,
+                    template.updated_at,
+                    template.id,
+                ],
+            )?;
+            if rows == 0 {
+                bail!("template not found: {}", template.id);
+            }
+        }
+        tx.commit()?;
+        tracing::info!(template_id = %template.id, name = %template.name, new, "saved template");
+        Ok(())
+    }
+
+    pub fn delete_template(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let count = conn.execute("DELETE FROM templates WHERE id = ?", params![id])?;
+        if count == 0 {
+            bail!("template not found: {id}");
+        }
+        tracing::info!(template_id = %id, rows_affected = count, "deleted template");
+        Ok(())
+    }
+}
+
+const TEMPLATE_SELECT: &str = "SELECT id, name, scope, is_default, country_code, state, city, \
+    organization, organization_unit, valid_days, digest_algorithm, key_profile, created_at, \
+    updated_at FROM templates";
+
+fn row_to_template(row: &rusqlite::Row<'_>) -> rusqlite::Result<Template> {
+    Ok(Template {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        scope: row.get(2)?,
+        is_default: row.get::<_, i64>(3)? != 0,
+        values: TemplateValues {
+            country_code: row.get(4)?,
+            state: row.get(5)?,
+            city: row.get(6)?,
+            organization: row.get(7)?,
+            organization_unit: row.get(8)?,
+            valid_days: row.get(9)?,
+            digest_algorithm: row.get(10)?,
+            key_profile: row.get(11)?,
+        },
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+    })
+}
+
+/// Every template, by name (case-insensitively).
+fn query_templates(conn: &Connection) -> Result<Vec<Template>> {
+    let mut stmt = conn.prepare(&format!("{TEMPLATE_SELECT} ORDER BY name COLLATE NOCASE"))?;
+    let rows = stmt.query_map([], row_to_template)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+fn insert_template_row(conn: &Connection, template: &Template) -> Result<()> {
+    conn.execute(
+        r#"
+        INSERT INTO templates (
+            id, name, scope, is_default, country_code, state, city, organization,
+            organization_unit, valid_days, digest_algorithm, key_profile, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+        params![
+            template.id,
+            template.name,
+            template.scope,
+            template.is_default as i64,
+            template.values.country_code,
+            template.values.state,
+            template.values.city,
+            template.values.organization,
+            template.values.organization_unit,
+            template.values.valid_days,
+            template.values.digest_algorithm,
+            template.values.key_profile,
+            template.created_at,
+            template.updated_at,
+        ],
+    )
+    .map_err(|err| {
+        if err.to_string().contains("UNIQUE") {
+            anyhow::anyhow!("template name already exists: {}", template.name)
+        } else {
+            err.into()
+        }
+    })?;
+    Ok(())
 }
 
 fn row_to_user(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserRecord> {
@@ -1387,7 +1806,8 @@ fn is_empty_conn(conn: &Connection) -> Result<bool> {
         SELECT
             (SELECT COUNT(*) FROM certificate_authorities) +
             (SELECT COUNT(*) FROM certificates) +
-            (SELECT COUNT(*) FROM users)
+            (SELECT COUNT(*) FROM users) +
+            (SELECT COUNT(*) FROM templates)
         "#,
         [],
         |row| row.get(0),
@@ -1576,6 +1996,7 @@ fn schema_columns_present(conn: &Connection) -> Result<bool> {
                 "deleted",
                 "created_at",
                 "updated_at",
+                "meta_version",
             ][..],
         ),
         (
@@ -1607,6 +2028,7 @@ fn schema_columns_present(conn: &Connection) -> Result<bool> {
                 "deleted",
                 "created_at",
                 "updated_at",
+                "meta_version",
             ][..],
         ),
         (
@@ -1616,6 +2038,25 @@ fn schema_columns_present(conn: &Connection) -> Result<bool> {
         (
             "users",
             &["id", "username", "password_hash", "role", "created_at"][..],
+        ),
+        (
+            "templates",
+            &[
+                "id",
+                "name",
+                "scope",
+                "is_default",
+                "country_code",
+                "state",
+                "city",
+                "organization",
+                "organization_unit",
+                "valid_days",
+                "digest_algorithm",
+                "key_profile",
+                "created_at",
+                "updated_at",
+            ][..],
         ),
     ];
 
@@ -2109,6 +2550,7 @@ mod tests {
         // before it must be rolled back.
         let broken = BackupSnapshot {
             users: vec![user.clone()],
+            templates: vec![],
             cas: vec![(ca_row.clone(), vec![cert_row.clone(), cert_row.clone()])],
         };
         assert!(db.restore_backup(&broken).is_err());
@@ -2119,6 +2561,7 @@ mod tests {
 
         let good = BackupSnapshot {
             users: vec![user],
+            templates: vec![],
             cas: vec![(ca_row, vec![cert_row])],
         };
         db.restore_backup(&good).unwrap();

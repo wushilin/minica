@@ -114,6 +114,143 @@ pub struct UserView {
     pub created_at: i64,
 }
 
+/// Which creation forms a template is offered on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TemplateScope {
+    Both,
+    Ca,
+    Certificate,
+}
+
+impl TemplateScope {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "both" => Some(Self::Both),
+            "ca" => Some(Self::Ca),
+            "certificate" => Some(Self::Certificate),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::Ca => "ca",
+            Self::Certificate => "certificate",
+        }
+    }
+
+    /// Whether a template with this scope belongs on the form of `kind`
+    /// (`Ca` or `Certificate`).
+    pub fn covers(self, kind: TemplateScope) -> bool {
+        self == TemplateScope::Both || self == kind
+    }
+
+    /// Whether two scopes share at least one form (so only one of two
+    /// default templates with overlapping scopes can apply).
+    pub fn overlaps(self, other: TemplateScope) -> bool {
+        self == TemplateScope::Both || other == TemplateScope::Both || self == other
+    }
+}
+
+/// The form fields a template can pre-fill. `None` leaves the form's own
+/// value alone, so a template only needs to carry what it changes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemplateValues {
+    #[serde(default)]
+    pub country_code: Option<String>,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub city: Option<String>,
+    #[serde(default)]
+    pub organization: Option<String>,
+    #[serde(default)]
+    pub organization_unit: Option<String>,
+    #[serde(default)]
+    pub valid_days: Option<i64>,
+    #[serde(default)]
+    pub digest_algorithm: Option<String>,
+    #[serde(default)]
+    pub key_profile: Option<String>,
+}
+
+impl TemplateValues {
+    /// `self` with every unset field taken from `base`.
+    pub fn over(&self, base: &TemplateValues) -> TemplateValues {
+        TemplateValues {
+            country_code: self.country_code.clone().or_else(|| base.country_code.clone()),
+            state: self.state.clone().or_else(|| base.state.clone()),
+            city: self.city.clone().or_else(|| base.city.clone()),
+            organization: self.organization.clone().or_else(|| base.organization.clone()),
+            organization_unit: self
+                .organization_unit
+                .clone()
+                .or_else(|| base.organization_unit.clone()),
+            valid_days: self.valid_days.or(base.valid_days),
+            digest_algorithm: self
+                .digest_algorithm
+                .clone()
+                .or_else(|| base.digest_algorithm.clone()),
+            key_profile: self.key_profile.clone().or_else(|| base.key_profile.clone()),
+        }
+    }
+
+    /// Trims every text field and turns blank ones into `None`.
+    pub fn normalized(&self) -> TemplateValues {
+        fn clean(value: &Option<String>) -> Option<String> {
+            value
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        }
+        TemplateValues {
+            country_code: clean(&self.country_code).map(|code| code.to_uppercase()),
+            state: clean(&self.state),
+            city: clean(&self.city),
+            organization: clean(&self.organization),
+            organization_unit: clean(&self.organization_unit),
+            valid_days: self.valid_days,
+            digest_algorithm: clean(&self.digest_algorithm).map(|digest| digest.to_lowercase()),
+            key_profile: clean(&self.key_profile).map(|profile| profile.to_lowercase()),
+        }
+    }
+}
+
+/// A global form template, managed in the web UI / API and stored in the
+/// database. `scope` is `both`, `ca` or `certificate`; at most one default
+/// template applies to each creation form.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Template {
+    pub id: String,
+    pub name: String,
+    pub scope: String,
+    pub is_default: bool,
+    #[serde(flatten)]
+    pub values: TemplateValues,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl Template {
+    pub fn scope(&self) -> TemplateScope {
+        TemplateScope::parse(&self.scope).unwrap_or(TemplateScope::Both)
+    }
+}
+
+/// Create/update payload for a template. Blank strings count as unset.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct TemplateRequest {
+    pub name: String,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub is_default: bool,
+    #[serde(flatten)]
+    pub values: TemplateValues,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct CreateUserRequest {
     pub username: String,

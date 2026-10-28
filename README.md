@@ -63,6 +63,17 @@ story with something smaller, safer, and easier to run.
   file. *Rationale:* automate issuance from scripts without hand-rolling the API
   calls and CSRF handling.
 
+## Documentation
+
+- [Upgrading from MiniCA 1.0.x (Kotlin)](docs/upgrading-from-1.0.md) — the
+  `--import-legacy` migration of an old data directory.
+- [Running behind an Nginx reverse proxy](docs/reverse-proxy.md) — TLS
+  termination, an isolated Docker network, SSO header auth.
+- [Trusting a MiniCA certificate authority](docs/trusting-the-ca.md) — adding
+  the CA to Linux, Windows, macOS, Android, browsers, curl/wget, Python, Java,
+  Go, Node, Nginx, Docker, LLDAP, yt-dlp.
+- [Go CLI](cli/README.md) — issuing certificates from scripts.
+
 ## Why this is a better version of minica
 
 | Aspect | Original minica | MiniCA (Rust) |
@@ -113,8 +124,22 @@ backup-able state, real revocation, hashed credentials, and safe concurrency.
    The UI and API are served under `base_path` (default `/minica`); Swagger is at
    `/minica/swagger`. `/` redirects to `/minica/`, a public (no login) directory
    of CA cards with filtering, paging and CA certificate downloads; its
-   **Login** button leads to the signed-in UI at `/minica/cas`. Run `minica --help` to see all actions
-   (`--start`, `--gen-config`, `--gen-password`, `--verify-password`).
+   **Login** button leads to the signed-in UI at `/minica/cas`, whose top bar
+   has a **Sign out** link (Basic auth sessions; with reverse-proxy header auth
+   the proxy owns the session). Downloaded files are named after the
+   certificate's common name (`Homelab_CA.pem`, `web.home.lan.p12`, ...). Run
+   `minica --help` to see all actions (`--start`, `--gen-config`,
+   `--gen-password`, `--verify-password`, `--import-legacy`).
+
+   **Templates.** The **Templates** page (top bar, every signed-in user) holds
+   global presets for the "New CA" / "New Certificate" forms: country, state,
+   city, organization, unit, validity, digest and key profile, each optional.
+   A template can apply to CAs, certificates or both, and one per form can be
+   marked *default* so it fills the form automatically; the others appear in
+   the form's Template drop-down. Administrators manage them in the UI or via
+   `/api/templates`; they are stored in the database and included in backups.
+   Fields a template leaves unset keep the form's own value, which on the
+   certificate form is the issuing CA's subject.
 
 3. **Issue certs from the CLI.** See [cli/README.md](./cli/README.md):
    ```sh
@@ -167,7 +192,11 @@ the unprivileged user `minica` (uid/gid `10001`), and keeps all state under
    docker run -d --name minica ...same options... wushilin/minica:<new-version>
    ```
    The database is migrated automatically on startup; a copy of the old one is
-   kept next to it as `db.sqlite.pre-migrate-<timestamp>.bak`.
+   kept next to it as `db.sqlite.pre-migrate-<timestamp>.bak`. Coming from
+   the Kotlin **1.0.x** series (files under `minica.root`, no database)?
+   Follow [Upgrading from MiniCA 1.0.x](docs/upgrading-from-1.0.md): a one-off
+   `--import-legacy` run brings the old CAs and certificates, with their ids
+   and passwords, into the new database.
 
 **Using a host directory instead of a named volume:** it must be owned by
 `10001:10001`, or MiniCA exits with `Permission denied`:
@@ -367,6 +396,16 @@ Caveats:
   hit an issue with a specific LibreSSL version, set
   `openssl.keep_failed_workdirs: true` and check the logged command that
   failed.
+
+### Running behind a reverse proxy
+
+Put Nginx (or Caddy, Traefik, ...) in front of MiniCA to terminate TLS and
+keep MiniCA on an isolated network. Set `MINICA_PUBLIC_BASE_URL` to the
+proxy's address (it ends up in CRL URLs and public links), keep `base_path`
+the same on both sides, and turn on `MINICA_SECURE_COOKIES` once everything is
+HTTPS. A complete Docker Compose + `nginx.conf` example, including the
+`internal: true` network and the SSO variant, is in
+[docs/reverse-proxy.md](docs/reverse-proxy.md).
 
 ### Reverse-proxy (SSO) header authentication
 

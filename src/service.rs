@@ -6,9 +6,13 @@ use crate::{
     },
     models::{
         Certificate, CertificateAuthority, CreateCaRequest, CreateCertRequest, CreateUserRequest,
-        ImportCaRequest, ImportCertRequest, InspectResponse, UserView,
+        ImportCaRequest, ImportCertRequest, InspectResponse, Template, TemplateRequest,
+        TemplateScope, TemplateValues, UserView,
     },
-    openssl::{OpenSsl, build_bundle, create_subject, normalize_digest, random_password},
+    openssl::{
+        OpenSsl, RenewalRequest, build_bundle, create_subject, escape_subject, normalize_digest,
+        random_password,
+    },
 };
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -70,7 +74,44 @@ pub struct BackupFile {
     pub warning: String,
     #[serde(default)]
     pub users: Vec<BackupUser>,
+    #[serde(default)]
+    pub templates: Vec<BackupTemplate>,
     pub certificate_authorities: Vec<BackupCa>,
+}
+
+/// A form template in a backup (same shape as `models::Template`).
+#[derive(Serialize, Deserialize)]
+pub struct BackupTemplate {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_template_scope")]
+    pub scope: String,
+    #[serde(default)]
+    pub is_default: bool,
+    #[serde(flatten)]
+    pub values: TemplateValues,
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
+fn default_template_scope() -> String {
+    TemplateScope::Both.as_str().to_string()
+}
+
+impl From<Template> for BackupTemplate {
+    fn from(template: Template) -> Self {
+        Self {
+            id: template.id,
+            name: template.name,
+            scope: template.scope,
+            is_default: template.is_default,
+            values: template.values,
+            created_at: template.created_at,
+            updated_at: template.updated_at,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -301,54 +342,65 @@ impl AppService {
 
     #[tracing::instrument(skip(self, req), err, fields(span_id = %span_id()))]
     pub fn import_ca(&self, req: ImportCaRequest) -> Result<CertificateAuthority> {
+        self.import_ca_with_id(None, req)
+    }
+
+    /// Imports a CA under a caller-chosen id (the legacy 1.0.x migration keeps
+    /// the original directory names); `None` mints a fresh id. The subject,
+    /// validity, key and digest are all read from the certificate itself.
+    pub fn import_ca_with_id(
+        &self,
+        id: Option<String>,
+        req: ImportCaRequest,
+    ) -> Result<CertificateAuthority> {
         tracing::info!(
             cert_pem_bytes = req.cert_pem.len(),
             key_pem_bytes = req.key_pem.len(),
             "importing certificate authority"
         );
         validate_password(req.password.as_deref())?;
-        let id = short_id();
+        let id = match id {
+            Some(id) => validate_entity_id(&id)?,
+            None => short_id(),
+        };
+        if self.db.ca_exists(&id)? {
+            bail!("certificate authority id already exists: {id}");
+        }
         let password = req.password.unwrap_or_else(random_password);
         let work = self.openssl.workdir()?;
         fs::write(work.path().join("ca-cert.pem"), req.cert_pem.as_bytes())?;
         fs::write(work.path().join("ca-key.pem"), req.key_pem.as_bytes())?;
         let info = self.openssl.inspect_cert(work.path(), &req.cert_pem)?;
+        if !self.openssl.is_ca_cert(work.path(), &req.cert_pem)? {
+            bail!("the certificate is not a certificate authority (basicConstraints CA:TRUE is missing)");
+        }
+        self.openssl
+            .check_key_matches_cert(work.path(), "ca-cert.pem", "ca-key.pem")
+            .context("the private key does not match the CA certificate")?;
         let text = self
             .openssl
             .inspect_cert_text(work.path(), &req.cert_pem)
             .unwrap_or_default();
-        let subject_text = self.subject_for_parsing(work.path(), &req.cert_pem, &info);
-        let common_name =
-            parse_subject_part(&subject_text, "CN").unwrap_or_else(|| "Imported CA".to_string());
+        let derived = self.derive_subject(work.path(), &req.cert_pem, &info);
+        let common_name = derived
+            .common_name
+            .clone()
+            .unwrap_or_else(|| "Imported CA".to_string());
         self.ensure_unique_ca_common_name(&common_name)?;
-        let country_code =
-            parse_subject_part(&subject_text, "C").unwrap_or_else(|| "XX".to_string());
-        let organization =
-            parse_subject_part(&subject_text, "O").unwrap_or_else(|| "Imported".to_string());
-        let state = parse_subject_part(&subject_text, "ST").unwrap_or_default();
-        let city = parse_subject_part(&subject_text, "L").unwrap_or_default();
-        let organization_unit = parse_subject_part(&subject_text, "OU").unwrap_or_default();
-        let subject = create_subject(
-            &common_name,
-            &country_code,
-            &organization,
-            &state,
-            &city,
-            &organization_unit,
-        )?;
+        let (issue_time, valid_days) = validity_from_info(&info);
         let mut secrets = self.openssl.finish_ca_files(work.path(), &password)?;
         self.attach_initial_crl(&mut secrets)?;
         let meta = CaMeta {
             id: id.clone(),
             common_name,
-            country_code,
-            state,
-            city,
-            organization,
-            organization_unit,
-            subject,
-            issue_time: Utc::now().timestamp_millis(),
-            valid_days: 3650,
+            country_code: derived.country_code,
+            state: derived.state,
+            city: derived.city,
+            organization: derived.organization,
+            organization_unit: derived.organization_unit,
+            subject: derived.subject,
+            issue_time,
+            valid_days,
             key_profile: parse_public_key_profile(&text),
             digest_algorithm: parse_signature_digest(&text)
                 .unwrap_or_else(|| "imported".to_string()),
@@ -579,6 +631,20 @@ impl AppService {
 
     #[tracing::instrument(skip(self, req), err, fields(span_id = %span_id(), ca_id = %ca_id))]
     pub fn import_cert(&self, ca_id: &str, req: ImportCertRequest) -> Result<Certificate> {
+        self.import_cert_with(ca_id, None, req, None)
+    }
+
+    /// Imports a certificate under a caller-chosen id and, optionally, with
+    /// the signing request it was originally issued from (the legacy 1.0.x
+    /// migration has both). `None` mints an id / derives the CSR from the
+    /// certificate.
+    pub fn import_cert_with(
+        &self,
+        ca_id: &str,
+        cert_id: Option<String>,
+        req: ImportCertRequest,
+        csr_pem: Option<&[u8]>,
+    ) -> Result<Certificate> {
         tracing::info!(
             ca_id = %ca_id,
             cert_pem_bytes = req.cert_pem.len(),
@@ -587,7 +653,13 @@ impl AppService {
         );
         validate_password(req.password.as_deref())?;
         let _ca = self.db.get_ca(ca_id)?;
-        let cert_id = short_id();
+        let cert_id = match cert_id {
+            Some(id) => validate_entity_id(&id)?,
+            None => short_id(),
+        };
+        if self.db.cert_exists(&cert_id)? {
+            bail!("certificate id already exists: {cert_id}");
+        }
         let owner = Uuid::new_v4().to_string();
         let work = self.openssl.workdir()?;
         let info = self
@@ -600,7 +672,14 @@ impl AppService {
             let password = req.password.clone().unwrap_or_else(random_password);
             let secrets = self
                 .openssl
-                .import_cert_files(work.path(), &ca_secrets, &req.cert_pem, &req.key_pem, &password)
+                .import_cert_files(
+                    work.path(),
+                    &ca_secrets,
+                    &req.cert_pem,
+                    &req.key_pem,
+                    csr_pem,
+                    &password,
+                )
                 .map_err(|err| {
                     let message = err.to_string();
                     if message.contains("imported certificate was not issued")
@@ -613,17 +692,12 @@ impl AppService {
                         err
                     }
                 })?;
-            let subject_text = self.subject_for_parsing(work.path(), &req.cert_pem, &info);
-            let common_name = parse_subject_part(&subject_text, "CN")
+            let derived = self.derive_subject(work.path(), &req.cert_pem, &info);
+            let common_name = derived
+                .common_name
+                .clone()
                 .unwrap_or_else(|| "Imported Certificate".to_string());
             self.ensure_unique_cert_common_name(ca_id, &common_name)?;
-            let country_code =
-                parse_subject_part(&subject_text, "C").unwrap_or_else(|| "XX".to_string());
-            let organization =
-                parse_subject_part(&subject_text, "O").unwrap_or_else(|| "Imported".to_string());
-            let state = parse_subject_part(&subject_text, "ST").unwrap_or_default();
-            let city = parse_subject_part(&subject_text, "L").unwrap_or_default();
-            let organization_unit = parse_subject_part(&subject_text, "OU").unwrap_or_default();
             let (mut dns_list, ip_list) = self
                 .openssl
                 .inspect_cert_sans(work.path(), &req.cert_pem)
@@ -638,32 +712,18 @@ impl AppService {
             if is_valid_dns_name(&common_name) && !dns_list.contains(&common_name) {
                 dns_list.insert(0, common_name.clone());
             }
-            let not_before = info_value(&info, "notBefore")
-                .and_then(|value| parse_openssl_date(&value))
-                .unwrap_or_else(|| Utc::now().timestamp_millis());
-            let not_after = info_value(&info, "notAfter")
-                .and_then(|value| parse_openssl_date(&value))
-                .unwrap_or(not_before);
-            let valid_days = ((not_after - not_before).max(0) / 86_400_000).max(1);
-            let subject = create_subject(
-                &common_name,
-                &country_code,
-                &organization,
-                &state,
-                &city,
-                &organization_unit,
-            )?;
+            let (issue_time, valid_days) = validity_from_info(&info);
             let meta = CertMeta {
                 id: cert_id.clone(),
                 ca_id: ca_id.to_string(),
                 common_name,
-                country_code,
-                state,
-                city,
-                organization,
-                organization_unit,
-                subject,
-                issue_time: not_before,
+                country_code: derived.country_code,
+                state: derived.state,
+                city: derived.city,
+                organization: derived.organization,
+                organization_unit: derived.organization_unit,
+                subject: derived.subject,
+                issue_time,
                 valid_days,
                 dns_list,
                 ip_list,
@@ -729,6 +789,34 @@ impl AppService {
         let digest =
             normalize_digest(&cert.digest_algorithm).unwrap_or_else(|_| "sha512".to_string());
         let crl_url = self.issuing_crl_url(ca_id)?;
+        // The renewal reproduces the current certificate: same subject and the
+        // SANs it carries today (the stored metadata is the fallback when the
+        // certificate has none).
+        let work = self.openssl.workdir()?;
+        let subject = self
+            .openssl
+            .inspect_cert_subject_rfc2253(work.path(), &cert.cert_pem)
+            .ok()
+            .and_then(|text| slash_subject(&subject_attributes(&text)));
+        let (mut dns_list, mut ip_list) = self
+            .openssl
+            .inspect_cert_sans(work.path(), &cert.cert_pem)
+            .unwrap_or_default();
+        if dns_list.is_empty() && ip_list.is_empty() {
+            dns_list = cert
+                .dns_list
+                .iter()
+                .filter(|name| is_valid_dns_name(name))
+                .cloned()
+                .collect();
+            ip_list = cert
+                .ip_list
+                .iter()
+                .filter(|ip| ip.parse::<std::net::IpAddr>().is_ok())
+                .cloned()
+                .collect();
+        }
+        drop(work);
         let owner = Uuid::new_v4().to_string();
         self.db.acquire_ca_lock(ca_id, &owner, 120_000)?;
         let result = (|| -> Result<Certificate> {
@@ -740,6 +828,11 @@ impl AppService {
                 work.path(),
                 &ca_secrets,
                 &cert_secrets,
+                &RenewalRequest {
+                    subject: subject.as_deref(),
+                    dns_list: &dns_list,
+                    ip_list: &ip_list,
+                },
                 days,
                 &digest,
                 crl_url.as_deref(),
@@ -918,17 +1011,23 @@ impl AppService {
         let kind_name = download_kind_name(&kind);
         tracing::info!(ca_id = %ca_id, kind = kind_name, "downloading certificate authority artifact");
         let secrets = self.db.get_ca_secrets(ca_id)?;
+        // Files are named after the common name (falling back to the id), so
+        // several downloads stay tellable apart; see `artifact_basename`.
+        let name = artifact_basename(
+            self.db.ca_common_name(ca_id).as_deref().unwrap_or_default(),
+            ca_id,
+        );
         let artifact = match kind {
-            Download::CaCert => (format!("ca-{ca_id}-cert.pem"), secrets.cert_pem),
-            Download::CaKey => (format!("ca-{ca_id}-key.pem"), secrets.key_pem),
-            Download::CaPkcs12 => (format!("ca-{ca_id}.p12"), secrets.pkcs12),
-            Download::CaPassword => (format!("ca-{ca_id}-password.txt"), secrets.password),
+            Download::CaCert => (format!("{name}.pem"), secrets.cert_pem),
+            Download::CaKey => (format!("{name}.key"), secrets.key_pem),
+            Download::CaPkcs12 => (format!("{name}.p12"), secrets.pkcs12),
+            Download::CaPassword => (format!("{name}-p12-password.txt"), secrets.password),
             Download::CaTruststore => (
-                format!("ca-{ca_id}-truststore.p12"),
+                format!("{name}-truststore.p12"),
                 self.truststore(ca_id, &secrets.cert_pem)?,
             ),
             Download::CaTruststorePassword => (
-                format!("ca-{ca_id}-truststore-password.txt"),
+                format!("{name}-truststore-password.txt"),
                 TRUSTSTORE_PASSWORD.as_bytes().to_vec(),
             ),
             _ => bail!("invalid CA download kind"),
@@ -1008,16 +1107,14 @@ impl AppService {
             "downloading certificate artifact"
         );
         let secrets = self.db.get_cert_secrets(ca_id, cert_id)?;
+        let name = artifact_basename(&self.db.get_cert(ca_id, cert_id)?.common_name, cert_id);
         let artifact = match kind {
-            Download::CertBundle => (format!("cert-{cert_id}.zip"), secrets.bundle_zip),
-            Download::CertPem => (format!("cert-{cert_id}.pem"), secrets.cert_pem),
-            Download::CertCsr => (format!("cert-{cert_id}.csr"), secrets.csr_pem),
-            Download::CertKey => (format!("cert-{cert_id}.key"), secrets.key_pem),
-            Download::CertPkcs12 => (format!("cert-{cert_id}.p12"), secrets.pkcs12),
-            Download::CertPassword => (
-                format!("cert-{cert_id}-pkcs12-password.txt"),
-                secrets.password,
-            ),
+            Download::CertBundle => (format!("{name}.zip"), secrets.bundle_zip),
+            Download::CertPem => (format!("{name}.pem"), secrets.cert_pem),
+            Download::CertCsr => (format!("{name}.csr"), secrets.csr_pem),
+            Download::CertKey => (format!("{name}.key"), secrets.key_pem),
+            Download::CertPkcs12 => (format!("{name}.p12"), secrets.pkcs12),
+            Download::CertPassword => (format!("{name}-p12-password.txt"), secrets.password),
             _ => bail!("invalid certificate download kind"),
         };
         tracing::info!(
@@ -1038,6 +1135,12 @@ impl AppService {
         let snapshot = self.db.backup_snapshot()?;
         let users: Vec<BackupUser> = snapshot.users.into_iter().map(BackupUser::from).collect();
         let user_count = users.len();
+        let templates: Vec<BackupTemplate> = snapshot
+            .templates
+            .into_iter()
+            .map(BackupTemplate::from)
+            .collect();
+        let template_count = templates.len();
         let mut cas_out = Vec::new();
         for (ca, certs) in snapshot.cas {
             let mut certs_out = Vec::new();
@@ -1100,6 +1203,7 @@ impl AppService {
             exported_at: Utc::now().timestamp_millis(),
             warning: "This backup includes private keys and passwords.".to_string(),
             users,
+            templates,
             certificate_authorities: cas_out,
         })
         .map_err(anyhow::Error::from)?;
@@ -1107,6 +1211,7 @@ impl AppService {
             ca_count,
             cert_count,
             user_count,
+            template_count,
             bytes = yaml.len(),
             "exported backup YAML"
         );
@@ -1145,6 +1250,10 @@ impl AppService {
             // single transaction (which also re-checks the DB is empty).
             let snapshot = backup_to_snapshot(backup)?;
             self.db.restore_backup(&snapshot)?;
+            // Backups from older versions may carry fabricated import metadata.
+            if let Err(err) = self.repair_stale_metadata() {
+                tracing::warn!(error = %err, "metadata repair after restore failed");
+            }
             Ok((user_count, ca_count, cert_count))
         })();
         match outcome {
@@ -1260,6 +1369,87 @@ impl AppService {
         Ok(())
     }
 
+    pub fn list_templates(&self) -> Result<Vec<Template>> {
+        self.db.list_templates()
+    }
+
+    pub fn get_template(&self, id: &str) -> Result<Template> {
+        self.db
+            .get_template(id)?
+            .ok_or_else(|| anyhow::anyhow!("template not found: {id}"))
+    }
+
+    /// The templates offered on the creation form of `kind`: the default one
+    /// (applied automatically) and every applicable template, by name.
+    pub fn templates_for(&self, kind: TemplateScope) -> Result<(Option<Template>, Vec<Template>)> {
+        let presets: Vec<Template> = self
+            .db
+            .list_templates()?
+            .into_iter()
+            .filter(|template| template.scope().covers(kind))
+            .collect();
+        let default = presets.iter().find(|template| template.is_default).cloned();
+        Ok((default, presets))
+    }
+
+    #[tracing::instrument(skip(self, req), err, fields(span_id = %span_id(), name = %req.name))]
+    pub fn create_template(&self, req: TemplateRequest) -> Result<Template> {
+        let now = Utc::now().timestamp_millis();
+        let template = self.validate_template(req, Uuid::new_v4().to_string(), now, now)?;
+        self.db.save_template(&template, true)?;
+        tracing::info!(template_id = %template.id, name = %template.name, "created template");
+        Ok(template)
+    }
+
+    #[tracing::instrument(skip(self, req), err, fields(span_id = %span_id(), template_id = %id))]
+    pub fn update_template(&self, id: &str, req: TemplateRequest) -> Result<Template> {
+        let existing = self.get_template(id)?;
+        let now = Utc::now().timestamp_millis();
+        let template = self.validate_template(req, existing.id, existing.created_at, now)?;
+        self.db.save_template(&template, false)?;
+        tracing::info!(template_id = %template.id, name = %template.name, "updated template");
+        Ok(template)
+    }
+
+    #[tracing::instrument(skip(self), err, fields(span_id = %span_id(), template_id = %id))]
+    pub fn delete_template(&self, id: &str) -> Result<()> {
+        self.db.delete_template(id)
+    }
+
+    fn validate_template(
+        &self,
+        req: TemplateRequest,
+        id: String,
+        created_at: i64,
+        updated_at: i64,
+    ) -> Result<Template> {
+        let name = req.name.trim().to_string();
+        if name.is_empty() {
+            bail!("template name must not be empty");
+        }
+        if name.chars().count() > 100 || name.chars().any(char::is_control) {
+            bail!("template name must be at most 100 characters without control characters");
+        }
+        if self.db.template_name_taken(&name, Some(&id))? {
+            bail!("template name already exists: {name}");
+        }
+        let scope = match req.scope.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            None => TemplateScope::Both,
+            Some(scope) => TemplateScope::parse(scope)
+                .ok_or_else(|| anyhow::anyhow!("scope must be 'both', 'ca' or 'certificate'"))?,
+        };
+        let values = validate_template_values(&req.values)?;
+        Ok(Template {
+            id,
+            name,
+            scope: scope.as_str().to_string(),
+            is_default: req.is_default,
+            values,
+            created_at,
+            updated_at,
+        })
+    }
+
     /// CA common names are unique among CAs (not checked against cert CNs).
     fn ensure_unique_ca_common_name(&self, common_name: &str) -> Result<()> {
         if self.db.ca_common_name_exists(common_name)? {
@@ -1360,20 +1550,119 @@ impl AppService {
         Ok(days)
     }
 
-    /// The subject of `pem` in a form `parse_subject_part` can split safely:
-    /// RFC 2253 escaping when available, else openssl's default rendering.
-    fn subject_for_parsing(
+    /// The subject of `pem` as the certificate states it: the full DN in
+    /// `/C=..../CN=...` form plus the individual attributes MiniCA tracks
+    /// (empty when the certificate does not carry them — nothing is invented).
+    /// RFC 2253 output is used when available, else openssl's default
+    /// rendering.
+    fn derive_subject(
         &self,
         dir: &std::path::Path,
         pem: &str,
         info: &[(String, String)],
-    ) -> String {
-        self.openssl
+    ) -> DerivedSubject {
+        let text = self
+            .openssl
             .inspect_cert_subject_rfc2253(dir, pem)
             .ok()
             .filter(|subject| !subject.is_empty())
             .or_else(|| info_value(info, "subject"))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        DerivedSubject::from_rfc2253(&text)
+    }
+
+    /// One-time re-derivation of stored metadata from the certificates
+    /// themselves, for rows written by versions that fabricated it: imported
+    /// CAs used to be recorded as issued "now" for 3650 days, and imported CAs
+    /// and certificates without a country or organization were given `XX` /
+    /// `Imported`. Rows are checked once (`meta_version`), so this costs one
+    /// openssl call per unchecked CA (and per marked certificate) after an
+    /// upgrade or restore, then nothing. Returns the number of CAs and
+    /// certificates whose metadata changed.
+    pub fn repair_stale_metadata(&self) -> Result<(usize, usize)> {
+        let mut repaired_cas = 0;
+        for (mut meta, cert_pem) in self.db.list_cas_for_repair()? {
+            let pem = String::from_utf8_lossy(&cert_pem).to_string();
+            let work = self.openssl.workdir()?;
+            let info = match self.openssl.inspect_cert(work.path(), &pem) {
+                Ok(info) => info,
+                Err(err) => {
+                    tracing::warn!(ca_id = %meta.id, error = %err, "could not inspect CA certificate; metadata left as is");
+                    self.db.mark_ca_meta_checked(&meta.id)?;
+                    continue;
+                }
+            };
+            let before = meta.clone();
+            // Natively created CAs record issue_time a moment after openssl
+            // set notBefore; only a real discrepancy (an import recorded as
+            // issued at import time, or a made-up validity) is corrected.
+            let (issue_time, valid_days) = validity_from_info(&info);
+            if (issue_time - meta.issue_time).abs() > 86_400_000 || valid_days != meta.valid_days {
+                meta.issue_time = issue_time;
+                meta.valid_days = valid_days;
+            }
+            if has_fabricated_subject(&meta.country_code, &meta.organization) {
+                let derived = self.derive_subject(work.path(), &pem, &info);
+                apply_derived_subject(&mut meta, derived);
+            }
+            let changed = meta.subject != before.subject
+                || meta.issue_time != before.issue_time
+                || meta.valid_days != before.valid_days
+                || meta.country_code != before.country_code
+                || meta.organization != before.organization;
+            if changed {
+                tracing::info!(
+                    ca_id = %meta.id,
+                    old_subject = %before.subject,
+                    new_subject = %meta.subject,
+                    old_issue_time = before.issue_time,
+                    new_issue_time = meta.issue_time,
+                    old_valid_days = before.valid_days,
+                    new_valid_days = meta.valid_days,
+                    "repaired certificate authority metadata from its certificate"
+                );
+                repaired_cas += 1;
+            }
+            self.db.update_ca_meta_repaired(&meta)?;
+        }
+        let mut repaired_certs = 0;
+        for (mut meta, cert_pem) in self.db.list_certs_for_repair()? {
+            if !has_fabricated_subject(&meta.country_code, &meta.organization) {
+                self.db.mark_cert_meta_checked(&meta.id)?;
+                continue;
+            }
+            let pem = String::from_utf8_lossy(&cert_pem).to_string();
+            let work = self.openssl.workdir()?;
+            let info = self
+                .openssl
+                .inspect_cert(work.path(), &pem)
+                .unwrap_or_default();
+            let derived = self.derive_subject(work.path(), &pem, &info);
+            let before_subject = meta.subject.clone();
+            if !derived.subject.is_empty() {
+                meta.country_code = derived.country_code;
+                meta.state = derived.state;
+                meta.city = derived.city;
+                meta.organization = derived.organization;
+                meta.organization_unit = derived.organization_unit;
+                meta.subject = derived.subject;
+            }
+            if meta.subject != before_subject {
+                tracing::info!(
+                    ca_id = %meta.ca_id,
+                    cert_id = %meta.id,
+                    old_subject = %before_subject,
+                    new_subject = %meta.subject,
+                    "repaired certificate subject from its certificate"
+                );
+                repaired_certs += 1;
+            }
+            self.db.update_cert_meta_repaired(&meta)?;
+        }
+        if repaired_cas + repaired_certs > 0 {
+            tracing::warn!(repaired_cas, repaired_certs, "repaired stale metadata");
+        }
+        Ok((repaired_cas, repaired_certs))
     }
 
     fn with_ca_crl_url(&self, mut ca: CertificateAuthority) -> CertificateAuthority {
@@ -1693,21 +1982,160 @@ fn parse_signature_digest(text: &str) -> Option<String> {
     None
 }
 
-/// Finds the first `key=value` attribute of a distinguished name. Splits only
-/// on unescaped ',' and '+' (RFC 2253), so values such as `O=Acme\, Inc` or
-/// `CN=a\+b` stay intact; escapes (`\,` and `\XX` hex) are decoded.
-fn parse_subject_part(subject: &str, key: &str) -> Option<String> {
-    for part in split_unescaped(subject, &[',', '+']) {
-        let mut pieces = split_unescaped(&part, &['=']).into_iter();
-        let Some(k) = pieces.next() else {
-            continue;
+/// Subject data read from a certificate (see `AppService::derive_subject`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DerivedSubject {
+    /// The whole DN in `openssl -subj` form, DER order, e.g. `/C=DE/CN=x`.
+    pub subject: String,
+    pub common_name: Option<String>,
+    pub country_code: String,
+    pub state: String,
+    pub city: String,
+    pub organization: String,
+    pub organization_unit: String,
+}
+
+impl DerivedSubject {
+    /// Parses an RFC 2253 rendering (`C=DE,O=Acme\, Inc,CN=x`, DER order)
+    /// or openssl's default one (`C = DE, O = Acme, CN = x`).
+    pub fn from_rfc2253(text: &str) -> Self {
+        let attributes = subject_attributes(text);
+        let first = |key: &str| {
+            attributes
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
         };
-        let value = pieces.collect::<Vec<_>>().join("=");
-        if k.trim() == key {
-            return Some(unescape_dn_value(value.trim()));
+        Self {
+            subject: slash_subject(&attributes).unwrap_or_default(),
+            common_name: first("CN").filter(|value| !value.trim().is_empty()),
+            country_code: first("C").unwrap_or_default(),
+            state: first("ST").unwrap_or_default(),
+            city: first("L").unwrap_or_default(),
+            organization: first("O").unwrap_or_default(),
+            organization_unit: first("OU").unwrap_or_default(),
         }
     }
-    None
+}
+
+/// All `key=value` attributes of a distinguished name in the order written,
+/// with RFC 2253 escapes decoded. Multi-valued RDNs (`OU=a+OU=b`) become
+/// consecutive attributes.
+fn subject_attributes(subject: &str) -> Vec<(String, String)> {
+    split_unescaped(subject, &[',', '+'])
+        .into_iter()
+        .filter_map(|part| {
+            let mut pieces = split_unescaped(&part, &['=']).into_iter();
+            let key = pieces.next()?.trim().to_string();
+            if key.is_empty() {
+                return None;
+            }
+            let value = unescape_dn_value(pieces.collect::<Vec<_>>().join("=").trim());
+            Some((key, value))
+        })
+        .collect()
+}
+
+/// Renders attributes as an `openssl -subj` string (`/C=DE/O=Acme/CN=x`),
+/// escaping the separators inside values. `None` when there is nothing to
+/// render.
+fn slash_subject(attributes: &[(String, String)]) -> Option<String> {
+    if attributes.is_empty() {
+        return None;
+    }
+    Some(
+        attributes
+            .iter()
+            .map(|(key, value)| format!("/{key}={}", escape_subject(value)))
+            .collect(),
+    )
+}
+
+/// The placeholders older versions stored when an imported certificate had
+/// no country or organization.
+fn has_fabricated_subject(country_code: &str, organization: &str) -> bool {
+    country_code == "XX" || organization == "Imported"
+}
+
+fn apply_derived_subject(meta: &mut CaMeta, derived: DerivedSubject) {
+    if derived.subject.is_empty() {
+        return;
+    }
+    meta.country_code = derived.country_code;
+    meta.state = derived.state;
+    meta.city = derived.city;
+    meta.organization = derived.organization;
+    meta.organization_unit = derived.organization_unit;
+    meta.subject = derived.subject;
+}
+
+/// `(issue_time, valid_days)` from a certificate's `notBefore`/`notAfter`;
+/// now / one day when the dates cannot be read.
+fn validity_from_info(info: &[(String, String)]) -> (i64, i64) {
+    let not_before = info_value(info, "notBefore")
+        .and_then(|value| parse_openssl_date(&value))
+        .unwrap_or_else(|| Utc::now().timestamp_millis());
+    let not_after = info_value(info, "notAfter")
+        .and_then(|value| parse_openssl_date(&value))
+        .unwrap_or(not_before);
+    let valid_days = ((not_after - not_before).max(0) + 86_399_999) / 86_400_000;
+    (not_before, valid_days.max(1))
+}
+
+/// Ids chosen by callers (legacy migration) must be safe in URLs, file
+/// names and log lines: 1-64 characters of `[A-Za-z0-9._-]`, not starting
+/// with a dot.
+fn validate_entity_id(id: &str) -> Result<String> {
+    let id = id.trim();
+    if id.is_empty()
+        || id.len() > 64
+        || id.starts_with('.')
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        bail!("invalid id {id:?}: use 1-64 letters, digits, '-', '_' or '.'");
+    }
+    Ok(id.to_string())
+}
+
+/// File name stem for a download: the common name reduced to
+/// `[A-Za-z0-9._-]` (runs of anything else become one `_`, a leading `*.`
+/// wildcard label becomes `wildcard.`), or the id when nothing usable is
+/// left. Common names are unique per CA, so names stay distinct.
+pub fn artifact_basename(common_name: &str, id: &str) -> String {
+    let name = common_name.trim();
+    let name = name
+        .strip_prefix("*.")
+        .map(|rest| format!("wildcard.{rest}"))
+        .unwrap_or_else(|| name.to_string());
+    let mut out = String::with_capacity(name.len());
+    let mut last_sep = true;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-') {
+            out.push(ch);
+            last_sep = false;
+        } else if !last_sep {
+            out.push('_');
+            last_sep = true;
+        }
+    }
+    let out = out.trim_matches(['_', '.']).to_string();
+    if out.is_empty() || out.chars().all(|c| matches!(c, '.' | '_' | '-')) {
+        id.to_string()
+    } else {
+        out
+    }
+}
+
+/// Finds the first `key=value` attribute of a distinguished name (see
+/// `subject_attributes` for the splitting rules).
+#[cfg(test)]
+fn parse_subject_part(subject: &str, key: &str) -> Option<String> {
+    subject_attributes(subject)
+        .into_iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, value)| value)
 }
 
 /// Splits on unescaped separator characters, keeping escape sequences intact
@@ -1856,6 +2284,30 @@ fn backup_to_snapshot(backup: BackupFile) -> Result<BackupSnapshot> {
             created_at: user.created_at,
         });
     }
+    for template in backup.templates {
+        validate_backup_id(&template.id)?;
+        let scope = TemplateScope::parse(&template.scope).with_context(|| {
+            format!(
+                "backup template {:?} has unknown scope {:?}",
+                template.name, template.scope
+            )
+        })?;
+        let values = validate_template_values(&template.values)
+            .with_context(|| format!("backup template {:?} is invalid", template.name))?;
+        let name = template.name.trim().to_string();
+        if name.is_empty() || name.chars().any(char::is_control) {
+            bail!("backup template {:?} has an invalid name", template.id);
+        }
+        snapshot.templates.push(Template {
+            id: template.id,
+            name,
+            scope: scope.as_str().to_string(),
+            is_default: template.is_default,
+            values,
+            created_at: template.created_at,
+            updated_at: template.updated_at,
+        });
+    }
     for ca in backup.certificate_authorities {
         let ca_id = ca.meta.id.clone();
         validate_backup_id(&ca_id)?;
@@ -1972,6 +2424,56 @@ fn backup_to_snapshot(backup: BackupFile) -> Result<BackupSnapshot> {
 
 /// Ids end up in URLs and download file names; accept only what `short_id`
 /// produces (plus '-'/'_').
+/// Normalises template values and rejects anything the creation forms would
+/// not accept. Blank fields become unset.
+fn validate_template_values(values: &TemplateValues) -> Result<TemplateValues> {
+    let values = values.normalized();
+    if let Some(days) = values.valid_days.filter(|days| !(1..=7350).contains(days)) {
+        bail!("valid_days must be in 1..7350, got {days}");
+    }
+    if let Some(code) = values
+        .country_code
+        .as_deref()
+        .filter(|code| code.chars().count() != 2 || !code.chars().all(|c| c.is_ascii_alphabetic()))
+    {
+        bail!("country_code must be a 2-letter code, got {code:?}");
+    }
+    if let Some(digest) = values
+        .digest_algorithm
+        .as_deref()
+        .filter(|digest| !["sha256", "sha384", "sha512"].contains(digest))
+    {
+        bail!("digest_algorithm must be sha256, sha384 or sha512, got {digest:?}");
+    }
+    if let Some(profile) = values.key_profile.as_deref().filter(|profile| {
+        ![
+            "rsa:2048",
+            "rsa:4096",
+            "rsa:8192",
+            "ecdsa:prime256v1",
+            "ecdsa:secp384r1",
+            "ecdsa:secp521r1",
+        ]
+        .contains(profile)
+    }) {
+        bail!("key_profile is not supported: {profile:?}");
+    }
+    for (field, value) in [
+        ("country_code", &values.country_code),
+        ("state", &values.state),
+        ("city", &values.city),
+        ("organization", &values.organization),
+        ("organization_unit", &values.organization_unit),
+    ] {
+        if value.as_deref().is_some_and(|value| {
+            value.chars().any(char::is_control) || value.chars().count() > 200
+        }) {
+            bail!("{field} must be at most 200 characters without control characters");
+        }
+    }
+    Ok(values)
+}
+
 fn validate_backup_id(id: &str) -> Result<()> {
     if id.is_empty()
         || id.len() > 64
@@ -2181,6 +2683,7 @@ mod tests {
             app: "minica-rust".to_string(),
             exported_at: 0,
             warning: String::new(),
+            templates: vec![],
             users: vec![BackupUser {
                 id: "u1".to_string(),
                 username: "alice".to_string(),
@@ -2293,6 +2796,359 @@ mod tests {
         assert!(!yaml.contains("crlnumber_txt_b64"));
         let parsed: BackupFile = serde_yaml::from_str(&yaml).unwrap();
         assert!(backup_to_snapshot(parsed).is_ok());
+    }
+
+    /// Runs openssl in a fresh workdir and returns the files it wrote, for
+    /// building certificates the way other tools (or minica 1.0.x) do.
+    fn openssl_make(service: &AppService, steps: &[&[&str]], outputs: &[&str]) -> Vec<Vec<u8>> {
+        let work = service.openssl.workdir().unwrap();
+        for args in steps {
+            let out = service
+                .openssl
+                .run_in(work.path(), args, std::time::Duration::from_secs(60))
+                .unwrap();
+            assert_eq!(out.exit_code, 0, "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        }
+        outputs
+            .iter()
+            .map(|name| fs::read(work.path().join(name)).unwrap())
+            .collect()
+    }
+
+    /// A self-signed CA with only a common name (as many home-lab CAs are).
+    fn cn_only_ca(service: &AppService, cn: &str, days: &str) -> (String, String) {
+        let files = openssl_make(
+            service,
+            &[
+                &["genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", "k.pem"],
+                &["req", "-new", "-x509", "-nodes", "-days", days, "-key", "k.pem", "-sha256",
+                  "-out", "c.pem", "-subj", &format!("/CN={cn}"),
+                  "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=keyCertSign,cRLSign"],
+            ],
+            &["c.pem", "k.pem"],
+        );
+        (
+            String::from_utf8(files[0].clone()).unwrap(),
+            String::from_utf8(files[1].clone()).unwrap(),
+        )
+    }
+
+    #[test]
+    fn imported_ca_keeps_its_real_subject_and_validity() {
+        let (service, root) = temp_service();
+        let (cert_pem, key_pem) = cn_only_ca(&service, "Homelab CA", "3650");
+        let ca = service
+            .import_ca(ImportCaRequest {
+                cert_pem: cert_pem.clone(),
+                key_pem: key_pem.clone(),
+                password: Some("secret".to_string()),
+            })
+            .unwrap();
+        // No invented country/organization (issue #21).
+        assert_eq!(ca.subject, "/CN=Homelab CA");
+        assert_eq!(ca.common_name, "Homelab CA");
+        assert_eq!(ca.country_code, "");
+        assert_eq!(ca.organization, "");
+        // Validity comes from the certificate, not "now + 3650 days".
+        assert_eq!(ca.valid_days, 3650);
+        let now = Utc::now().timestamp_millis();
+        assert!((now - ca.issue_time).abs() < 120_000, "{}", ca.issue_time);
+        assert_eq!(ca.key_profile, "rsa:2048");
+        assert_eq!(ca.digest_algorithm, "sha256");
+        // Fresh rows are already marked as checked by the metadata repair.
+        assert_eq!(service.db.meta_versions().unwrap().0, vec![1]);
+
+        // A leaf certificate is refused as a CA, a mismatched key is refused too.
+        let leaf = service
+            .create_cert(&ca.id, cert_request("leaf.example.com", 10, &[]))
+            .unwrap();
+        let err = service
+            .import_ca(ImportCaRequest {
+                cert_pem: leaf.cert_pem.clone(),
+                key_pem: leaf.key_pem.clone(),
+                password: None,
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a certificate authority"), "{err}");
+        let (other_cert, _) = cn_only_ca(&service, "Other CA", "30");
+        let err = service
+            .import_ca(ImportCaRequest {
+                cert_pem: other_cert,
+                key_pem,
+                password: None,
+            })
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("does not match"), "{err:#}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn renewal_reproduces_sans_even_when_the_stored_csr_has_none() {
+        let (service, root) = temp_service();
+        let ca = service.create_ca(ca_request("SAN CA", 3650)).unwrap();
+        let cert = service
+            .create_cert(&ca.id, cert_request("web.home.lan", 10, &["www.home.lan"]))
+            .unwrap();
+        // Certificates imported before SAN copying existed have a CSR without
+        // SANs: reproduce that by importing with a plain x509toreq CSR.
+        let work = service.openssl.workdir().unwrap();
+        fs::write(work.path().join("c.pem"), &cert.cert_pem).unwrap();
+        fs::write(work.path().join("k.pem"), &cert.key_pem).unwrap();
+        let out = service
+            .openssl
+            .run_in(
+                work.path(),
+                &["x509", "-x509toreq", "-in", "c.pem", "-signkey", "k.pem", "-out", "r.csr"],
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+        assert_eq!(out.exit_code, 0, "{}", String::from_utf8_lossy(&out.stderr));
+        let plain_csr = fs::read(work.path().join("r.csr")).unwrap();
+        drop(work);
+        let csr_text = openssl_text(
+            &service,
+            &["req", "-in", "r.csr", "-noout", "-text"],
+            ("r.csr", &plain_csr),
+        );
+        assert!(!csr_text.contains("Subject Alternative Name"), "{csr_text}");
+
+        service.delete_cert(&ca.id, &cert.id).unwrap();
+        let imported = service
+            .import_cert_with(
+                &ca.id,
+                Some("legacy-cert-1".to_string()),
+                ImportCertRequest {
+                    cert_pem: cert.cert_pem.clone(),
+                    key_pem: cert.key_pem.clone(),
+                    password: Some("p12pass".to_string()),
+                },
+                Some(&plain_csr),
+            )
+            .unwrap();
+        assert_eq!(imported.id, "legacy-cert-1");
+        assert_eq!(imported.subject, "/C=SG/O=Org/CN=web.home.lan");
+        let stored = service.db.get_cert_secrets(&ca.id, &imported.id).unwrap();
+        assert_eq!(stored.csr_pem, plain_csr, "the supplied CSR is kept");
+        assert_eq!(stored.password, b"p12pass");
+
+        let renewed = service.renew_cert(&ca.id, &imported.id, 20).unwrap();
+        let work = service.openssl.workdir().unwrap();
+        let (dns, ips) = service
+            .openssl
+            .inspect_cert_sans(work.path(), &renewed.cert_pem)
+            .unwrap();
+        assert_eq!(dns, vec!["web.home.lan", "www.home.lan"]);
+        assert_eq!(ips, vec!["10.0.0.7"]);
+        let subject = service
+            .openssl
+            .inspect_cert_subject_rfc2253(work.path(), &renewed.cert_pem)
+            .unwrap();
+        assert_eq!(subject, "C=SG,O=Org,CN=web.home.lan");
+        assert_eq!(renewed.valid_days, 20);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn renewal_is_capped_at_the_ca_expiry_and_reports_the_effective_days() {
+        let (service, root) = temp_service();
+        let ca = service.create_ca(ca_request("Short CA", 40)).unwrap();
+        let cert = service
+            .create_cert(&ca.id, cert_request("leaf.short.test", 10, &[]))
+            .unwrap();
+        let renewed = service.renew_cert(&ca.id, &cert.id, 3650).unwrap();
+        assert!(renewed.valid_days <= 40 && renewed.valid_days >= 38, "{}", renewed.valid_days);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_metadata_is_repaired_from_the_certificates_once() {
+        let (service, root) = temp_service();
+        let ca = service.create_ca(ca_request("Repair CA", 30)).unwrap();
+        let cert = service
+            .create_cert(&ca.id, cert_request("leaf.repair.test", 10, &[]))
+            .unwrap();
+        // Nothing to do for rows written by this version.
+        assert_eq!(service.repair_stale_metadata().unwrap(), (0, 0));
+
+        // What an import by 1.2.2 or older left behind.
+        let fake_issue = Utc::now().timestamp_millis() - 93 * 86_400_000;
+        service
+            .db
+            .fake_legacy_ca_meta(&ca.id, "XX", "Imported", "/C=XX/O=Imported/CN=Repair CA", fake_issue, 3650)
+            .unwrap();
+        service
+            .db
+            .fake_legacy_cert_meta(&cert.id, "XX", "Imported", "/C=XX/O=Imported/CN=leaf.repair.test")
+            .unwrap();
+        assert_eq!(service.db.meta_versions().unwrap(), (vec![0], vec![0]));
+        assert_eq!(service.get_ca(&ca.id).unwrap().subject, "/C=XX/O=Imported/CN=Repair CA");
+
+        assert_eq!(service.repair_stale_metadata().unwrap(), (1, 1));
+        let repaired = service.get_ca(&ca.id).unwrap();
+        assert_eq!(repaired.subject, "/C=SG/O=Org/CN=Repair CA");
+        assert_eq!(repaired.country_code, "SG");
+        assert_eq!(repaired.organization, "Org");
+        assert_eq!(repaired.valid_days, 30);
+        assert!((repaired.issue_time - ca.issue_time).abs() < 2_000, "{} vs {}", repaired.issue_time, ca.issue_time);
+        let repaired_cert = service.get_cert(&ca.id, &cert.id).unwrap();
+        assert_eq!(repaired_cert.subject, "/C=SG/O=Org/CN=leaf.repair.test");
+        assert_eq!(service.db.meta_versions().unwrap(), (vec![1], vec![1]));
+        // Checked rows are not inspected again.
+        assert_eq!(service.repair_stale_metadata().unwrap(), (0, 0));
+
+        // A backup restored into an empty database is checked as well.
+        let yaml = service.export_backup_yaml().unwrap();
+        service.nuke_all().unwrap();
+        service.import_backup_yaml(&yaml).unwrap();
+        assert_eq!(service.db.meta_versions().unwrap(), (vec![1], vec![1]));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_tree_import_keeps_ids_passwords_and_sans() {
+        let (service, root) = temp_service();
+        // Build a 1.0.x data directory the way the Kotlin version did.
+        let legacy = root.join("legacy-root");
+        let ca_dir = legacy.join("CAs").join("6f1c2b4e-0000-4000-8000-00000000c0de");
+        let cert_dir = ca_dir.join("9a8b7c6d-0000-4000-8000-0000000c3a7f");
+        fs::create_dir_all(&cert_dir).unwrap();
+        fs::create_dir_all(ca_dir.join("certs")).unwrap();
+        let (ca_cert, ca_key) = cn_only_ca(&service, "Legacy Root", "3650");
+        fs::write(ca_dir.join("ca-cert.pem"), &ca_cert).unwrap();
+        fs::write(ca_dir.join("ca-key.pem"), &ca_key).unwrap();
+        fs::write(ca_dir.join("password.txt"), "caP4ss").unwrap();
+        fs::write(ca_dir.join("CA.complete"), "Done!").unwrap();
+        fs::write(ca_dir.join("meta.properties"), "#Generated by MiniCA\ncommonName=Legacy Root\n").unwrap();
+        // A leaf signed by that CA with SANs, through openssl ca like 1.0.x.
+        let ca_conf = format!(
+            "[ ca ]\ndefault_ca = CA_default\n[ CA_default ]\ndefault_days = 7300\ndefault_md = sha256\n\
+             unique_subject = no\nbase_dir = {base}\ncertificate = $base_dir/ca-cert.pem\n\
+             private_key = $base_dir/ca-key.pem\nnew_certs_dir = $base_dir/certs\n\
+             database = $base_dir/index.txt\nserial = $base_dir/serial.txt\n\
+             x509_extensions = ca_extensions\ncopy_extensions = copy\n[ ca_extensions ]\n\
+             basicConstraints = CA:FALSE\n[ signing_policy ]\ncountryName = optional\n\
+             stateOrProvinceName = optional\nlocalityName = optional\norganizationName = optional\n\
+             organizationalUnitName = optional\ncommonName = supplied\n[ signing_req ]\n\
+             subjectKeyIdentifier = hash\nauthorityKeyIdentifier = keyid,issuer\n\
+             basicConstraints = CA:FALSE\nkeyUsage = digitalSignature, keyEncipherment\n\
+             extendedKeyUsage = serverAuth, clientAuth\n",
+            base = ca_dir.display()
+        );
+        fs::write(ca_dir.join("openssl-ca.conf"), ca_conf).unwrap();
+        fs::write(ca_dir.join("index.txt"), "").unwrap();
+        fs::write(ca_dir.join("serial.txt"), "00\n").unwrap();
+        let req_conf = "[ req ]\ndistinguished_name = dn\nreq_extensions = ext\n[ dn ]\ncommonName = CN\n\
+                        [ ext ]\nsubjectAltName = @alt\n[ alt ]\nDNS.1 = web.home.lan\nDNS.2 = www.home.lan\nIP.1 = 10.0.0.5\n";
+        fs::write(cert_dir.join("req.conf"), req_conf).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("/usr/bin/openssl")
+                .args(args)
+                .current_dir(&ca_dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let cert_base = cert_dir.display().to_string();
+        run(&["req", "-config", &format!("{cert_base}/req.conf"), "-newkey", "rsa:2048", "-sha256", "-nodes",
+              "-keyout", &format!("{cert_base}/cert.key"), "-out", &format!("{cert_base}/cert.csr"),
+              "-subj", "/C=DE/ST=BW/O=Homelab/CN=web.home.lan"]);
+        run(&["ca", "-config", "openssl-ca.conf", "-days", "365", "-batch", "-policy", "signing_policy",
+              "-extensions", "signing_req", "-notext", "-out", &format!("{cert_base}/cert.pem"),
+              "-infiles", &format!("{cert_base}/cert.csr")]);
+        fs::write(cert_dir.join("password.txt"), "leafP4ss").unwrap();
+        fs::write(cert_dir.join("CERT.complete"), "Done!").unwrap();
+        // An incomplete certificate directory (no CERT.complete) is ignored,
+        // and a broken one is reported without stopping the run.
+        fs::create_dir_all(ca_dir.join("abandoned")).unwrap();
+        fs::write(ca_dir.join("abandoned").join("cert.pem"), "junk").unwrap();
+        let broken = ca_dir.join("broken-cert");
+        fs::create_dir_all(&broken).unwrap();
+        fs::write(broken.join("cert.pem"), "not a certificate").unwrap();
+        fs::write(broken.join("cert.key"), "not a key").unwrap();
+        fs::write(broken.join("CERT.complete"), "Done!").unwrap();
+
+        let report = crate::legacy::import_tree(&service, &legacy).unwrap();
+        assert_eq!(report.cas_imported, 1, "{report:?}");
+        assert_eq!(report.certs_imported, 1, "{report:?}");
+        assert_eq!(report.failures.len(), 1, "{report:?}");
+        assert!(report.failures[0].contains("broken-cert"), "{report:?}");
+        assert!(report.skipped.is_empty(), "{report:?}");
+
+        let ca = service.get_ca("6f1c2b4e-0000-4000-8000-00000000c0de").unwrap();
+        assert_eq!(ca.common_name, "Legacy Root");
+        assert_eq!(ca.subject, "/CN=Legacy Root");
+        assert_eq!(ca.valid_days, 3650);
+        assert_eq!(service.db.get_ca_secrets(&ca.id).unwrap().password, b"caP4ss");
+        let cert = service.get_cert(&ca.id, "9a8b7c6d-0000-4000-8000-0000000c3a7f").unwrap();
+        assert_eq!(cert.subject, "/C=DE/ST=BW/O=Homelab/CN=web.home.lan");
+        assert_eq!(cert.dns_list, vec!["web.home.lan", "www.home.lan"]);
+        assert_eq!(cert.ip_list, vec!["10.0.0.5"]);
+        assert_eq!(cert.valid_days, 365);
+        let secrets = service.db.get_cert_secrets(&ca.id, &cert.id).unwrap();
+        assert_eq!(secrets.password, b"leafP4ss");
+        assert_eq!(secrets.csr_pem, fs::read(cert_dir.join("cert.csr")).unwrap());
+        // The imported CA keeps working: it can issue, and the legacy leaf renews with its SANs.
+        service
+            .create_cert(&ca.id, cert_request("new.home.lan", 10, &[]))
+            .unwrap();
+        let renewed = service.renew_cert(&ca.id, &cert.id, 400).unwrap();
+        assert_eq!(renewed.dns_list, vec!["web.home.lan", "www.home.lan"]);
+        let work = service.openssl.workdir().unwrap();
+        let (dns, _) = service
+            .openssl
+            .inspect_cert_sans(work.path(), &renewed.cert_pem)
+            .unwrap();
+        assert_eq!(dns, vec!["web.home.lan", "www.home.lan"]);
+
+        // A second run is a no-op apart from the still-broken directory.
+        let again = crate::legacy::import_tree(&service, &legacy).unwrap();
+        assert_eq!((again.cas_imported, again.certs_imported), (0, 0));
+        assert_eq!(again.skipped.len(), 2, "{again:?}");
+        assert_eq!(again.failures.len(), 1);
+        // The CAs directory itself is accepted too; anything else is not.
+        assert!(crate::legacy::import_tree(&service, &legacy.join("CAs")).is_ok());
+        assert!(crate::legacy::import_tree(&service, &root).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn subject_helpers() {
+        let derived = DerivedSubject::from_rfc2253(r"C=DE,ST=BW,O=Home\, Lab,CN=web/home");
+        assert_eq!(derived.subject, r"/C=DE/ST=BW/O=Home, Lab/CN=web\/home");
+        assert_eq!(derived.common_name.as_deref(), Some("web/home"));
+        assert_eq!(derived.organization, "Home, Lab");
+        assert_eq!(derived.organization_unit, "");
+        // openssl's default rendering (fallback) and multi-valued RDNs.
+        let derived = DerivedSubject::from_rfc2253("C = SG, O = Org, OU = a+OU = b, CN = x");
+        assert_eq!(derived.subject, "/C=SG/O=Org/OU=a/OU=b/CN=x");
+        assert_eq!(DerivedSubject::from_rfc2253("").subject, "");
+        assert_eq!(DerivedSubject::from_rfc2253("CN=Homelab CA").subject, "/CN=Homelab CA");
+
+        assert_eq!(artifact_basename("Homelab CA", "id1"), "Homelab_CA");
+        assert_eq!(artifact_basename("*.example.com", "id1"), "wildcard.example.com");
+        assert_eq!(artifact_basename("web.home.lan", "id1"), "web.home.lan");
+        assert_eq!(artifact_basename("  a  b/c\\d:e  ", "id1"), "a_b_c_d_e");
+        assert_eq!(artifact_basename("日本語", "id1"), "id1");
+        assert_eq!(artifact_basename("...", "id1"), "id1");
+        assert_eq!(artifact_basename("", "id1"), "id1");
+
+        assert!(validate_entity_id("6f1c2b4e-0000-4000-8000-00000000c0de").is_ok());
+        assert!(validate_entity_id("a_b.c").is_ok());
+        for bad in ["", ".hidden", "a/b", "a b", &"x".repeat(65)] {
+            assert!(validate_entity_id(bad).is_err(), "{bad:?}");
+        }
+
+        let info = vec![
+            ("notBefore".to_string(), "Oct 25 04:24:20 2026 GMT".to_string()),
+            ("notAfter".to_string(), "Oct 22 04:24:20 2036 GMT".to_string()),
+        ];
+        let (issue, days) = validity_from_info(&info);
+        assert_eq!(days, 3650);
+        assert_eq!(issue, parse_openssl_date("Oct 25 04:24:20 2026 GMT").unwrap());
+        assert!(has_fabricated_subject("XX", "Org"));
+        assert!(has_fabricated_subject("DE", "Imported"));
+        assert!(!has_fabricated_subject("DE", "Org"));
     }
 
     #[test]
