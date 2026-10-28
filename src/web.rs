@@ -554,7 +554,7 @@ fn ca_form_page(
             lang,
             csrf,
             &t(lang, "ca.new.submit"),
-            &template_picker(lang, "ca-templates", &presets, &TemplateValues::default()),
+            &template_picker(lang, "ca-templates", &presets, &builtin_form_base()),
             values
         )
     ))
@@ -914,9 +914,27 @@ fn cert_form_page(
     ))
 }
 
+/// The built-in form values (what a form shows with no template and, for a
+/// CA, no other source), as a template base so choosing a template in the
+/// drop-down always yields the same fields regardless of earlier edits.
+fn builtin_form_base() -> TemplateValues {
+    let base = SubjectValues::default();
+    TemplateValues {
+        country_code: Some(base.country_code),
+        state: Some(base.state),
+        city: Some(base.city),
+        organization: Some(base.organization),
+        organization_unit: Some(base.organization_unit),
+        valid_days: base.valid_days.parse().ok(),
+        digest_algorithm: Some(base.digest_algorithm),
+        key_profile: Some(base.key_profile),
+    }
+}
+
 /// What the New Certificate form starts from when no template applies: the
 /// issuing CA's own subject attributes (a certificate usually belongs to the
-/// organisation of its CA). Templates fill in over these.
+/// organisation of its CA) over the built-in values. Templates fill in over
+/// these; nothing here is enforced when the form is submitted.
 fn cert_form_base(ca: &CertificateAuthority) -> TemplateValues {
     TemplateValues {
         country_code: Some(ca.country_code.clone()),
@@ -926,6 +944,7 @@ fn cert_form_base(ca: &CertificateAuthority) -> TemplateValues {
         organization_unit: Some(ca.organization_unit.clone()),
         ..TemplateValues::default()
     }
+    .over(&builtin_form_base())
 }
 
 /// A template drop-down for a creation form, plus each template's values
@@ -3793,8 +3812,9 @@ fn error_banner_html(message_html: &str) -> String {
 
 fn subject_fields_common(lang: Lang, v: &SubjectValues) -> String {
     let digest = format!(
-        "{}{}",
+        "{}{}{}",
         opt("sha512", "SHA-512", &v.digest_algorithm),
+        opt("sha384", "SHA-384", &v.digest_algorithm),
         opt("sha256", "SHA-256", &v.digest_algorithm)
     );
     let key_profiles = format!(

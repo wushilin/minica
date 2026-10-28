@@ -2622,6 +2622,46 @@ mod tests {
             assert!(html.contains(expected), "missing {expected}: {html}");
         }
 
+        // Templates only pre-fill: the submitted form wins, whether the
+        // template set the field (country, days) or left it unset (city).
+        let body = format!(
+            "_csrf={}&common_name=override.test&country_code=SG&state=Bayern&city=Munich&organization=Homelab&organization_unit=&valid_days=7&digest_algorithm=sha384&key_profile=rsa:2048&password=&dns_list=override.test&ip_list=",
+            csrf.token
+        );
+        let posted = env
+            .send(
+                "POST",
+                &format!("/minica/cas/{ca_id}/certs"),
+                Some(("admin", "adminpass")),
+                Some(&csrf),
+                Some("application/x-www-form-urlencoded"),
+                Body::from(body),
+            )
+            .await;
+        posted.assert_status(StatusCode::SEE_OTHER);
+        let certs = env
+            .send(
+                "GET",
+                &format!("/minica/api/cas/{ca_id}/certs"),
+                Some(("admin", "adminpass")),
+                None,
+                None,
+                Body::empty(),
+            )
+            .await
+            .json();
+        let cert = certs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["common_name"] == "override.test")
+            .unwrap();
+        assert_eq!(cert["country_code"], "SG");
+        assert_eq!(cert["city"], "Munich");
+        assert_eq!(cert["valid_days"], 7);
+        assert_eq!(cert["digest_algorithm"], "sha384");
+        assert!(cert["subject"].as_str().unwrap().contains("/C=SG/"), "{cert}");
+
         // Making the preset the default clears the flag on the overlapping one.
         let updated = env
             .json(
