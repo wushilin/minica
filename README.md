@@ -10,6 +10,21 @@ the same mental model — CAs and certificates managed over a Basic-auth REST AP
 with admin/viewer roles — while replacing the runtime, storage, and operational
 story with something smaller, safer, and easier to run.
 
+## Screenshots
+
+<img width="1728" height="494" alt="image" src="https://github.com/user-attachments/assets/794bc50a-7fc1-4593-bf8c-ed4022d6ba4b" />
+
+<img width="1166" height="926" alt="image" src="https://github.com/user-attachments/assets/fab69d82-f633-43c7-b765-089cdd725b06" />
+
+<img width="1186" height="844" alt="image" src="https://github.com/user-attachments/assets/8f075485-e87d-45db-b2c6-e25c106c891a" />
+
+<img width="1166" height="914" alt="image" src="https://github.com/user-attachments/assets/ce6154b8-b7fd-4c4f-b6b1-212342a4c149" />
+
+<img width="1180" height="863" alt="image" src="https://github.com/user-attachments/assets/546ad117-d2e3-4360-9a7a-fc042cb74788" />
+
+<img width="1183" height="679" alt="image" src="https://github.com/user-attachments/assets/f163b946-aceb-44ea-a969-0320aa1596d4" />
+
+
 ## Feature highlights
 
 - **Single static binary, two dependencies.** The service is one Rust binary
