@@ -465,3 +465,7 @@ auth:
 
 > **Note:** Like the original, this is intended for development and internal/test
 > environments where standing up a full enterprise PKI is overkill.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
