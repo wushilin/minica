@@ -300,6 +300,9 @@
   "template.submit_create": "テンプレートを作成",
   "template.submit_update": "テンプレートを保存",
   "template.unset": "— 未設定 —",
+  "validity.ca_max_confirm": "CA 証明書のほうが先に期限切れになるため、この証明書の有効期間は最大 {max} 日です。この値を使用しますか?",
+  "validity.max_confirm": "最大値は {max} 日です。この値を使用しますか?",
+  "validity.use_max": "{max} 日を使用",
   "validity.expired": "{days} 日前に期限切れ",
   "validity.left": "残り {days} 日",
   "validity.today": "本日期限切れ"

@@ -300,6 +300,9 @@
   "template.submit_create": "Opret skabelon",
   "template.submit_update": "Gem skabelon",
   "template.unset": "— ikke angivet —",
+  "validity.ca_max_confirm": "CA-certifikatet udløber først, så dette certifikat kan højst være gyldigt i {max} dage. Vil du bruge denne værdi i stedet?",
+  "validity.max_confirm": "Maksimumværdien er {max} dage. Vil du bruge den i stedet?",
+  "validity.use_max": "Brug {max} dage",
   "validity.expired": "udløb for {days} dag(e) siden",
   "validity.left": "{days} dag(e) tilbage",
   "validity.today": "udløber i dag"

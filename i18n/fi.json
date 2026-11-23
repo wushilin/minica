@@ -300,6 +300,9 @@
   "template.submit_create": "Luo malli",
   "template.submit_update": "Tallenna malli",
   "template.unset": "— ei asetettu —",
+  "validity.ca_max_confirm": "CA-varmenne vanhenee ensin, joten tämä varmenne voi olla voimassa enintään {max} päivää. Haluatko käyttää tätä arvoa?",
+  "validity.max_confirm": "Enimmäisarvo on {max} päivää. Haluatko käyttää sitä?",
+  "validity.use_max": "Käytä {max} päivää",
   "validity.expired": "vanheni {days} päivää sitten",
   "validity.left": "{days} päivää jäljellä",
   "validity.today": "vanhenee tänään"

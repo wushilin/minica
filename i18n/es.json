@@ -300,6 +300,9 @@
   "template.submit_create": "Crear plantilla",
   "template.submit_update": "Guardar plantilla",
   "template.unset": "— sin definir —",
+  "validity.ca_max_confirm": "El certificado de la CA caduca antes, por lo que este certificado puede ser válido como máximo {max} días. ¿Quiere usar este valor?",
+  "validity.max_confirm": "El valor máximo es {max} días. ¿Quiere usar este valor?",
+  "validity.use_max": "Usar {max} días",
   "validity.expired": "venció hace {days} día(s)",
   "validity.left": "quedan {days} día(s)",
   "validity.today": "vence hoy"

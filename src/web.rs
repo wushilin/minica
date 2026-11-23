@@ -908,6 +908,15 @@ async fn renew_ca_form(
     .await
 }
 
+/// Tells the page script how long a certificate from this CA can last.
+fn ca_limit_attr(state: &Arc<AppState>, ca_id: &str) -> String {
+    state
+        .service
+        .max_cert_days(ca_id)
+        .map(|days| format!(r#" data-ca-max-days="{days}""#))
+        .unwrap_or_default()
+}
+
 fn cert_form_page(
     state: &Arc<AppState>,
     lang: Lang,
@@ -919,7 +928,7 @@ fn cert_form_page(
     let (_, presets) = state.service.templates_for(TemplateScope::Certificate)?;
     let ca_id = &ca.id;
     Ok(format!(
-        r#"{}<h1>{}</h1>{}<form method="post" action="{}" class="form-grid">{}</form>"#,
+        r#"{}<h1>{}</h1>{}<form method="post" action="{}" class="form-grid"{}>{}</form>"#,
         breadcrumb(lang, &[
             (t(lang, "crumb.home"), Some(u(state, "/cas"))),
             (
@@ -931,6 +940,7 @@ fn cert_form_page(
         t(lang, "cert.new.title"),
         error.map(|e| error_banner(lang, e)).unwrap_or_default(),
         u(state, &format!("/cas/{ca_id}/certs")),
+        ca_limit_attr(state, ca_id),
         cert_form_fields(
             lang,
             csrf,
@@ -1234,9 +1244,10 @@ async fn cert_detail(
         ]);
         let renew = if user.role.can_write() {
             format!(
-                r#"<dt>{}</dt><dd><form method="post" action="{}" class="renew-sentence"><input type="hidden" name="_csrf" value="{}"><button type="submit" class="btn btn-sm btn-warning" data-renew="{}">{}</button><span>{}</span><input class="form-control form-control-sm" type="number" min="1" max="{max_days}" name="days" value="365" aria-label="{}"><span>{}</span></form></dd>"#,
+                r#"<dt>{}</dt><dd><form method="post" action="{}" class="renew-sentence"{}><input type="hidden" name="_csrf" value="{}"><button type="submit" class="btn btn-sm btn-warning" data-renew="{}">{}</button><span>{}</span><input class="form-control form-control-sm" type="number" min="1" max="{max_days}" name="days" value="365" aria-label="{}"><span>{}</span></form></dd>"#,
                 t(lang, "field.renewal"),
                 u(state, &format!("/cas/{ca_id}/certs/{cert_id}/renew")),
+                ca_limit_attr(state, &ca_id),
                 h(&csrf),
                 t(lang, "cert.detail.renew_what"),
                 t(lang, "action.renew"),
@@ -4277,6 +4288,10 @@ fn script_strings(lang: Lang) -> String {
         "confirmLabel": tr(lang, "action.delete", &[]),
         "renew": tr(lang, "action.renew", &[]),
         "renewConfirm": tr(lang, "renew.confirm", &[]),
+        "caMaxConfirm": tr(lang, "validity.ca_max_confirm", &[]),
+        "maxConfirm": tr(lang, "validity.max_confirm", &[]),
+        "useMax": tr(lang, "validity.use_max", &[]),
+        "standardMaxDays": crate::config::STANDARD_MAX_VALID_DAYS,
     })
     .to_string()
     .replace('<', "\\u003c")
@@ -5206,6 +5221,7 @@ document.querySelectorAll('[data-toggle]').forEach((btn) => {
   const okBtn = modal.querySelector('#confirm-ok');
   const cancelBtn = modal.querySelector('#confirm-cancel');
   let pendingForm = null;
+  let pendingAction = null;
 
   const open = (message, okLabel, okClass) => {
     messageEl.textContent = message;
@@ -5213,15 +5229,44 @@ document.querySelectorAll('[data-toggle]').forEach((btn) => {
     okBtn.className = 'btn ' + okClass;
     modal.hidden = false;
   };
-  const close = () => { modal.hidden = true; pendingForm = null; };
+  const close = () => { modal.hidden = true; pendingForm = null; pendingAction = null; };
 
   cancelBtn.addEventListener('click', close);
   modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !modal.hidden) close(); });
   okBtn.addEventListener('click', () => {
     const form = pendingForm;
+    const action = pendingAction;
     close();
-    if (form) form.submit();
+    if (action) action();
+    else if (form) form.submit();
+  });
+
+  // Validity fields: offer the longest allowed value instead of a rejection.
+  // Without extra-long validity the browser's normal maximum still applies.
+  const daysFields = document.querySelectorAll('input[type=number][name=days],input[type=number][name=valid_days]');
+  const overLimit = (field) => {
+    const days = Number(field.value);
+    const max = Number(field.dataset.maxDays);
+    const caMax = Number(field.form?.dataset.caMaxDays || 0);
+    if (!(days > 0)) return null;
+    if (caMax && caMax <= max && days > caMax) return { days: caMax, message: I18N.caMaxConfirm };
+    if (max > I18N.standardMaxDays && days > max) return { days: max, message: I18N.maxConfirm };
+    return null;
+  };
+  const offerLimit = (field, limit, then) => {
+    open(fmt(limit.message, { max: limit.days }), fmt(I18N.useMax, { max: limit.days }), 'btn-primary');
+    pendingAction = () => { field.value = limit.days; then(); };
+  };
+  daysFields.forEach((field) => {
+    field.dataset.maxDays = field.max;
+    if (Number(field.max) > I18N.standardMaxDays) field.removeAttribute('max');
+    field.form?.addEventListener('submit', (e) => {
+      const limit = overLimit(field);
+      if (!limit) return;
+      e.preventDefault();
+      offerLimit(field, limit, () => field.form.requestSubmit());
+    });
   });
 
   // Generic delete confirmations.
@@ -5238,10 +5283,16 @@ document.querySelectorAll('[data-toggle]').forEach((btn) => {
     btn.addEventListener('click', (e) => {
       e.preventDefault();
       const form = btn.closest('form');
-      const days = parseInt((form.querySelector('[name=days]') || {}).value || '0', 10);
-      const expiry = new Date(Date.now() + days * 86400000).toISOString().slice(0, 10);
-      pendingForm = form;
-      open(fmt(I18N.renewConfirm, { what: btn.dataset.renew || '', days, expiry }), I18N.renew, 'btn-warning');
+      const field = form.querySelector('[name=days]');
+      const confirmRenew = () => {
+        const days = parseInt((field || {}).value || '0', 10);
+        const expiry = new Date(Date.now() + days * 86400000).toISOString().slice(0, 10);
+        pendingForm = form;
+        open(fmt(I18N.renewConfirm, { what: btn.dataset.renew || '', days, expiry }), I18N.renew, 'btn-warning');
+      };
+      const limit = field && overLimit(field);
+      if (limit) offerLimit(field, limit, confirmRenew);
+      else confirmRenew();
     });
   });
 })();

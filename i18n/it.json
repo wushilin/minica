@@ -300,6 +300,9 @@
   "template.submit_create": "Crea modello",
   "template.submit_update": "Salva modello",
   "template.unset": "— non impostato —",
+  "validity.ca_max_confirm": "Il certificato della CA scade prima, quindi questo certificato può essere valido al massimo {max} giorni. Vuoi usare questo valore?",
+  "validity.max_confirm": "Il valore massimo è {max} giorni. Vuoi usare questo valore?",
+  "validity.use_max": "Usa {max} giorni",
   "validity.expired": "scaduto {days} giorno/i fa",
   "validity.left": "{days} giorno/i rimasti",
   "validity.today": "scade oggi"

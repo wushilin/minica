@@ -300,6 +300,9 @@
   "template.submit_create": "Δημιουργία προτύπου",
   "template.submit_update": "Αποθήκευση προτύπου",
   "template.unset": "— δεν έχει οριστεί —",
+  "validity.ca_max_confirm": "Το πιστοποιητικό CA λήγει πρώτο, επομένως αυτό το πιστοποιητικό μπορεί να ισχύει το πολύ {max} ημέρες. Θέλετε να χρησιμοποιήσετε αυτήν την τιμή;",
+  "validity.max_confirm": "Η μέγιστη τιμή είναι {max} ημέρες. Θέλετε να τη χρησιμοποιήσετε;",
+  "validity.use_max": "Χρήση {max} ημερών",
   "validity.expired": "έληξε πριν από {days} ημέρα(ες)",
   "validity.left": "απομένουν {days} ημέρα(ες)",
   "validity.today": "λήγει σήμερα"

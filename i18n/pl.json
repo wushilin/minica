@@ -300,6 +300,9 @@
   "template.submit_create": "Utwórz szablon",
   "template.submit_update": "Zapisz szablon",
   "template.unset": "— nie ustawiono —",
+  "validity.ca_max_confirm": "Certyfikat CA wygasa wcześniej, więc ten certyfikat może być ważny najwyżej {max} dni. Czy chcesz użyć tej wartości?",
+  "validity.max_confirm": "Maksymalna wartość to {max} dni. Czy chcesz jej użyć?",
+  "validity.use_max": "Użyj {max} dni",
   "validity.expired": "wygasł {days} dni temu",
   "validity.left": "pozostało {days} dni",
   "validity.today": "wygasa dzisiaj"

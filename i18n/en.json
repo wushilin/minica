@@ -300,6 +300,9 @@
   "template.submit_create": "Create Template",
   "template.submit_update": "Save Template",
   "template.unset": "— not set —",
+  "validity.ca_max_confirm": "The CA certificate expires first, so this certificate can be valid for at most {max} days. Would you like to use this instead?",
+  "validity.max_confirm": "The maximum value is {max} days. Would you like to use this instead?",
+  "validity.use_max": "Use {max} days",
   "validity.expired": "expired {days} day(s) ago",
   "validity.left": "{days} day(s) left",
   "validity.today": "expires today"

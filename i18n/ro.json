@@ -300,6 +300,9 @@
   "template.submit_create": "Creează șablon",
   "template.submit_update": "Salvează șablonul",
   "template.unset": "— nesetat —",
+  "validity.ca_max_confirm": "Certificatul CA expiră primul, deci acest certificat poate fi valabil cel mult {max} zile. Doriți să folosiți această valoare?",
+  "validity.max_confirm": "Valoarea maximă este {max} zile. Doriți să o folosiți?",
+  "validity.use_max": "Folosește {max} zile",
   "validity.expired": "a expirat acum {days} zi(le)",
   "validity.left": "mai are {days} zi(le)",
   "validity.today": "expiră astăzi"
