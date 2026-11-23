@@ -19,7 +19,7 @@ use base64::Engine;
 use crate::config::{CertificatesConfig, days_until_x509_limit};
 use crate::settings::{EffectiveEntry, LiveSettings, SettingAudit, SettingRow};
 use std::sync::{Arc, RwLock};
-use chrono::{NaiveDateTime, TimeZone, Utc};
+use chrono::{Datelike, NaiveDateTime, TimeZone, Utc};
 use rand::{Rng, distr::Alphanumeric};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -649,7 +649,8 @@ impl AppService {
         }
         self.ensure_unique_cert_common_name(ca_id, &req.common_name)?;
         let ca = self.db.get_ca(ca_id)?;
-        let valid_days = self.clamp_to_ca_validity(&ca.cert_pem, req.valid_days)?;
+        let capped = self.clamp_to_ca_validity(&ca.cert_pem, req.valid_days)?;
+        let valid_days = capped.days;
         let crl_url = self.issuing_crl_url(ca_id)?;
         let subject = create_subject(
             &req.common_name,
@@ -673,6 +674,7 @@ impl AppService {
                 &subject,
                 &req.common_name,
                 valid_days,
+                capped.not_after.as_deref(),
                 &digest,
                 &key.algorithm,
                 &key.attributes,
@@ -866,13 +868,15 @@ impl AppService {
             bail!("certificate is revoked and cannot be renewed; issue a new certificate instead");
         }
         let ca = self.db.get_ca(ca_id)?;
-        let requested_days = days;
-        let days = self.clamp_to_ca_validity(&ca.cert_pem, days)?;
+        let capped = self.clamp_to_ca_validity(&ca.cert_pem, days)?;
+        let days = capped.days;
         let now = Utc::now().timestamp_millis();
-        let current_expiry = cert.issue_time + cert.valid_days * 86_400_000;
-        let proposed_expiry = now + days * 86_400_000;
+        // Whole-day metadata can round past the CA's exact expiry.
+        let within_ca = |time: i64| capped.ca_expiry.map_or(time, |end| time.min(end));
+        let current_expiry = within_ca(cert.issue_time + cert.valid_days * DAY_MS);
+        let proposed_expiry = within_ca(now + days * DAY_MS);
         if proposed_expiry <= current_expiry {
-            if days < requested_days {
+            if capped.not_after.is_some() {
                 bail!(
                     "renewal would not extend the certificate expiry: the CA certificate expires first"
                 );
@@ -932,6 +936,7 @@ impl AppService {
                     ip_list: &ip_list,
                 },
                 days,
+                capped.not_after.as_deref(),
                 &digest,
                 crl_url.as_deref(),
                 self.crl().next_update_days,
@@ -1626,42 +1631,48 @@ impl AppService {
         Ok(())
     }
 
-    /// Whole days until the CA certificate expires, if its expiry is readable.
-    fn ca_days_left(&self, ca_cert_pem: &str) -> Result<Option<i64>> {
+    /// When the CA certificate expires, in Unix milliseconds, if readable.
+    fn ca_expiry(&self, ca_cert_pem: &str) -> Result<Option<i64>> {
         let work = self.openssl.workdir()?;
         let info = self.openssl.inspect_cert(work.path(), ca_cert_pem)?;
-        Ok(info_value(&info, "notAfter")
-            .and_then(|v| parse_openssl_date(&v))
-            .map(|not_after| (not_after - Utc::now().timestamp_millis()) / 86_400_000))
+        Ok(info_value(&info, "notAfter").and_then(|v| parse_openssl_date(&v)))
     }
 
-    /// The longest validity a new certificate from this CA can get, for the
-    /// forms to offer. `None` when it cannot be determined or the CA is ending.
+    /// The smallest whole number of days that reaches the CA's expiry, for the
+    /// forms to offer. `None` when unreadable or the CA has under a day left.
     pub fn max_cert_days(&self, ca_id: &str) -> Option<i64> {
         let ca = self.db.get_ca(ca_id).ok()?;
-        self.ca_days_left(&ca.cert_pem).ok().flatten().filter(|days| *days >= 1)
+        let left = self.ca_expiry(&ca.cert_pem).ok()?? - Utc::now().timestamp_millis();
+        (left >= DAY_MS).then(|| days_to_reach(left))
     }
 
     /// Caps a leaf validity so it never outlives the issuing CA certificate.
-    /// Returns the effective number of days (recorded as the cert's
-    /// `valid_days`).
-    fn clamp_to_ca_validity(&self, ca_cert_pem: &str, days: i64) -> Result<i64> {
-        let Some(max_days) = self.ca_days_left(ca_cert_pem)? else {
+    /// A request that reaches the CA's expiry ends at exactly that moment.
+    fn clamp_to_ca_validity(&self, ca_cert_pem: &str, days: i64) -> Result<CappedValidity> {
+        let Some(ca_expiry) = self.ca_expiry(ca_cert_pem)? else {
             tracing::warn!("could not read CA notAfter; leaf validity not clamped");
-            return Ok(days);
+            return Ok(CappedValidity { days, not_after: None, ca_expiry: None });
         };
-        if max_days < 1 {
+        let left = ca_expiry - Utc::now().timestamp_millis();
+        if left < DAY_MS {
             bail!("the CA certificate expires within a day; it can no longer issue certificates");
         }
-        if days > max_days {
+        if days.saturating_mul(DAY_MS) < left {
+            return Ok(CappedValidity { days, not_after: None, ca_expiry: Some(ca_expiry) });
+        }
+        let effective_days = days_to_reach(left);
+        if days > effective_days {
             tracing::warn!(
                 requested_days = days,
-                effective_days = max_days,
+                effective_days,
                 "clamping certificate validity to the CA certificate's expiry"
             );
-            return Ok(max_days);
         }
-        Ok(days)
+        Ok(CappedValidity {
+            days: effective_days,
+            not_after: Some(x509_time(ca_expiry)?),
+            ca_expiry: Some(ca_expiry),
+        })
     }
 
     /// The subject of `pem` as the certificate states it: the full DN in
@@ -2641,6 +2652,32 @@ fn info_value(info: &[(String, String)], key: &str) -> Option<String> {
         .map(|(_, v)| v.to_string())
 }
 
+const DAY_MS: i64 = 86_400_000;
+
+/// A leaf validity after applying the issuing CA's expiry.
+struct CappedValidity {
+    /// Whole days, rounded up when the certificate ends with the CA.
+    days: i64,
+    /// The exact end time for OpenSSL when the certificate ends with the CA.
+    not_after: Option<String>,
+    ca_expiry: Option<i64>,
+}
+
+/// The smallest whole number of days covering `millis`.
+fn days_to_reach(millis: i64) -> i64 {
+    (millis + DAY_MS - 1) / DAY_MS
+}
+
+/// RFC 5280 time: UTCTime through 2049, GeneralizedTime from 2050.
+fn x509_time(millis: i64) -> Result<String> {
+    let time = Utc
+        .timestamp_millis_opt(millis)
+        .single()
+        .ok_or_else(|| anyhow::anyhow!("invalid certificate time"))?;
+    let format = if time.year() < 2050 { "%y%m%d%H%M%SZ" } else { "%Y%m%d%H%M%SZ" };
+    Ok(time.format(format).to_string())
+}
+
 fn parse_openssl_date(value: &str) -> Option<i64> {
     NaiveDateTime::parse_from_str(value.trim(), "%b %e %H:%M:%S %Y GMT")
         .ok()
@@ -2652,6 +2689,44 @@ mod tests {
     use super::*;
     use crate::config::OpenSslConfig;
     use std::path::PathBuf;
+
+    #[test]
+    fn capped_certificates_end_exactly_with_their_ca() {
+        let (service, root) = temp_service();
+        let not_after = |pem: &str| {
+            let work = service.openssl.workdir().unwrap();
+            let info = service.openssl.inspect_cert(work.path(), pem).unwrap();
+            info_value(&info, "notAfter").unwrap()
+        };
+        let ca = service.create_ca(ca_request("Exact CA", 40)).unwrap();
+        let end = not_after(&ca.cert_pem);
+
+        let created = service
+            .create_cert(&ca.id, cert_request("capped.test", 5000, &["capped.test"]))
+            .unwrap();
+        assert_eq!(not_after(&created.cert_pem), end);
+        assert_eq!(created.valid_days, 40);
+        let err = service.renew_cert(&ca.id, &created.id, 5000).unwrap_err();
+        assert!(err.to_string().contains("CA certificate expires first"), "{err}");
+
+        let offered = service.max_cert_days(&ca.id).unwrap();
+        let short = service
+            .create_cert(&ca.id, cert_request("short.test", 10, &["short.test"]))
+            .unwrap();
+        assert_ne!(not_after(&short.cert_pem), end);
+        let renewed = service.renew_cert(&ca.id, &short.id, offered).unwrap();
+        assert_eq!(not_after(&renewed.cert_pem), end);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn x509_times_follow_rfc_5280() {
+        let at = |y, m, d| Utc.with_ymd_and_hms(y, m, d, 5, 33, 19).unwrap().timestamp_millis();
+        assert_eq!(x509_time(at(2042, 1, 12)).unwrap(), "420112053319Z");
+        assert_eq!(x509_time(at(2049, 12, 31)).unwrap(), "491231053319Z");
+        assert_eq!(x509_time(at(2050, 1, 1)).unwrap(), "20500101053319Z");
+        assert_eq!(x509_time(at(9999, 12, 31)).unwrap(), "99991231053319Z");
+    }
 
     fn temp_service() -> (AppService, PathBuf) {
         let root = std::env::temp_dir().join(format!("minica-service-test-{}", Uuid::new_v4()));
@@ -3338,7 +3413,7 @@ mod tests {
                 cert_request("leaf.example.com", 400, &["alt.example.com"]),
             )
             .unwrap();
-        assert!(cert.valid_days < 30, "valid_days {}", cert.valid_days);
+        assert_eq!(cert.valid_days, 30, "ends with the CA");
         assert_eq!(cert.dns_list, vec!["leaf.example.com", "alt.example.com"]);
         let text = openssl_text(
             &service,
@@ -3348,6 +3423,13 @@ mod tests {
         assert!(text.contains("ecdsa-with-SHA384"), "{text}");
 
         // Renewal keeps SANs (imported certs too) and reissues a new serial.
+        service.delete_cert(&ca.id, &cert.id).unwrap();
+        let cert = service
+            .create_cert(
+                &ca.id,
+                cert_request("leaf.example.com", 10, &["alt.example.com"]),
+            )
+            .unwrap();
         let renewed = service.renew_cert(&ca.id, &cert.id, 29).unwrap();
         assert_ne!(renewed.cert_pem, cert.cert_pem);
         service.delete_cert(&ca.id, &cert.id).unwrap();

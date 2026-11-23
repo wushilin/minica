@@ -844,7 +844,7 @@ async fn ca_detail(
                     u(state, &format!("/cas/{}/certs/{}", ca.id, cert.id)),
                     h(&cert.common_name),
                     h(&cert.id),
-                    date(cert.issue_time + cert.valid_days * 86_400_000),
+                    date(cert_expiry(cert.issue_time, cert.valid_days, &ca)),
                     h(&cert.dns_list.join(", ")),
                     if user.role.can_write() {
                         format!(
@@ -906,6 +906,16 @@ async fn renew_ca_form(
         ))
     })
     .await
+}
+
+/// A certificate's expiry for display. Validity is stored in whole days, so one
+/// that ends with its CA can round up past it by less than a day. A certificate
+/// that really outlives its CA keeps its own date.
+fn cert_expiry(issue_time: i64, valid_days: i64, ca: &CertificateAuthority) -> i64 {
+    const DAY_MS: i64 = 86_400_000;
+    let expiry = issue_time + valid_days * DAY_MS;
+    let ca_expiry = ca.issue_time + ca.valid_days * DAY_MS;
+    if (1..DAY_MS).contains(&(expiry - ca_expiry)) { ca_expiry } else { expiry }
 }
 
 /// Tells the page script how long a certificate from this CA can last.
@@ -1309,7 +1319,7 @@ async fn cert_detail(
             t(lang, "field.ip_sans"),
             san_badges(&cert.ip_list, &t(lang, "san.ip")),
             t(lang, "field.valid_until"),
-            validity_label(lang, cert.issue_time + cert.valid_days * 86_400_000),
+            validity_label(lang, cert_expiry(cert.issue_time, cert.valid_days, &ca)),
             t(lang, "field.algorithm"),
             h(&cert.digest_algorithm),
             t(lang, "field.key_size"),

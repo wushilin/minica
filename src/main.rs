@@ -3650,7 +3650,7 @@ mod tests {
         // A flash message after an action, rendered on the next page.
         let renew = post(
             format!("/minica/cas/{ca}/certs/{cert}/renew"),
-            format!("_csrf={}&days=30", csrf.token),
+            format!("_csrf={}&days=20", csrf.token),
             cookie.clone(),
         )
         .await;
@@ -3967,7 +3967,7 @@ mod tests {
         let uri = format!("/minica/cas/{ca_id}/certs/new");
         let page = env.send("GET", &uri, admin, None, None, Body::empty()).await;
         page.assert_status(StatusCode::OK);
-        assert!(page.text().contains(r#"data-ca-max-days="99""#), "CA limit missing");
+        assert!(page.text().contains(r#"data-ca-max-days="100""#), "CA limit missing");
 
         // The server stays strict for API clients and still caps at the CA.
         let mut over = ca_payload("over.limit");
@@ -3980,7 +3980,7 @@ mod tests {
             .json("PUT", &format!("/minica/api/cas/{ca_id}/certs"), admin, Some(&csrf), cert)
             .await;
         cert.assert_status(StatusCode::OK);
-        assert_eq!(cert.json()["valid_days"], json!(99));
+        assert_eq!(cert.json()["valid_days"], json!(100));
     }
 
     #[tokio::test]
