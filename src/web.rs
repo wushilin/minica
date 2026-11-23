@@ -164,6 +164,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/admin", get(admin_console))
         .route("/swagger", get(swagger_page))
+        .route("/how-to-use", get(how_to_use))
         .route("/lang/{code}", get(switch_lang))
         .route("/logout", get(logout))
         .route("/admin/backup", get(admin_backup_export))
@@ -172,6 +173,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(admin_backup_restore).layer(DefaultBodyLimit::max(RESTORE_BODY_LIMIT)),
         )
         .route("/admin/nuke", post(admin_nuke))
+        .route("/admin/settings", post(admin_save_setting))
+        .route("/admin/settings/delete", post(admin_delete_setting))
+        .route("/admin/settings/check", post(admin_check_setting))
         .route("/admin/users", post(admin_create_user))
         .route("/admin/users/{user_id}/delete", post(admin_delete_user))
         .route("/admin/cas/{ca_id}/restore", post(admin_restore_ca))
@@ -381,6 +385,26 @@ pub async fn home(
     response
 }
 
+/// The public guide to trusting a CA, in the visitor's language.
+async fn how_to_use(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let lang = request_lang(&headers);
+    let base = state.config.server.base_path.trim_end_matches('/');
+    let public_base = state.service.public_base_url();
+    let body = crate::guide::render(
+        lang,
+        public_base.as_deref(),
+        &t(lang, "guide.contents"),
+    );
+    let login = format!(
+        r#"<a class="topbar-link topbar-login" href="{base}/cas">{}</a>"#,
+        t(lang, "nav.login")
+    );
+    let index = format!("{base}/");
+    let mut response = Html(layout_with(base, lang, &body, &index, "", &login)).into_response();
+    refresh_lang_cookie(&state, &headers, &mut response);
+    response
+}
+
 /// Prev / numbered / Next links for a CA list. Shows the first and last
 /// page plus two either side of the current one, with gaps elided.
 fn ca_pager(lang: Lang, index: &str, filter: &str, page: usize, pages: usize) -> String {
@@ -555,7 +579,8 @@ fn ca_form_page(
             csrf,
             &t(lang, "ca.new.submit"),
             &template_picker(lang, "ca-templates", &presets, &builtin_form_base()),
-            values
+            values,
+            state.service.max_valid_days()
         )
     ))
 }
@@ -702,6 +727,7 @@ async fn ca_detail(
 ) -> Response {
     let lang = request_lang(&headers);
     page_response(state, headers, move |state, user, csrf| {
+        let max_days = state.service.max_valid_days();
         let ca = state.service.get_ca(&ca_id)?;
         let certs = state.service.list_certs(&ca_id)?;
         let mut body = breadcrumb(lang, &[
@@ -744,7 +770,7 @@ async fn ca_detail(
             String::new()
         } else if state.service.ca_is_self_signed(&ca.cert_pem).unwrap_or(false) {
             format!(
-                r#"<dt>{}</dt><dd><form method="post" action="{}" class="renew-sentence"><input type="hidden" name="_csrf" value="{}"><button type="submit" class="btn btn-sm btn-warning" data-renew="{}">{}</button><span>{}</span><input class="form-control form-control-sm" type="number" min="1" max="7350" name="days" value="3650" aria-label="{}"><span>{}</span></form></dd>"#,
+                r#"<dt>{}</dt><dd><form method="post" action="{}" class="renew-sentence"><input type="hidden" name="_csrf" value="{}"><button type="submit" class="btn btn-sm btn-warning" data-renew="{}">{}</button><span>{}</span><input class="form-control form-control-sm" type="number" min="1" max="{max_days}" name="days" value="3650" aria-label="{}"><span>{}</span></form></dd>"#,
                 t(lang, "field.renewal"),
                 u(state, &format!("/cas/{}/renew", ca.id)),
                 h(&csrf),
@@ -909,7 +935,8 @@ fn cert_form_page(
             lang,
             csrf,
             &template_picker(lang, "cert-templates", &presets, &cert_form_base(ca)),
-            values
+            values,
+            state.service.max_valid_days()
         )
     ))
 }
@@ -1190,6 +1217,7 @@ async fn cert_detail(
 ) -> Response {
     let lang = request_lang(&headers);
     page_response(state, headers, move |state, user, csrf| {
+        let max_days = state.service.max_valid_days();
         let cert = state.service.get_cert(&ca_id, &cert_id)?;
         let ca = state.service.get_ca(&ca_id)?;
         let purposes = state
@@ -1206,7 +1234,7 @@ async fn cert_detail(
         ]);
         let renew = if user.role.can_write() {
             format!(
-                r#"<dt>{}</dt><dd><form method="post" action="{}" class="renew-sentence"><input type="hidden" name="_csrf" value="{}"><button type="submit" class="btn btn-sm btn-warning" data-renew="{}">{}</button><span>{}</span><input class="form-control form-control-sm" type="number" min="1" max="7350" name="days" value="365" aria-label="{}"><span>{}</span></form></dd>"#,
+                r#"<dt>{}</dt><dd><form method="post" action="{}" class="renew-sentence"><input type="hidden" name="_csrf" value="{}"><button type="submit" class="btn btn-sm btn-warning" data-renew="{}">{}</button><span>{}</span><input class="form-control form-control-sm" type="number" min="1" max="{max_days}" name="days" value="365" aria-label="{}"><span>{}</span></form></dd>"#,
                 t(lang, "field.renewal"),
                 u(state, &format!("/cas/{ca_id}/certs/{cert_id}/renew")),
                 h(&csrf),
@@ -1674,6 +1702,7 @@ fn template_form_page(
         opt("sha384", "SHA-384", &values.digest_algorithm),
         opt("sha512", "SHA-512", &values.digest_algorithm)
     );
+    let max_days = state.service.max_valid_days();
     let unset_key = format!(
         r#"<option value=""{}>{}</option>"#,
         if values.key_profile.is_empty() { " selected" } else { "" },
@@ -1689,7 +1718,7 @@ fn template_form_page(
         opt("ecdsa:secp521r1", "ECDSA P-521 / secp521r1", &values.key_profile)
     );
     format!(
-        r#"{crumbs}<h1>{title}</h1><p class="muted">{help}</p>{error}<form method="post" action="{action}" class="form-grid"><input type="hidden" name="_csrf" value="{csrf}"><div class="grid2"><label>{l_name}<input class="form-control" name="name" value="{name}" maxlength="100" required></label><label>{l_scope}<select class="form-select" name="scope">{scope_options}</select></label><label>{l_cc}<input class="form-control" name="country_code" value="{cc}" maxlength="2"></label><label>{l_st}<input class="form-control" name="state" value="{st}"></label><label>{l_ci}<input class="form-control" name="city" value="{ci}"></label><label>{l_org}<input class="form-control" name="organization" value="{org}"></label><label>{l_ou}<input class="form-control" name="organization_unit" value="{ou}"></label><label>{l_vd}<input class="form-control" type="number" min="1" max="7350" name="valid_days" value="{vd}"></label><label>{l_digest}<select class="form-select" name="digest_algorithm">{digest}</select></label><label>{l_kp}<select class="form-select" name="key_profile">{key_profiles}</select></label></div><label class="check-row"><input type="checkbox" name="is_default" value="1"{checked}> {l_default} <span class="muted">{default_help}</span></label><button class="btn btn-primary">{submit}</button></form>"#,
+        r#"{crumbs}<h1>{title}</h1><p class="muted">{help}</p>{error}<form method="post" action="{action}" class="form-grid"><input type="hidden" name="_csrf" value="{csrf}"><div class="grid2"><label>{l_name}<input class="form-control" name="name" value="{name}" maxlength="100" required></label><label>{l_scope}<select class="form-select" name="scope">{scope_options}</select></label><label>{l_cc}<input class="form-control" name="country_code" value="{cc}" maxlength="2"></label><label>{l_st}<input class="form-control" name="state" value="{st}"></label><label>{l_ci}<input class="form-control" name="city" value="{ci}"></label><label>{l_org}<input class="form-control" name="organization" value="{org}"></label><label>{l_ou}<input class="form-control" name="organization_unit" value="{ou}"></label><label>{l_vd}<input class="form-control" type="number" min="1" max="{max_days}" name="valid_days" value="{vd}"></label><label>{l_digest}<select class="form-select" name="digest_algorithm">{digest}</select></label><label>{l_kp}<select class="form-select" name="key_profile">{key_profiles}</select></label></div><label class="check-row"><input type="checkbox" name="is_default" value="1"{checked}> {l_default} <span class="muted">{default_help}</span></label><button class="btn btn-primary">{submit}</button></form>"#,
         crumbs = breadcrumb(lang, &[
             (t(lang, "crumb.home"), Some(u(state, "/cas"))),
             (t(lang, "nav.templates"), Some(u(state, "/templates"))),
@@ -2014,6 +2043,250 @@ async fn admin_delete_user(
     .await
 }
 
+/// The Configuration tab: database settings, the values in use with their
+/// source, and the change history. Rendered only through the admin page.
+fn admin_configuration_section(state: &Arc<AppState>, lang: Lang, csrf: &str) -> Result<String> {
+    use crate::settings::{ConfigOption, SettingStatus, Source, status};
+    let rows = state.service.list_settings()?;
+    let effective = state.service.effective_config(&state.config)?;
+    let audit = state.service.settings_audit(50)?;
+    let save = u(state, "/admin/settings");
+    let delete = u(state, "/admin/settings/delete");
+    let check = u(state, "/admin/settings/check");
+    let csrf = h(csrf);
+    let code = |text: &str| format!(r#"<code translate="no">{}</code>"#, h(text));
+    let optional = |value: &Option<String>| value.as_deref().map(&code).unwrap_or_default();
+
+    let mut out = format!(
+        r#"<section id="admin-configuration" class="panel tab-panel admin-config" hidden><h2>{}</h2><p class="muted">{}</p>"#,
+        t(lang, "admin.tab_configuration"),
+        t(lang, "config.help")
+    );
+    if state.service.settings_ignored() {
+        out.push_str(&format!(
+            r#"<div class="alert alert-warning" role="status">{}</div>"#,
+            t(lang, "config.ignored")
+        ));
+    }
+
+    let key_options: String = ConfigOption::editable_options()
+        .map(|option| format!(r#"<option value="{}"></option>"#, option.name()))
+        .collect();
+    out.push_str(&format!(
+        r#"<h3>{title}</h3><form method="post" action="{save}" class="user-form" data-setting-check="{check}"><input type="hidden" name="_csrf" value="{csrf}"><div class="grid3"><label>{key}<input class="form-control" name="key" list="setting-keys" maxlength="128" dir="ltr" required></label><label>{value}<input class="form-control" name="value" maxlength="4096" dir="ltr"></label><label class="setting-enabled"><input type="checkbox" name="enabled" value="1" checked> {enabled}</label></div><datalist id="setting-keys">{key_options}</datalist><button type="submit" class="btn btn-primary">{submit}</button></form>"#,
+        title = t(lang, "config.add_title"),
+        key = t(lang, "config.key"),
+        value = t(lang, "config.value"),
+        enabled = t(lang, "config.enabled"),
+        submit = t(lang, "config.save"),
+    ));
+
+    out.push_str(&format!("<h3>{}</h3>", t(lang, "config.overrides_title")));
+    if rows.is_empty() {
+        out.push_str(&format!(r#"<p class="muted">{}</p>"#, t(lang, "config.none")));
+    } else {
+        out.push_str(r#"<div class="setting-cards">"#);
+        for (index, row) in rows.iter().enumerate() {
+            let form_id = format!("setting-{index}");
+            let badge = match status(row) {
+                SettingStatus::Active => {
+                    format!(r#"<span class="badge text-bg-success">{}</span>"#, t(lang, "config.status_active"))
+                }
+                SettingStatus::Disabled => {
+                    format!(r#"<span class="badge text-bg-secondary">{}</span>"#, t(lang, "config.status_disabled"))
+                }
+                SettingStatus::NoEffect => {
+                    format!(r#"<span class="badge text-bg-warning">{}</span>"#, t(lang, "config.status_no_effect"))
+                }
+            };
+            out.push_str(&format!(
+                r#"<article class="setting-card"><div class="setting-card-head">{key_code}{badge}<span class="setting-card-updated muted">{updated_label}: {updated} <span translate="no">{actor}</span></span></div><div class="setting-card-body"><div class="setting-card-field"><input form="{form_id}" class="form-control form-control-sm" name="value" value="{value}" maxlength="4096" dir="ltr" aria-label="{value_label}"></div><label class="setting-enabled"><input form="{form_id}" type="checkbox" name="enabled" value="1"{checked}> {enabled_label}</label><div class="setting-card-actions"><form id="{form_id}" method="post" action="{save}" data-setting-check="{check}"><input type="hidden" name="_csrf" value="{csrf}"><input type="hidden" name="key" value="{key}"><button type="submit" class="btn btn-sm btn-primary">{save_label}</button></form><form method="post" action="{delete}"><input type="hidden" name="_csrf" value="{csrf}"><input type="hidden" name="key" value="{key}"><button type="submit" class="btn btn-sm btn-outline-danger" data-confirm="{confirm}">{delete_label}</button></form></div></div></article>"#,
+                key_code = code(&row.key),
+                key = h(&row.key),
+                value = h(&row.value),
+                value_label = t(lang, "config.value"),
+                checked = if row.enabled { " checked" } else { "" },
+                enabled_label = t(lang, "config.enabled"),
+                updated_label = t(lang, "config.updated"),
+                updated = date(row.updated_at),
+                actor = h(&row.updated_by),
+                save_label = t(lang, "config.save"),
+                confirm = tf(lang, "config.delete_confirm", &[("name", &row.key)]),
+                delete_label = t(lang, "action.delete"),
+            ));
+        }
+        out.push_str("</div>");
+    }
+
+    out.push_str(&format!(
+        r#"<h3>{}</h3><p class="muted">{}</p><div class="config-cards">"#,
+        t(lang, "config.effective_title"),
+        t(lang, "config.effective_help"),
+    ));
+    let none = r#"<span class="muted">—</span>"#;
+    let required_mark = format!(
+        r#"<svg class="config-required" viewBox="0 0 16 16" width="15" height="15" role="img" aria-label="{}"><path d="M3 8.5 6.5 12 13 4.5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>"#,
+        t(lang, "config.required")
+    );
+    for entry in &effective {
+        let value = match &entry.value {
+            Some(value) => code(value),
+            None => format!(r#"<span class="muted">{}</span>"#, t(lang, "config.not_set")),
+        };
+        let (source, source_class) = match &entry.source {
+            Source::Sqlite => (t(lang, "config.source_sqlite"), "text-bg-primary"),
+            Source::File => (t(lang, "config.source_file"), "text-bg-secondary"),
+            Source::Environment(name) => (
+                tf(lang, "config.source_environment", &[("name", name)]),
+                "text-bg-info",
+            ),
+            Source::Default => (t(lang, "config.source_default"), "text-bg-light border"),
+        };
+        out.push_str(&format!(
+            r#"<article class="config-card"><div class="config-card-key">{key}<button type="button" class="config-info" translate="no" aria-label="{docs}">i</button><span class="config-tip" role="tooltip" translate="no" lang="en" dir="ltr">{docs}</span></div><div class="config-card-value">{value}</div><dl class="config-card-meta"><dt>{type_label}</dt><dd>{type_value}</dd><dt>{required_label}</dt><dd>{required}</dd><dt>{default_label}</dt><dd>{default}</dd><dt>{source_label}</dt><dd><span class="badge {source_class}">{source}</span></dd></dl></article>"#,
+            key = code(&entry.key),
+            docs = h(entry.option.docs()),
+            type_label = t(lang, "config.type"),
+            type_value = code(entry.option.value_type().describe()),
+            required_label = t(lang, "config.required"),
+            required = if entry.option.required() { required_mark.as_str() } else { none },
+            default_label = t(lang, "config.default"),
+            default = entry.option.default_text().map(&code).unwrap_or_else(|| none.to_string()),
+            source_label = t(lang, "config.source"),
+        ));
+    }
+    out.push_str("</div>");
+
+    out.push_str(&format!("<h3>{}</h3>", t(lang, "config.audit_title")));
+    if audit.is_empty() {
+        out.push_str(&format!(r#"<p class="muted">{}</p>"#, t(lang, "config.audit_none")));
+    } else {
+        out.push_str(&format!(
+            r#"<div class="table-responsive"><table class="table"><thead><tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th></tr></thead><tbody>"#,
+            t(lang, "config.when"),
+            t(lang, "config.actor"),
+            t(lang, "config.key"),
+            t(lang, "config.action"),
+            t(lang, "config.old_value"),
+            t(lang, "config.new_value")
+        ));
+        for item in &audit {
+            let action = match item.action.as_str() {
+                "created" => t(lang, "config.action_created"),
+                "updated" => t(lang, "config.action_updated"),
+                "enabled" => t(lang, "config.action_enabled"),
+                "disabled" => t(lang, "config.action_disabled"),
+                "deleted" => t(lang, "config.action_deleted"),
+                "restored" => t(lang, "config.action_restored"),
+                "cleared" => t(lang, "config.action_cleared"),
+                other => h(other),
+            };
+            out.push_str(&format!(
+                r#"<tr><td>{}</td><td><span translate="no">{}</span></td><td>{}</td><td>{action}</td><td>{}</td><td>{}</td></tr>"#,
+                date(item.at),
+                h(&item.actor),
+                code(&item.key),
+                optional(&item.old_value),
+                optional(&item.new_value)
+            ));
+        }
+        out.push_str("</tbody></table></div>");
+    }
+    out.push_str("</section>");
+    Ok(out)
+}
+
+#[derive(Deserialize)]
+struct SettingForm {
+    _csrf: String,
+    key: String,
+    #[serde(default)]
+    value: String,
+    enabled: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SettingDeleteForm {
+    _csrf: String,
+    key: String,
+}
+
+/// Always returns to the Configuration tab, with the outcome as a flash.
+fn setting_result(state: &Arc<AppState>, result: Result<()>, success: String) -> Response {
+    let target = format!("{}#admin-configuration", u(state, "/admin"));
+    match result {
+        Ok(()) => redirect_with_flash(state, &target, "success", &success),
+        Err(err) => redirect_with_flash(state, &target, "error", &err.to_string()),
+    }
+}
+
+/// Live validation for the Configuration forms. Runs the same checks as saving
+/// and stores nothing.
+async fn admin_check_setting(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<SettingForm>,
+) -> Response {
+    let (key, value) = (form.key, form.value);
+    match admin_blocking(&state, &headers, Some(form._csrf), move |_| {
+        use crate::settings::{normalize_value, validate_key};
+        Ok(match validate_key(&key) {
+            Err(err) => serde_json::json!({ "ok": false, "field": "key", "error": err.to_string() }),
+            Ok(key) => match normalize_value(&key, &value) {
+                Err(err) => serde_json::json!({ "ok": false, "field": "value", "error": err.to_string() }),
+                Ok(_) => serde_json::json!({ "ok": true }),
+            },
+        })
+    })
+    .await
+    {
+        Ok(result) => Json(result).into_response(),
+        Err(err) => error_response(&state, &headers, err),
+    }
+}
+
+async fn admin_save_setting(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<SettingForm>,
+) -> Response {
+    let lang = request_lang(&headers);
+    let success = tr(lang, "flash.setting_saved", &[("name", form.key.trim())]);
+    let task_headers = headers.clone();
+    let (key, value, enabled) = (form.key, form.value, form.enabled.is_some());
+    let result = match admin_blocking(&state, &headers, Some(form._csrf), move |state| {
+        let actor = auth::require_admin(&task_headers, state)?.username;
+        Ok(state.service.save_setting(&key, &value, enabled, &actor))
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => return error_response(&state, &headers, err),
+    };
+    setting_result(&state, result, success)
+}
+
+async fn admin_delete_setting(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<SettingDeleteForm>,
+) -> Response {
+    let lang = request_lang(&headers);
+    let success = tr(lang, "flash.setting_deleted", &[("name", form.key.trim())]);
+    let task_headers = headers.clone();
+    let key = form.key;
+    let result = match admin_blocking(&state, &headers, Some(form._csrf), move |state| {
+        let actor = auth::require_admin(&task_headers, state)?.username;
+        Ok(state.service.delete_setting(&key, &actor))
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => return error_response(&state, &headers, err),
+    };
+    setting_result(&state, result, success)
+}
+
 async fn admin_backup_export(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     match admin_blocking(&state, &headers, None, |state| {
         state.service.export_backup_yaml()
@@ -2194,10 +2467,11 @@ fn admin_console_body(
     }
 
     body.push_str(&format!(
-        r#"<div class="admin-shell"><nav class="admin-menu tabs" aria-label="{}"><button type="button" class="admin-menu-item tab-btn active" data-tab="admin-maintenance">{}</button><button type="button" class="admin-menu-item tab-btn" data-tab="admin-users">{}</button><button type="button" class="admin-menu-item tab-btn" data-tab="admin-deleted-cas">{}</button><button type="button" class="admin-menu-item tab-btn" data-tab="admin-deleted-certs">{}</button></nav><div class="admin-content">"#,
+        r#"<div class="admin-shell"><nav class="admin-menu tabs" aria-label="{}"><button type="button" class="admin-menu-item tab-btn active" data-tab="admin-maintenance">{}</button><button type="button" class="admin-menu-item tab-btn" data-tab="admin-users">{}</button><button type="button" class="admin-menu-item tab-btn" data-tab="admin-configuration">{}</button><button type="button" class="admin-menu-item tab-btn" data-tab="admin-deleted-cas">{}</button><button type="button" class="admin-menu-item tab-btn" data-tab="admin-deleted-certs">{}</button></nav><div class="admin-content">"#,
         t(lang, "admin.sections_aria"),
         t(lang, "admin.tab_backup"),
         t(lang, "admin.tab_users"),
+        t(lang, "admin.tab_configuration"),
         t(lang, "admin.tab_deleted_cas"),
         t(lang, "admin.tab_deleted_certs")
     ));
@@ -2276,6 +2550,8 @@ fn admin_console_body(
         body.push_str("</tbody></table>");
     }
     body.push_str("</section>");
+
+    body.push_str(&admin_configuration_section(state, lang, csrf)?);
 
     // Deleted CAs
     body.push_str(&format!(
@@ -3810,7 +4086,7 @@ fn error_banner_html(message_html: &str) -> String {
     format!(r#"<div class="alert-error" role="alert">{message_html}</div>"#)
 }
 
-fn subject_fields_common(lang: Lang, v: &SubjectValues) -> String {
+fn subject_fields_common(lang: Lang, v: &SubjectValues, max_days: i64) -> String {
     let digest = format!(
         "{}{}{}",
         opt("sha512", "SHA-512", &v.digest_algorithm),
@@ -3831,7 +4107,7 @@ fn subject_fields_common(lang: Lang, v: &SubjectValues) -> String {
         opt("ecdsa:secp521r1", "ECDSA P-521 / secp521r1", &v.key_profile)
     );
     format!(
-        r#"<label>{l_cn}<input class="form-control" name="common_name" value="{cn}" required></label><label>{l_cc}<input class="form-control" name="country_code" value="{cc}" maxlength="2" required></label><label>{l_st}<input class="form-control" name="state" value="{st}"></label><label>{l_ci}<input class="form-control" name="city" value="{ci}"></label><label>{l_org}<input class="form-control" name="organization" value="{org}" required></label><label>{l_ou}<input class="form-control" name="organization_unit" value="{ou}"></label><label>{l_vd}<input class="form-control" type="number" min="1" max="7350" name="valid_days" value="{vd}"></label><label>{l_digest}<select class="form-select" name="digest_algorithm">{digest}</select></label><label>{l_kp}<select class="form-select" name="key_profile">{key_profiles}</select></label><label>{l_pw}<input class="form-control" name="password" value="{pw}" placeholder="{p_pw}"></label>"#,
+        r#"<label>{l_cn}<input class="form-control" name="common_name" value="{cn}" required></label><label>{l_cc}<input class="form-control" name="country_code" value="{cc}" maxlength="2" required></label><label>{l_st}<input class="form-control" name="state" value="{st}"></label><label>{l_ci}<input class="form-control" name="city" value="{ci}"></label><label>{l_org}<input class="form-control" name="organization" value="{org}" required></label><label>{l_ou}<input class="form-control" name="organization_unit" value="{ou}"></label><label>{l_vd}<input class="form-control" type="number" min="1" max="{max_days}" name="valid_days" value="{vd}"></label><label>{l_digest}<select class="form-select" name="digest_algorithm">{digest}</select></label><label>{l_kp}<select class="form-select" name="key_profile">{key_profiles}</select></label><label>{l_pw}<input class="form-control" name="password" value="{pw}" placeholder="{p_pw}"></label>"#,
         l_cn = t(lang, "field.common_name"),
         l_cc = t(lang, "field.country_code"),
         l_st = t(lang, "field.state"),
@@ -3855,22 +4131,35 @@ fn subject_fields_common(lang: Lang, v: &SubjectValues) -> String {
 }
 
 /// `submit` is translated, already-escaped HTML.
-fn ca_form_fields(lang: Lang, csrf: &str, submit: &str, extra: &str, v: &SubjectValues) -> String {
+fn ca_form_fields(
+    lang: Lang,
+    csrf: &str,
+    submit: &str,
+    extra: &str,
+    v: &SubjectValues,
+    max_days: i64,
+) -> String {
     format!(
         r#"<input type="hidden" name="_csrf" value="{}">{}<div class="grid2">{}</div><button class="btn btn-primary">{}</button>"#,
         h(csrf),
         extra,
-        subject_fields_common(lang, v),
+        subject_fields_common(lang, v, max_days),
         submit
     )
 }
 
-fn cert_form_fields(lang: Lang, csrf: &str, picker: &str, v: &SubjectValues) -> String {
+fn cert_form_fields(
+    lang: Lang,
+    csrf: &str,
+    picker: &str,
+    v: &SubjectValues,
+    max_days: i64,
+) -> String {
     format!(
         r#"<input type="hidden" name="_csrf" value="{}">{}<div class="grid2">{}<label>{} <span class="muted">{}</span><input class="form-control" name="dns_list" value="{}"></label><label>{} <span class="muted">{}</span><input class="form-control" name="ip_list" value="{}"></label></div><button class="btn btn-primary">{}</button>"#,
         h(csrf),
         picker,
-        subject_fields_common(lang, v),
+        subject_fields_common(lang, v, max_days),
         t(lang, "field.dns_sans"),
         t(lang, "field.comma_separated"),
         h(&v.dns_list),
@@ -3941,10 +4230,14 @@ fn layout_with(
         t(lang, "modal.cancel"),
         t(lang, "modal.confirm")
     );
+    let guide = format!(
+        r#"<a class="topbar-link" href="{base}/how-to-use">{}</a>"#,
+        t(lang, "nav.how_to_use")
+    );
     let strings = script_strings(lang);
     let (code, dir) = (lang.code(), lang.dir());
     format!(
-        r#"<!doctype html><html lang="{code}" dir="{dir}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>MiniCA</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"><style>{CSS}</style></head><body><header class="topbar"><a class="brand" href="{home}">MiniCA</a><div class="topbar-actions">{links}{switcher}{trailing}</div></header><main>{content}</main>{modal}<script type="application/json" id="minica-i18n">{strings}</script><script>{JS}</script></body></html>"#
+        r#"<!doctype html><html lang="{code}" dir="{dir}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>MiniCA</title><link rel="icon" type="image/svg+xml" href="{FAVICON}"><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"><style>{CSS}</style></head><body><header class="topbar"><a class="brand" href="{home}">MiniCA</a><div class="topbar-actions">{guide}{links}{switcher}{trailing}</div></header><main>{content}</main>{modal}<script type="application/json" id="minica-i18n">{strings}</script><script>{JS}</script></body></html>"#
     )
 }
 
@@ -4259,7 +4552,7 @@ fn openapi_spec_json(base: &str) -> String {
                         "city": { "type": "string", "nullable": true },
                         "organization": { "type": "string", "nullable": true, "example": "Homelab" },
                         "organization_unit": { "type": "string", "nullable": true },
-                        "valid_days": { "type": "integer", "nullable": true, "minimum": 1, "maximum": 7350, "example": 365 },
+                        "valid_days": { "type": "integer", "nullable": true, "minimum": 1, "example": 365 },
                         "digest_algorithm": { "type": "string", "nullable": true, "enum": ["sha256", "sha384", "sha512"] },
                         "key_profile": { "type": "string", "nullable": true, "enum": ["rsa:2048", "rsa:4096", "rsa:8192", "ecdsa:prime256v1", "ecdsa:secp384r1", "ecdsa:secp521r1"] }
                     }
@@ -4355,7 +4648,7 @@ fn openapi_spec_json(base: &str) -> String {
                     "security": [{ "basicAuth": [] }, { "csrfToken": [] }],
                     "parameters": [
                         { "name": "ca_id", "in": "path", "required": true, "schema": { "type": "string" } },
-                        { "name": "days", "in": "path", "required": true, "schema": { "type": "integer", "minimum": 1, "maximum": 7350 } }
+                        { "name": "days", "in": "path", "required": true, "schema": { "type": "integer", "minimum": 1 } }
                     ],
                     "responses": {
                         "200": { "description": "Renewed certificate authority" },
@@ -4626,6 +4919,10 @@ pub(crate) fn h(input: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// The "Seal of Approval" site icon. Inlined so it needs no route, works
+/// under a base path, and shows on signed-out pages.
+const FAVICON: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M9 18 6 31l5-2 3 3 3-11zM23 18l3 13-5-2-3 3-3-11z' fill='%233257c4'/%3E%3Cg fill='%23f2b632'%3E%3Ccircle cx='25' cy='13' r='3.6'/%3E%3Ccircle cx='22.4' cy='19.4' r='3.6'/%3E%3Ccircle cx='16' cy='22' r='3.6'/%3E%3Ccircle cx='9.6' cy='19.4' r='3.6'/%3E%3Ccircle cx='7' cy='13' r='3.6'/%3E%3Ccircle cx='9.6' cy='6.6' r='3.6'/%3E%3Ccircle cx='16' cy='4' r='3.6'/%3E%3Ccircle cx='22.4' cy='6.6' r='3.6'/%3E%3Ccircle cx='16' cy='13' r='9.5'/%3E%3C/g%3E%3Ccircle cx='12.2' cy='11.5' r='1.9' fill='%23172033'/%3E%3Ccircle cx='19.8' cy='11.5' r='1.9' fill='%23172033'/%3E%3Cpath d='M12.8 15.8q3.2 2.7 6.4 0' fill='none' stroke='%23172033' stroke-width='1.9' stroke-linecap='round'/%3E%3C/svg%3E";
+
 const CSS: &str = r#"
 body{background:#f6f7f9;color:#172033;font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif}
 .topbar{min-height:58px;background:#fff;border-bottom:1px solid #e2e6ee;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:0 28px}
@@ -4635,6 +4932,46 @@ body{background:#f6f7f9;color:#172033;font-family:Inter,system-ui,-apple-system,
 .topbar-link{font-size:15px;font-weight:700;color:#3257c4;text-decoration:none;padding:8px 14px;border:1px solid #cdd8f0;border-radius:8px}
 .topbar-link:hover{background:#eef2fc;color:#23408f}
 main{max-width:1180px;margin:28px auto;padding:0 20px}
+.admin-config h3{margin-top:24px}
+.admin-config code{direction:ltr;unicode-bidi:isolate;overflow-wrap:anywhere}
+.setting-enabled{display:flex;gap:8px;align-items:center}
+.setting-cards{display:grid;gap:12px;margin-bottom:24px}
+.setting-card{display:grid;gap:10px;min-width:0;padding:14px 16px;background:white;border:1px solid #d4dae5;border-radius:10px;box-shadow:0 1px 3px rgba(15,23,42,.05)}
+.setting-card-head{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;min-width:0}
+.setting-card-head code{color:#172033;font-size:13px;font-weight:700;background:none;padding:0}
+.setting-card-updated{margin-inline-start:auto;font-size:12px}
+.setting-card-body{display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:start;gap:8px 16px}
+.setting-card-body .setting-enabled{min-height:31px;margin:0;white-space:nowrap}
+.setting-card-actions{display:flex;gap:8px;flex:none}
+.setting-card-actions .btn{white-space:nowrap}
+@media(max-width:640px){.setting-card-body{grid-template-columns:minmax(0,1fr) auto}.setting-card-field{grid-column:1/-1}}
+.config-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,300px),1fr));gap:14px;margin-bottom:24px}
+.config-card{position:relative;display:grid;grid-row:span 3;grid-template-rows:subgrid;row-gap:8px;min-width:0;padding:14px 16px;background:white;border:1px solid #d4dae5;border-radius:10px;box-shadow:0 1px 3px rgba(15,23,42,.05)}
+.config-card-key code{color:#172033;font-size:13px;font-weight:700;background:none;padding:0}
+.config-card-value{padding:7px 10px;background:#f3f6fb;border-radius:6px;min-width:0}
+.config-card-value code{color:#1d4ed8}
+.config-card-meta{display:grid;grid-template-columns:minmax(72px,34%) minmax(0,1fr);gap:4px 10px;margin:0;font-size:13px;align-content:start}
+.config-card-meta dt{font-weight:600;color:#667085}
+.config-card-meta dd{margin:0;min-width:0}
+.config-card-meta code{color:#465166;font-size:12px}
+.config-required{color:#1b6e3e;vertical-align:-2px}
+.config-card-key{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}
+.config-info{flex:none;width:20px;height:20px;padding:0;border:1px solid #b8c2d3;border-radius:50%;background:white;color:#465166;font:italic 700 12px/18px Georgia,serif;cursor:help}
+.config-info:hover,.config-info:focus-visible,.config-info.open{background:#1d4ed8;border-color:#1d4ed8;color:white}
+.config-tip{display:none;position:absolute;z-index:5;top:42px;left:10px;right:10px;padding:10px 12px;border-radius:8px;background:#172033;color:white;font-size:13px;font-weight:400;line-height:1.45;box-shadow:0 6px 20px rgba(15,23,42,.28)}
+.config-info:hover+.config-tip,.config-info:focus-visible+.config-tip,.config-info.open+.config-tip{display:block}
+.guide{max-width:920px;margin:0 auto;line-height:1.6}
+.guide h2{margin-top:36px}
+.guide h3{margin-top:24px}
+.guide pre{direction:ltr;text-align:left;overflow-x:auto;background:#172033;color:#e8edf7;padding:14px 16px;border-radius:8px}
+.guide pre code{color:inherit;background:none;padding:0}
+.guide code{direction:ltr;unicode-bidi:isolate;overflow-wrap:anywhere}
+.guide pre code{overflow-wrap:normal}
+.guide-toc{margin:18px 0 26px;padding:16px 18px;background:#f3f6fb;border:1px solid #dde2ea;border-radius:8px}
+.guide-toc ul{list-style:none;margin:8px 0 0;padding:0;columns:220px 3}
+.guide-toc li{break-inside:avoid}
+.guide-toc .l2{font-weight:700;margin-top:6px}
+.guide-toc .l3{padding-inline-start:12px}
 h1{font-size:28px;margin:8px 0}
 h2{font-size:20px;margin:22px 0 12px}
 .toolbar{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:24px}
@@ -4761,7 +5098,7 @@ label .form-control,label .form-select,textarea{margin-top:6px}
 .lang-menu{position:relative}
 .lang-menu summary{list-style:none;cursor:pointer;user-select:none;white-space:nowrap}
 .lang-menu summary::-webkit-details-marker{display:none}
-.lang-list{position:absolute;inset-inline-end:0;top:calc(100% + 6px);z-index:1080;background:#fff;border:1px solid #dde2ea;border-radius:8px;box-shadow:0 12px 32px rgba(15,23,42,.14);padding:6px;display:grid;gap:2px;min-width:170px}
+.lang-list{position:absolute;max-height:min(70vh,520px);overflow-y:auto;inset-inline-end:0;top:calc(100% + 6px);z-index:1080;background:#fff;border:1px solid #dde2ea;border-radius:8px;box-shadow:0 12px 32px rgba(15,23,42,.14);padding:6px;display:grid;gap:2px;min-width:170px}
 .lang-option{padding:7px 12px;border-radius:6px;color:#263244;text-decoration:none;font-weight:600}
 .lang-option:hover{background:#f3f6fb;color:#172033}
 .lang-option.active{background:#eaf0ff;color:#1d4ed8}
@@ -4936,6 +5273,69 @@ document.querySelectorAll('.flash-panel').forEach((panel) => {
   const close = panel.querySelector('.flash-close');
   if (close) close.addEventListener('click', dismiss);
   setTimeout(dismiss, 8000);
+});
+
+// Info icons open on hover or keyboard focus, and on tap for touch screens.
+document.querySelectorAll('.config-info').forEach((button) => {
+  button.addEventListener('click', () => {
+    const open = !button.classList.contains('open');
+    document.querySelectorAll('.config-info.open').forEach((other) => other.classList.remove('open'));
+    button.classList.toggle('open', open);
+  });
+});
+
+// Configuration forms: check the key and value as they are typed, show the
+// problem beside the field, and keep an invalid value from being submitted.
+// If the check cannot run, the server still validates on save.
+document.querySelectorAll('form[data-setting-check]').forEach((form) => {
+  const key = form.elements.key;
+  const value = form.elements.value;
+  const note = document.createElement('div');
+  note.className = 'invalid-feedback';
+  note.setAttribute('role', 'alert');
+  let timer = 0;
+  let latest = 0;
+  const clear = () => {
+    key.classList.remove('is-invalid');
+    value.classList.remove('is-invalid');
+    note.remove();
+  };
+  const check = async (submitting) => {
+    clearTimeout(timer);
+    const id = ++latest;
+    if (!key.value.trim()) { clear(); return !submitting; }
+    let result;
+    try {
+      const response = await fetch(form.dataset.settingCheck, {
+        method: 'POST',
+        credentials: 'same-origin',
+        body: new URLSearchParams({ _csrf: form.elements._csrf.value, key: key.value, value: value.value }),
+      });
+      if (!response.ok) return true;
+      result = await response.json();
+    } catch (e) {
+      return true;
+    }
+    if (id !== latest) return false;
+    clear();
+    if (result.ok) return true;
+    // An empty value is not an error until the admin tries to save it.
+    if (result.field === 'value' && !value.value && !submitting) return false;
+    const field = result.field === 'key' && key.type !== 'hidden' ? key : value;
+    field.classList.add('is-invalid');
+    note.textContent = result.error;
+    field.after(note);
+    if (submitting) field.focus();
+    return false;
+  };
+  [key, value].forEach((field) => field.addEventListener('input', () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => check(false), 200);
+  }));
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (await check(true)) form.submit();
+  });
 });
 "#;
 

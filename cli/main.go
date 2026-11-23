@@ -128,7 +128,7 @@ CERTIFICATE FIELDS (flag or env; prompted otherwise)
   --key-profile    MINICA_KEY_PROFILE    rsa:4096           rsa:2048|4096|8192 or
                                                             ecdsa:prime256v1|secp384r1|secp521r1
   --digest         MINICA_DIGEST         sha256
-  --days           MINICA_DAYS           825                Validity in days (1..7350)
+  --days           MINICA_DAYS           825                Validity in days (1..7350 by default)
   --hostnames      MINICA_HOSTNAMES      (empty)            Comma-separated DNS names and/or IPs;
                                                             IPs become IP SANs, the rest DNS SANs
   --p12-password   MINICA_P12_PASSWORD   server-generated   Blank = server generates and we download it

@@ -54,6 +54,10 @@ ENV MINICA_RUNTIME_FOLDER=/data/runtime \
     MINICA_OPENSSL_WORKING_ROOT=/data/runtime/openssl-work \
     MINICA_OPENSSL_PATH=/usr/bin/openssl
 
+# Validity limit: false allows up to 7350 days. Set to true per container to
+# allow up to 3,000,000 days, ending no later than 9999-12-31.
+ENV MINICA_EXTRA_LONG_VALIDITY=false
+
 WORKDIR /data
 VOLUME /data
 EXPOSE 9988

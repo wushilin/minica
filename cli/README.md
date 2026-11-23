@@ -107,7 +107,7 @@ MINICA_ORG="Example Corp"
 | `MINICA_ORG_UNIT` | `--org-unit` | _(empty)_ | |
 | `MINICA_KEY_PROFILE` | `--key-profile` | `rsa:4096` | `rsa:2048\|4096\|8192` or `ecdsa:prime256v1\|secp384r1\|secp521r1` |
 | `MINICA_DIGEST` | `--digest` | `sha256` | |
-| `MINICA_DAYS` | `--days` | `825` | 1..7350 |
+| `MINICA_DAYS` | `--days` | `825` | 1 up to the server limit (7350 by default) |
 | `MINICA_HOSTNAMES` | `--hostnames` | _(empty)_ | Comma-separated DNS names and/or IPs |
 | `MINICA_P12_PASSWORD` | `--p12-password` | server-generated | Blank ⇒ server generates one, downloaded for you |
 | `MINICA_NAME` | `--name` | sanitized common name | Output file prefix |

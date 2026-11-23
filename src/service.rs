@@ -16,6 +16,9 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use base64::Engine;
+use crate::config::{CertificatesConfig, days_until_x509_limit};
+use crate::settings::{EffectiveEntry, LiveSettings, SettingAudit, SettingRow};
+use std::sync::{Arc, RwLock};
 use chrono::{NaiveDateTime, TimeZone, Utc};
 use rand::{Rng, distr::Alphanumeric};
 use serde::{Deserialize, Serialize};
@@ -27,8 +30,11 @@ use uuid::Uuid;
 pub struct AppService {
     db: Db,
     openssl: OpenSsl,
-    public_base_url: Option<String>,
-    crl: CrlConfig,
+    /// File-based values, the fallback when a database setting is off.
+    base: LiveSettings,
+    /// The values in use: `base` with the active database settings applied.
+    live: Arc<RwLock<LiveSettings>>,
+    ignore_db_settings: bool,
     /// Usernames of the config-file (bootstrap) accounts. DB users may not
     /// reuse them, or the two accounts would shadow each other at login.
     reserved_usernames: Vec<String>,
@@ -76,6 +82,8 @@ pub struct BackupFile {
     pub users: Vec<BackupUser>,
     #[serde(default)]
     pub templates: Vec<BackupTemplate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<Vec<SettingRow>>,
     pub certificate_authorities: Vec<BackupCa>,
 }
 
@@ -217,13 +225,103 @@ pub struct BackupCertSecrets {
 
 impl AppService {
     pub fn new(db: Db, openssl: OpenSsl, public_base_url: Option<String>, crl: CrlConfig) -> Self {
+        let base = LiveSettings {
+            public_base_url,
+            crl,
+            certificates: CertificatesConfig::default(),
+        };
         Self {
             db,
             openssl,
-            public_base_url,
-            crl,
+            live: Arc::new(RwLock::new(base.clone())),
+            base,
+            ignore_db_settings: false,
             reserved_usernames: Vec::new(),
         }
+    }
+
+    pub fn with_certificates(mut self, certificates: CertificatesConfig) -> Self {
+        self.base.certificates = certificates;
+        *self.live.write().expect("settings lock poisoned") = self.base.clone();
+        self
+    }
+
+    /// `--ignore-db-config`: run on the file configuration alone.
+    pub fn with_ignored_db_settings(mut self, ignore: bool) -> Self {
+        self.ignore_db_settings = ignore;
+        self
+    }
+
+    /// Recomputes the values in use from the file and the database.
+    pub fn load_settings(&self) -> Result<()> {
+        let rows = self.active_setting_rows()?;
+        *self.live.write().expect("settings lock poisoned") =
+            crate::settings::apply(&self.base, &rows);
+        Ok(())
+    }
+
+    fn active_setting_rows(&self) -> Result<Vec<SettingRow>> {
+        if self.ignore_db_settings {
+            Ok(Vec::new())
+        } else {
+            self.db.list_settings()
+        }
+    }
+
+    fn live(&self) -> LiveSettings {
+        self.live.read().expect("settings lock poisoned").clone()
+    }
+
+    fn crl(&self) -> CrlConfig {
+        self.live().crl
+    }
+
+    pub fn public_base_url(&self) -> Option<String> {
+        self.live().public_base_url
+    }
+
+    pub fn settings_ignored(&self) -> bool {
+        self.ignore_db_settings
+    }
+
+    pub fn list_settings(&self) -> Result<Vec<SettingRow>> {
+        self.db.list_settings()
+    }
+
+    pub fn settings_audit(&self, limit: usize) -> Result<Vec<SettingAudit>> {
+        self.db.list_settings_audit(limit)
+    }
+
+    pub fn save_setting(&self, key: &str, value: &str, enabled: bool, actor: &str) -> Result<()> {
+        let key = crate::settings::validate_key(key)?;
+        let value = crate::settings::normalize_value(&key, value)?;
+        self.db.save_setting(&key, &value, enabled, actor)?;
+        tracing::warn!(key = %key, enabled, actor = %actor, "setting saved");
+        self.load_settings()
+    }
+
+    pub fn delete_setting(&self, key: &str, actor: &str) -> Result<()> {
+        self.db.delete_setting(key.trim(), actor)?;
+        tracing::warn!(key = %key.trim(), actor = %actor, "setting deleted");
+        self.load_settings()
+    }
+
+    pub fn effective_config(&self, config: &crate::config::Config) -> Result<Vec<EffectiveEntry>> {
+        let rows = self.active_setting_rows()?;
+        Ok(crate::settings::effective(config, &self.live(), &rows))
+    }
+
+    /// The longest validity, in days, accepted right now.
+    pub fn max_valid_days(&self) -> i64 {
+        self.live().certificates.effective_max_days()
+    }
+
+    fn validate_days(&self, days: i64) -> Result<()> {
+        let max = self.max_valid_days();
+        if !(1..=max).contains(&days) {
+            bail!("valid days must be in 1..{max}");
+        }
+        Ok(())
     }
 
     /// Registers the bootstrap (config-file) usernames so `create_user`
@@ -286,7 +384,7 @@ impl AppService {
             digest_algorithm = %req.digest_algorithm,
             "creating certificate authority"
         );
-        validate_days(req.valid_days)?;
+        self.validate_days(req.valid_days)?;
         let key = key_spec(&req.key_profile)?;
         let digest = normalize_digest(&req.digest_algorithm)?;
         validate_password(req.password.as_deref())?;
@@ -446,7 +544,7 @@ impl AppService {
 
     #[tracing::instrument(skip(self), err, fields(span_id = %span_id(), ca_id = %ca_id, cert_id = %cert_id, reason = %reason))]
     pub fn revoke_cert(&self, ca_id: &str, cert_id: &str, reason: &str) -> Result<Certificate> {
-        if !self.crl.enabled {
+        if !self.crl().enabled {
             bail!("CRL support is disabled");
         }
         let reason = normalize_revocation_reason(reason)?;
@@ -471,7 +569,7 @@ impl AppService {
                 &ca_secrets,
                 &cert_secrets,
                 &reason,
-                self.crl.next_update_days,
+                self.crl().next_update_days,
             )?;
             self.db.revoke_cert_with_state(
                 ca_id,
@@ -518,7 +616,7 @@ impl AppService {
             ip_count = req.ip_list.len(),
             "creating certificate"
         );
-        validate_days(req.valid_days)?;
+        self.validate_days(req.valid_days)?;
         let key = key_spec(&req.key_profile)?;
         let digest = normalize_digest(&req.digest_algorithm)?;
         validate_password(req.password.as_deref())?;
@@ -582,7 +680,7 @@ impl AppService {
                 &ip_list,
                 &password,
                 crl_url.as_deref(),
-                self.crl.next_update_days,
+                self.crl().next_update_days,
             )?;
             let meta = CertMeta {
                 id: cert_id.clone(),
@@ -760,7 +858,7 @@ impl AppService {
     #[tracing::instrument(skip(self), err, fields(span_id = %span_id(), ca_id = %ca_id, cert_id = %cert_id, days))]
     pub fn renew_cert(&self, ca_id: &str, cert_id: &str, days: i64) -> Result<Certificate> {
         tracing::info!(ca_id = %ca_id, cert_id = %cert_id, days, "renewing certificate");
-        validate_days(days)?;
+        self.validate_days(days)?;
         let cert = self.db.get_cert(ca_id, cert_id)?;
         if cert.revoked_at.is_some() {
             // Renewal reuses the key; a revoked (possibly compromised) key
@@ -836,7 +934,7 @@ impl AppService {
                 days,
                 &digest,
                 crl_url.as_deref(),
-                self.crl.next_update_days,
+                self.crl().next_update_days,
             )?;
             let serial_txt = fs::read(work.path().join("serial.txt"))?;
             self.db.update_cert_with_state(
@@ -875,7 +973,7 @@ impl AppService {
     #[tracing::instrument(skip(self), err, fields(span_id = %span_id(), ca_id = %ca_id, days))]
     pub fn renew_ca(&self, ca_id: &str, days: i64) -> Result<CertificateAuthority> {
         tracing::info!(ca_id = %ca_id, days, "renewing certificate authority");
-        validate_days(days)?;
+        self.validate_days(days)?;
         let ca = self.db.get_ca(ca_id)?;
         // Imported CAs may carry a digest we don't sign with; fall back to the
         // historical default.
@@ -906,12 +1004,12 @@ impl AppService {
             ca_secrets.pkcs12 = pkcs12;
             // Same key, so the CRL could stay; it is re-signed anyway so its
             // issuer is the current certificate and the CRL number advances.
-            let crl = if self.crl.enabled {
+            let crl = if self.crl().enabled {
                 let crl_work = self.openssl.workdir()?;
                 Some(self.openssl.generate_crl(
                     crl_work.path(),
                     &ca_secrets,
-                    self.crl.next_update_days,
+                    self.crl().next_update_days,
                 )?)
             } else {
                 None
@@ -1077,7 +1175,7 @@ impl AppService {
 
     #[tracing::instrument(skip(self), err, fields(span_id = %span_id(), ca_id = %ca_id))]
     pub fn crl_der(&self, ca_id: &str) -> Result<Vec<u8>> {
-        if !self.crl.enabled {
+        if !self.crl().enabled {
             bail!("CRL support is disabled");
         }
         let bytes = self.db.get_ca_crl(ca_id)?;
@@ -1141,6 +1239,7 @@ impl AppService {
             .map(BackupTemplate::from)
             .collect();
         let template_count = templates.len();
+        let settings = snapshot.settings.clone();
         let mut cas_out = Vec::new();
         for (ca, certs) in snapshot.cas {
             let mut certs_out = Vec::new();
@@ -1204,6 +1303,7 @@ impl AppService {
             warning: "This backup includes private keys and passwords.".to_string(),
             users,
             templates,
+            settings,
             certificate_authorities: cas_out,
         })
         .map_err(anyhow::Error::from)?;
@@ -1250,6 +1350,7 @@ impl AppService {
             // single transaction (which also re-checks the DB is empty).
             let snapshot = backup_to_snapshot(backup)?;
             self.db.restore_backup(&snapshot)?;
+            self.load_settings()?;
             // Backups from older versions may carry fabricated import metadata.
             if let Err(err) = self.repair_stale_metadata() {
                 tracing::warn!(error = %err, "metadata repair after restore failed");
@@ -1272,6 +1373,7 @@ impl AppService {
     pub fn nuke_all(&self) -> Result<()> {
         tracing::warn!("nuking all database entities by admin request");
         self.db.nuke_all()?;
+        self.load_settings()?;
         tracing::warn!("nuked all database entities by admin request");
         Ok(())
     }
@@ -1438,7 +1540,7 @@ impl AppService {
             Some(scope) => TemplateScope::parse(scope)
                 .ok_or_else(|| anyhow::anyhow!("scope must be 'both', 'ca' or 'certificate'"))?,
         };
-        let values = validate_template_values(&req.values)?;
+        let values = validate_template_values(&req.values, self.max_valid_days())?;
         Ok(Template {
             id,
             name,
@@ -1474,10 +1576,10 @@ impl AppService {
     }
 
     pub fn crl_url(&self, ca_id: &str) -> Option<String> {
-        if !self.crl.enabled {
+        if !self.crl().enabled {
             return None;
         }
-        self.public_base_url
+        self.public_base_url()
             .as_ref()
             .map(|base| format!("{}/crl/{ca_id}", base.trim_end_matches('/')))
     }
@@ -1485,14 +1587,14 @@ impl AppService {
     /// Long-form public download URL of the CA certificate; serves the same
     /// PEM as [`Self::public_ca_cert_url`].
     pub fn public_ca_cert_download_url(&self, ca_id: &str) -> Option<String> {
-        self.public_base_url
+        self.public_base_url()
             .as_ref()
             .map(|base| format!("{}/download/ca/{ca_id}/cert", base.trim_end_matches('/')))
     }
 
     /// Public (unauthenticated) download URL of the CA certificate.
     pub fn public_ca_cert_url(&self, ca_id: &str) -> Option<String> {
-        self.public_base_url
+        self.public_base_url()
             .as_ref()
             .map(|base| format!("{}/{ca_id}/download", base.trim_end_matches('/')))
     }
@@ -1510,13 +1612,13 @@ impl AppService {
     /// Generates the CA's first (empty) CRL before the CA row is inserted, so
     /// a CRL failure cannot leave behind a CA that reported an error.
     fn attach_initial_crl(&self, secrets: &mut CaSecrets) -> Result<()> {
-        if !self.crl.enabled {
+        if !self.crl().enabled {
             return Ok(());
         }
         let work = self.openssl.workdir()?;
         let refresh = self
             .openssl
-            .generate_crl(work.path(), secrets, self.crl.next_update_days)?;
+            .generate_crl(work.path(), secrets, self.crl().next_update_days)?;
         secrets.crl_der = refresh.crl_der;
         secrets.index_txt = refresh.index_txt;
         secrets.crlnumber_txt = refresh.crlnumber_txt;
@@ -1846,13 +1948,6 @@ fn download_kind_name(kind: &Download) -> &'static str {
         Download::CertPkcs12 => "cert_pkcs12",
         Download::CertPassword => "cert_password",
     }
-}
-
-fn validate_days(days: i64) -> Result<()> {
-    if !(1..=7350).contains(&days) {
-        bail!("valid days must be in 1..7350");
-    }
-    Ok(())
 }
 
 fn validate_key_length(key_length: i64) -> Result<()> {
@@ -2248,7 +2343,7 @@ fn validate_password(password: Option<&str>) -> Result<()> {
 /// The CRL URL is embedded in an openssl config file as `URI:<url>`; allow
 /// only http(s) URLs made of printable ASCII without whitespace, quotes,
 /// backslashes or commas (a comma would start another GeneralName).
-fn validate_crl_url(url: &str) -> Result<()> {
+pub(crate) fn validate_crl_url(url: &str) -> Result<()> {
     let lower = url.to_ascii_lowercase();
     let scheme_ok = lower.starts_with("http://") || lower.starts_with("https://");
     let chars_ok = url
@@ -2266,6 +2361,17 @@ fn validate_crl_url(url: &str) -> Result<()> {
 /// restore transaction.
 fn backup_to_snapshot(backup: BackupFile) -> Result<BackupSnapshot> {
     let mut snapshot = BackupSnapshot::default();
+    if let Some(settings) = backup.settings {
+        let mut rows = Vec::with_capacity(settings.len());
+        for mut row in settings {
+            row.key = crate::settings::validate_key(&row.key)
+                .with_context(|| format!("backup setting {:?} is invalid", row.key))?;
+            row.value = crate::settings::normalize_value(&row.key, &row.value)
+                .with_context(|| format!("backup setting {:?} is invalid", row.key))?;
+            rows.push(row);
+        }
+        snapshot.settings = Some(rows);
+    }
     for user in backup.users {
         let role = Role::parse(&user.role).with_context(|| {
             format!(
@@ -2292,7 +2398,8 @@ fn backup_to_snapshot(backup: BackupFile) -> Result<BackupSnapshot> {
                 template.name, template.scope
             )
         })?;
-        let values = validate_template_values(&template.values)
+        // A backup may come from a server with a higher limit; restore it as is.
+        let values = validate_template_values(&template.values, days_until_x509_limit())
             .with_context(|| format!("backup template {:?} is invalid", template.name))?;
         let name = template.name.trim().to_string();
         if name.is_empty() || name.chars().any(char::is_control) {
@@ -2426,10 +2533,10 @@ fn backup_to_snapshot(backup: BackupFile) -> Result<BackupSnapshot> {
 /// produces (plus '-'/'_').
 /// Normalises template values and rejects anything the creation forms would
 /// not accept. Blank fields become unset.
-fn validate_template_values(values: &TemplateValues) -> Result<TemplateValues> {
+fn validate_template_values(values: &TemplateValues, max_days: i64) -> Result<TemplateValues> {
     let values = values.normalized();
-    if let Some(days) = values.valid_days.filter(|days| !(1..=7350).contains(days)) {
-        bail!("valid_days must be in 1..7350, got {days}");
+    if let Some(days) = values.valid_days.filter(|days| !(1..=max_days).contains(days)) {
+        bail!("valid_days must be in 1..{max_days}, got {days}");
     }
     if let Some(code) = values
         .country_code
@@ -2684,6 +2791,7 @@ mod tests {
             exported_at: 0,
             warning: String::new(),
             templates: vec![],
+            settings: None,
             users: vec![BackupUser {
                 id: "u1".to_string(),
                 username: "alice".to_string(),

@@ -295,6 +295,36 @@ or `LLDAP_LDAPS_OPTIONS__ENABLED=true`, `LLDAP_LDAPS_OPTIONS__CERT_FILE=...`,
 (Authelia, Nextcloud, Jellyfin, ...) then needs the MiniCA CA in its own
 trust store, per the recipes above for the platform or language it runs on.
 
+## Publishing MiniCA through Nginx
+
+With MiniCA's own login, one prefix is enough. MiniCA protects its private pages itself, and this guide stays public at `/minica/how-to-use`:
+
+```nginx
+location /minica/ {
+    proxy_pass http://minica:9988;
+    include /etc/nginx/snippets/proxy.conf;
+}
+```
+
+With SSO (Authelia, oauth2-proxy, ...), the prefix is protected, so the public pages need one rule of their own. Keep the identity headers cleared on that rule, because MiniCA trusts them when they come from the proxy:
+
+```nginx
+# Public pages: no SSO, client-supplied identity headers removed.
+location ~ ^/minica/(how-to-use|lang/[^/]+|[^/]+/download|download/ca/[^/]+/truststore(-password)?|crl/[^/]+)?$ {
+    proxy_pass http://minica:9988;
+    include /etc/nginx/snippets/proxy.conf;
+    proxy_set_header Remote-User "";
+    proxy_set_header Remote-Groups "";
+}
+
+# Everything else: behind SSO.
+include /etc/nginx/snippets/authelia-location.conf;
+location /minica/ {
+    proxy_pass http://minica:9988;
+    include /etc/nginx/snippets/authelia-authrequest.conf;
+}
+```
+
 ## Checking that it works
 
 ```sh

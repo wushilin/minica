@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod db;
+mod guide;
 mod i18n;
 mod legacy;
 mod logging;
@@ -8,6 +9,7 @@ mod models;
 mod openssl;
 mod pkcs12;
 mod service;
+mod settings;
 mod web;
 
 use anyhow::Result;
@@ -48,6 +50,11 @@ struct Cli {
     /// Start the MiniCA server
     #[arg(long, group = "action")]
     start: bool,
+
+    /// With --start: ignore settings saved in the Admin Console, to recover
+    /// from a bad value. They stay stored and apply again on a normal start.
+    #[arg(long, requires = "start")]
+    ignore_db_config: bool,
 
     /// Write a sample config.yaml to the current directory and exit
     #[arg(long, group = "action")]
@@ -123,7 +130,7 @@ async fn main() -> Result<()> {
     // --start: load config and run the server.
     if cli.start {
         let config = Config::load(&cli.config)?;
-        return start_server(config).await;
+        return start_server(config, cli.ignore_db_config).await;
     }
 
     // Default: no action selected, print help.
@@ -198,7 +205,7 @@ fn prompt_secret(prompt: &str) -> Result<String> {
     Ok(line.trim_end_matches(['\n', '\r']).to_string())
 }
 
-async fn start_server(config: Config) -> Result<()> {
+async fn start_server(config: Config, ignore_db_config: bool) -> Result<()> {
     let file_writer = RotatingFileMakeWriter::new(&config.logging)?;
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
@@ -260,7 +267,10 @@ async fn start_server(config: Config) -> Result<()> {
         compress = config.logging.compress,
         "logging initialized"
     );
-    let service = build_service(&config)?;
+    if ignore_db_config {
+        tracing::warn!("--ignore-db-config: database settings are not applied");
+    }
+    let service = build_service(&config, ignore_db_config)?;
     // Metadata written by older versions is re-derived from the certificates
     // once (imported CAs used to be recorded as issued now for 3650 days).
     match service.repair_stale_metadata() {
@@ -296,7 +306,7 @@ async fn start_server(config: Config) -> Result<()> {
 
 /// Opens the database and openssl wrapper named by `config` and builds the
 /// service on them (shared by `--start` and `--import-legacy`).
-fn build_service(config: &Config) -> Result<AppService> {
+fn build_service(config: &Config, ignore_db_config: bool) -> Result<AppService> {
     tracing::info!(runtime_folder = %config.runtime.folder.display(), "creating runtime folder");
     std::fs::create_dir_all(&config.runtime.folder)?;
     tracing::info!(openssl_working_root = %config.openssl.working_root.display(), "creating openssl working root");
@@ -305,13 +315,17 @@ fn build_service(config: &Config) -> Result<AppService> {
     let openssl = OpenSsl::new(config.openssl.clone());
     openssl.check()?;
     openssl.reap_workdirs()?;
-    Ok(AppService::new(
+    let service = AppService::new(
         db,
         openssl,
         config.public_base_url.clone(),
         config.crl.clone(),
     )
-    .with_reserved_usernames(config.auth.basic_users().iter().map(|u| u.username.clone())))
+    .with_certificates(config.certificates)
+    .with_ignored_db_settings(ignore_db_config)
+    .with_reserved_usernames(config.auth.basic_users().iter().map(|u| u.username.clone()));
+    service.load_settings()?;
+    Ok(service)
 }
 
 /// `--import-legacy DIR`: walks a 1.0.x data directory and imports it, printing
@@ -322,7 +336,7 @@ fn import_legacy(config: Config, dir: &std::path::Path) -> Result<()> {
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")))
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
-    let service = build_service(&config)?;
+    let service = build_service(&config, false)?;
     eprintln!(
         "Importing MiniCA 1.0.x data from {} into {} ...",
         dir.display(),
@@ -420,6 +434,29 @@ mod tests {
         }
 
         fn with_options(auth: config::AuthConfig, base_path: &str, secure_cookies: bool) -> Self {
+            Self::build(auth, base_path, secure_cookies, config::CertificatesConfig::default())
+        }
+
+        fn with_extra_long_validity() -> Self {
+            Self::build(
+                config::AuthConfig {
+                    users: Some(basic_users()),
+                    headers: None,
+                },
+                "/minica",
+                false,
+                config::CertificatesConfig {
+                    extra_long_validity: true,
+                },
+            )
+        }
+
+        fn build(
+            auth: config::AuthConfig,
+            base_path: &str,
+            secure_cookies: bool,
+            certificates: config::CertificatesConfig,
+        ) -> Self {
             let root = std::env::temp_dir().join(format!("minica-rust-test-{}", Uuid::new_v4()));
             fs::create_dir_all(root.join("runtime")).expect("create test runtime");
             fs::create_dir_all(root.join("openssl-work")).expect("create openssl work root");
@@ -433,6 +470,7 @@ mod tests {
                 },
                 public_base_url: Some("http://localhost/minica".to_string()),
                 crl: config::CrlConfig::default(),
+                certificates,
                 runtime: config::RuntimeConfig {
                     folder: root.join("runtime"),
                     db_folder: Some(root.join("db")),
@@ -446,6 +484,7 @@ mod tests {
                 },
                 auth,
                 logging: config::LoggingConfig::default(),
+                sources: Default::default(),
             };
 
             let db = Db::open(&config.db_path()).expect("open test database");
@@ -458,7 +497,8 @@ mod tests {
                     openssl,
                     config.public_base_url.clone(),
                     config.crl.clone(),
-                ),
+                )
+                .with_certificates(config.certificates),
             });
             let app = app_router(&config, state);
 
@@ -1828,7 +1868,7 @@ mod tests {
         let backup_yaml = backup.json()["yaml"].as_str().unwrap().to_string();
         assert!(backup_yaml.contains("format_version: 1"));
         assert!(backup_yaml.contains("app_version:"));
-        assert!(backup_yaml.contains("schema_version: 3"));
+        assert!(backup_yaml.contains(&format!("schema_version: {}", db::SCHEMA_VERSION)));
         assert!(backup_yaml.contains("ca.lifecycle.test"));
         assert!(backup_yaml.contains("leaf.lifecycle.test"));
         assert!(backup_yaml.contains("second.lifecycle.test"));
@@ -3660,6 +3700,324 @@ mod tests {
         assert!(list.contains("Zertifizierungsstellen"), "{list}");
         let flash = pages.last().unwrap().2.text();
         assert!(!flash.contains("Renewed certificate"), "{flash}");
+    }
+
+    #[tokio::test]
+    async fn how_to_use_is_public_translated_and_its_urls_work() {
+        let env = TestEnv::new();
+        let csrf = env.get_csrf().await;
+        let fixture = page_fixture(&env, &csrf).await;
+        for lang in i18n::Lang::all() {
+            let code = lang.code();
+            let cookie = format!("minica_lang={code}");
+            let response = env
+                .request_with_headers("GET", "/minica/how-to-use", &[("cookie", &cookie)])
+                .await;
+            let text = response.text();
+            assert_eq!(response.status, StatusCode::OK, "{code}: {text}");
+            assert!(text.contains(&format!(r#"<html lang="{code}""#)), "{code}");
+            assert!(text.contains(r#"href="/minica/how-to-use""#), "{code}: no menu link");
+            assert!(text.contains(r#"id="debian-ubuntu""#), "{code}: no guide");
+            assert!(!text.contains("⟦missing:"), "{code}: missing key");
+        }
+        for path in guide::example_paths() {
+            let path = path.replace("<ca-id>", &fixture.ca_id);
+            let uri = format!("/minica{path}");
+            let response = env.request_with_headers("GET", &uri, &[]).await;
+            assert_eq!(response.status, StatusCode::OK, "guide URL {uri} is not public");
+        }
+    }
+
+    #[tokio::test]
+    async fn validity_limit_is_unchanged_by_default() {
+        let env = TestEnv::new();
+        let csrf = env.get_csrf().await;
+        let admin = Some(("admin", "adminpass"));
+        let mut body = ca_payload("standard.limit");
+        body["valid_days"] = json!(7351);
+        let rejected = env.json("PUT", "/minica/api/cas", admin, Some(&csrf), body.clone()).await;
+        assert_ne!(rejected.status, StatusCode::OK);
+        body["valid_days"] = json!(7350);
+        let accepted = env.json("PUT", "/minica/api/cas", admin, Some(&csrf), body).await;
+        accepted.assert_status(StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_settings_override_the_file_and_stay_admin_only() {
+        const FORM: &str = "application/x-www-form-urlencoded";
+        let env = TestEnv::new();
+        let csrf = env.get_csrf().await;
+        let admin = Some(("admin", "adminpass"));
+        let viewer = Some(("viewer", "viewerpass"));
+        let form = |key: &str, value: &str, enabled: bool| {
+            let mut body = format!("_csrf={}&key={}&value={}", csrf.token, key, value);
+            if enabled {
+                body.push_str("&enabled=1");
+            }
+            Body::from(body)
+        };
+        let save = "/minica/admin/settings";
+        let guide = || async {
+            env.request_with_headers("GET", "/minica/how-to-use", &[]).await.text()
+        };
+
+        let page = env.send("GET", "/minica/admin", viewer, None, None, Body::empty()).await;
+        page.assert_status(StatusCode::FORBIDDEN);
+        let denied = env
+            .send("POST", save, viewer, Some(&csrf), Some(FORM), form("public_base_url", "https%3A%2F%2Fx.test", true))
+            .await;
+        denied.assert_status(StatusCode::FORBIDDEN);
+
+        let saved = env
+            .send("POST", save, admin, Some(&csrf), Some(FORM), form("public_base_url", "https%3A%2F%2Fdb.test%2Fca", true))
+            .await;
+        assert_eq!(saved.status, StatusCode::SEE_OTHER, "{}", saved.text());
+        assert!(guide().await.contains("https://db.test/ca/"), "override not live");
+
+        let html = env.send("GET", "/minica/admin", admin, None, None, Body::empty()).await.text();
+        assert!(html.contains("admin-configuration"), "{html}");
+        assert!(html.contains(">Database</span>"), "source missing");
+        assert!(html.contains("Change history"), "history missing");
+        assert!(html.contains("auth.users.admin.password"), "masked row missing");
+        assert!(!html.contains("adminpass"), "password leaked");
+
+        let off = env
+            .send("POST", save, admin, Some(&csrf), Some(FORM), form("public_base_url", "https%3A%2F%2Fdb.test%2Fca", false))
+            .await;
+        assert_eq!(off.status, StatusCode::SEE_OTHER);
+        let text = guide().await;
+        assert!(!text.contains("https://db.test/ca/"), "disabled must fall through");
+        assert!(text.contains("http://localhost/minica/"), "file value expected");
+
+        for (key, value) in [("openssl.path", "%2Ftmp%2Fevil"), ("crl.next_update_days", "0")] {
+            let rejected = env
+                .send("POST", save, admin, Some(&csrf), Some(FORM), form(key, value, true))
+                .await;
+            assert_eq!(rejected.status, StatusCode::SEE_OTHER, "{key}");
+            assert!(rejected.header(header::LOCATION).ends_with("#admin-configuration"), "{key}");
+            let flash = rejected.headers.get(header::SET_COOKIE).unwrap().to_str().unwrap();
+            assert!(flash.starts_with("minica_flash="), "{key} has no error message");
+        }
+
+        let check = "/minica/admin/settings/check";
+        let denied = env
+            .send("POST", check, viewer, Some(&csrf), Some(FORM), form("crl.next_update_days", "0", true))
+            .await;
+        denied.assert_status(StatusCode::FORBIDDEN);
+        let bad_value = env
+            .send("POST", check, admin, Some(&csrf), Some(FORM), form("crl.next_update_days", "0", true))
+            .await;
+        bad_value.assert_status(StatusCode::OK);
+        let result: Value = serde_json::from_slice(&bad_value.body).unwrap();
+        assert_eq!((result["ok"].as_bool(), result["field"].as_str()), (Some(false), Some("value")));
+        let bad_key = env
+            .send("POST", check, admin, Some(&csrf), Some(FORM), form("openssl.path", "x", true))
+            .await;
+        let result: Value = serde_json::from_slice(&bad_key.body).unwrap();
+        assert_eq!((result["ok"].as_bool(), result["field"].as_str()), (Some(false), Some("key")));
+        let fine = env
+            .send("POST", check, admin, Some(&csrf), Some(FORM), form("custom.unsaved", "x", true))
+            .await;
+        let result: Value = serde_json::from_slice(&fine.body).unwrap();
+        assert_eq!(result["ok"].as_bool(), Some(true));
+        let html = env.send("GET", "/minica/admin", admin, None, None, Body::empty()).await.text();
+        assert!(!html.contains("custom.unsaved"), "a check must not save");
+
+        let unknown = env
+            .send("POST", save, admin, Some(&csrf), Some(FORM), form("custom.key", "value", true))
+            .await;
+        assert_eq!(unknown.status, StatusCode::SEE_OTHER);
+        let html = env.send("GET", "/minica/admin", admin, None, None, Body::empty()).await.text();
+        assert!(html.contains("No effect"), "{html}");
+
+        let mut body = ca_payload("live.extra.long");
+        body["valid_days"] = json!(8000);
+        let blocked = env.json("PUT", "/minica/api/cas", admin, Some(&csrf), body.clone()).await;
+        assert_ne!(blocked.status, StatusCode::OK);
+        let on = env
+            .send("POST", save, admin, Some(&csrf), Some(FORM), form("certificates.extra_long_validity", "true", true))
+            .await;
+        assert_eq!(on.status, StatusCode::SEE_OTHER);
+        let allowed = env.json("PUT", "/minica/api/cas", admin, Some(&csrf), body).await;
+        allowed.assert_status(StatusCode::OK);
+
+        let delete = env
+            .send(
+                "POST",
+                "/minica/admin/settings/delete",
+                admin,
+                Some(&csrf),
+                Some(FORM),
+                Body::from(format!("_csrf={}&key=certificates.extra_long_validity", csrf.token)),
+            )
+            .await;
+        assert_eq!(delete.status, StatusCode::SEE_OTHER);
+        let mut body = ca_payload("back.to.limit");
+        body["valid_days"] = json!(8000);
+        let blocked = env.json("PUT", "/minica/api/cas", admin, Some(&csrf), body).await;
+        assert_ne!(blocked.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn settings_travel_with_a_backup_and_are_cleared_by_nuke() {
+        const FORM: &str = "application/x-www-form-urlencoded";
+        let admin = Some(("admin", "adminpass"));
+        let source = TestEnv::new();
+        let csrf = source.get_csrf().await;
+        let body = format!(
+            "_csrf={}&key=public_base_url&value=https%3A%2F%2Fbackup.test%2Fca&enabled=1",
+            csrf.token
+        );
+        let saved = source
+            .send("POST", "/minica/admin/settings", admin, Some(&csrf), Some(FORM), Body::from(body))
+            .await;
+        assert_eq!(saved.status, StatusCode::SEE_OTHER);
+        let yaml = source
+            .send("GET", "/minica/api/backup", admin, None, None, Body::empty())
+            .await
+            .json()["yaml"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(yaml.contains("backup.test"), "{yaml}");
+
+        let target = TestEnv::new();
+        let csrf = target.get_csrf().await;
+        let restored = target
+            .send(
+                "POST",
+                "/minica/api/backup/restore",
+                admin,
+                Some(&csrf),
+                Some("application/x-yaml"),
+                Body::from(yaml),
+            )
+            .await;
+        restored.assert_status(StatusCode::OK);
+        let guide = target.request_with_headers("GET", "/minica/how-to-use", &[]).await.text();
+        assert!(guide.contains("https://backup.test/ca/"), "restored setting not live");
+
+        let nuke = target
+            .send(
+                "POST",
+                "/minica/admin/nuke",
+                admin,
+                Some(&csrf),
+                Some(FORM),
+                Body::from(format!("_csrf={}&confirm=CONFIRM", csrf.token)),
+            )
+            .await;
+        assert_eq!(nuke.status, StatusCode::SEE_OTHER, "{}", nuke.text());
+        let guide = target.request_with_headers("GET", "/minica/how-to-use", &[]).await.text();
+        assert!(!guide.contains("https://backup.test/ca/"), "nuke must clear settings");
+    }
+
+    #[tokio::test]
+    async fn templates_and_forms_follow_the_validity_limit() {
+        let admin = Some(("admin", "adminpass"));
+        let extra_max = config::CertificatesConfig {
+            extra_long_validity: true,
+        }
+        .effective_max_days();
+        for (env, max) in [
+            (TestEnv::new(), 7350),
+            (TestEnv::with_extra_long_validity(), extra_max),
+        ] {
+            let csrf = env.get_csrf().await;
+            let over = env
+                .json(
+                    "PUT",
+                    "/minica/api/templates",
+                    admin,
+                    Some(&csrf),
+                    json!({ "name": "Over the limit", "valid_days": max + 1 }),
+                )
+                .await;
+            assert_ne!(over.status, StatusCode::OK, "{max}: {}", over.text());
+            let at_limit = env
+                .json(
+                    "PUT",
+                    "/minica/api/templates",
+                    admin,
+                    Some(&csrf),
+                    json!({ "name": "At the limit", "valid_days": max }),
+                )
+                .await;
+            at_limit.assert_status(StatusCode::OK);
+            assert_eq!(at_limit.json()["valid_days"], json!(max));
+            for uri in ["/minica/templates/new", "/minica/cas/new"] {
+                let page = env.send("GET", uri, admin, None, None, Body::empty()).await;
+                page.assert_status(StatusCode::OK);
+                let expected = format!(r#"max="{max}" name="valid_days""#);
+                assert!(page.text().contains(&expected), "{uri}: missing {expected}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn extra_long_validity_reaches_the_last_x509_date() {
+        let env = TestEnv::with_extra_long_validity();
+        let csrf = env.get_csrf().await;
+        let admin = Some(("admin", "adminpass"));
+        let max = config::CertificatesConfig {
+            extra_long_validity: true,
+        }
+        .effective_max_days();
+        assert!(max <= config::EXTRA_LONG_MAX_VALID_DAYS);
+        let mut body = ca_payload("extra.long");
+        body["valid_days"] = json!(max + 1);
+        let rejected = env.json("PUT", "/minica/api/cas", admin, Some(&csrf), body.clone()).await;
+        assert_ne!(rejected.status, StatusCode::OK);
+        body["valid_days"] = json!(max);
+        let ca = env.json("PUT", "/minica/api/cas", admin, Some(&csrf), body).await;
+        ca.assert_status(StatusCode::OK);
+        let ca_id = ca.json()["id"].as_str().unwrap().to_string();
+
+        let pem = env
+            .request_with_headers("GET", &format!("/minica/{ca_id}/download"), &[])
+            .await
+            .text();
+        let pem_path = env.root.join("extra-long-ca.pem");
+        fs::write(&pem_path, pem).unwrap();
+        let output = std::process::Command::new("/usr/bin/openssl")
+            .args(["x509", "-noout", "-enddate", "-in"])
+            .arg(&pem_path)
+            .output()
+            .unwrap();
+        let end = String::from_utf8_lossy(&output.stdout);
+        if max == config::days_until_x509_limit() {
+            assert!(end.contains("Dec 31") && end.contains("9999 GMT"), "{end}");
+        }
+
+        let mut cert_body = cert_payload("leaf.extra.long");
+        cert_body["valid_days"] = json!(400);
+        let cert = env
+            .json("PUT", &format!("/minica/api/cas/{ca_id}/certs"), admin, Some(&csrf), cert_body)
+            .await;
+        cert.assert_status(StatusCode::OK);
+        let cert_id = cert.json()["id"].as_str().unwrap().to_string();
+        let renewed = env
+            .json(
+                "POST",
+                &format!("/minica/api/cas/{ca_id}/certs/{cert_id}/renew/{}", max - 10),
+                admin,
+                Some(&csrf),
+                json!({}),
+            )
+            .await;
+        renewed.assert_status(StatusCode::OK);
+        assert_eq!(renewed.json()["valid_days"], json!(max - 10));
+
+        let auth = basic_auth("admin", "adminpass");
+        let page = env
+            .request_with_headers(
+                "GET",
+                &format!("/minica/cas/{ca_id}"),
+                &[("authorization", &auth)],
+            )
+            .await
+            .text();
+        assert!(page.contains(&format!(r#"max="{max}""#)), "form limit missing");
     }
 
     /// Text visible to users that is not wrapped in pseudo-locale markers:

@@ -1,4 +1,5 @@
 use crate::models::{Certificate, CertificateAuthority, Template, TemplateValues};
+use crate::settings::{SettingAudit, SettingRow};
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use rand::{Rng, distr::Alphanumeric};
@@ -9,7 +10,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// How many `.pre-migrate-*.bak` copies of the database to keep. Each holds
 /// every private key, so older ones are pruned after a new one is made.
@@ -97,6 +98,8 @@ pub struct BackupSnapshot {
     pub users: Vec<UserRecord>,
     pub templates: Vec<Template>,
     pub cas: Vec<(BackupCaRow, Vec<BackupCertRow>)>,
+    /// `None` (a backup from before settings existed) leaves them untouched.
+    pub settings: Option<Vec<SettingRow>>,
 }
 
 #[derive(Clone)]
@@ -290,6 +293,24 @@ impl Db {
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_templates_name
                 ON templates(name COLLATE NOCASE);
+
+            -- Schema 4: Admin Console settings and their change history.
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                enabled INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                updated_by TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS settings_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                at INTEGER NOT NULL,
+                actor TEXT NOT NULL,
+                key TEXT NOT NULL,
+                action TEXT NOT NULL,
+                old_value TEXT,
+                new_value TEXT
+            );
 
             -- certificates.ca_id is filtered on every CA view (list_cas' LEFT
             -- JOIN, the per-CA cert listings, and the dashboard/trash COUNT
@@ -935,6 +956,7 @@ impl Db {
         let tx = conn.transaction()?;
         let users = query_users(&tx)?;
         let templates = query_templates(&tx)?;
+        let settings = Some(query_settings(&tx)?);
         let mut cas = Vec::new();
         for ca in query_backup_cas(&tx)? {
             let certs = query_backup_certs(&tx, &ca.meta.id)?;
@@ -945,6 +967,7 @@ impl Db {
             users,
             templates,
             cas,
+            settings,
         })
     }
 
@@ -976,6 +999,22 @@ impl Db {
                 insert_cert_row(&tx, cert)?;
             }
         }
+        if let Some(settings) = &snapshot.settings {
+            let now = Utc::now().timestamp_millis();
+            tx.execute("DELETE FROM settings", [])?;
+            for row in settings {
+                write_setting(&tx, &row.key, &row.value, row.enabled, now, "backup")?;
+                insert_setting_audit(
+                    &tx,
+                    now,
+                    "backup",
+                    &row.key,
+                    "restored",
+                    None,
+                    Some(&row.value),
+                )?;
+            }
+        }
         tx.commit()?;
         tracing::info!(
             user_count = snapshot.users.len(),
@@ -999,6 +1038,11 @@ impl Db {
         let ca_rows = tx.execute("DELETE FROM certificate_authorities", [])?;
         let user_rows = tx.execute("DELETE FROM users", [])?;
         let template_rows = tx.execute("DELETE FROM templates", [])?;
+        // The change history is kept, so a wipe of the settings stays visible.
+        if tx.execute("DELETE FROM settings", [])? > 0 {
+            let now = Utc::now().timestamp_millis();
+            insert_setting_audit(&tx, now, "system", "*", "cleared", None, None)?;
+        }
         tx.commit()?;
         tracing::warn!(
             lock_rows_affected = lock_rows,
@@ -1009,6 +1053,65 @@ impl Db {
             total_rows_affected = lock_rows + cert_rows + ca_rows + user_rows + template_rows,
             "nuked all database entities"
         );
+        Ok(())
+    }
+
+    pub fn list_settings(&self) -> Result<Vec<SettingRow>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        query_settings(&conn)
+    }
+
+    pub fn list_settings_audit(&self, limit: usize) -> Result<Vec<SettingAudit>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut statement = conn.prepare(
+            "SELECT at, actor, key, action, old_value, new_value
+             FROM settings_audit ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit as i64], |row| {
+            Ok(SettingAudit {
+                at: row.get(0)?,
+                actor: row.get(1)?,
+                key: row.get(2)?,
+                action: row.get(3)?,
+                old_value: row.get(4)?,
+                new_value: row.get(5)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    /// Creates or changes a setting and records it in the change history in
+    /// one transaction. Saving identical values records nothing.
+    pub fn save_setting(&self, key: &str, value: &str, enabled: bool, actor: &str) -> Result<()> {
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
+        let old = read_setting(&tx, key)?;
+        let action = match &old {
+            None => "created",
+            Some((old_value, _)) if old_value != value => "updated",
+            Some((_, old_enabled)) if *old_enabled != enabled => {
+                if enabled { "enabled" } else { "disabled" }
+            }
+            Some(_) => return Ok(()),
+        };
+        let now = Utc::now().timestamp_millis();
+        write_setting(&tx, key, value, enabled, now, actor)?;
+        let old_value = old.as_ref().map(|(value, _)| value.as_str());
+        insert_setting_audit(&tx, now, actor, key, action, old_value, Some(value))?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_setting(&self, key: &str, actor: &str) -> Result<()> {
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
+        let Some((old_value, _)) = read_setting(&tx, key)? else {
+            bail!("setting {key} does not exist");
+        };
+        tx.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
+        let now = Utc::now().timestamp_millis();
+        insert_setting_audit(&tx, now, actor, key, "deleted", Some(&old_value), None)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1800,6 +1903,73 @@ fn query_backup_certs(conn: &Connection, ca_id: &str) -> Result<Vec<BackupCertRo
         .map_err(Into::into)
 }
 
+fn query_settings(conn: &Connection) -> Result<Vec<SettingRow>> {
+    let mut statement = conn.prepare(
+        "SELECT key, value, enabled, updated_at, updated_by FROM settings ORDER BY key",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(SettingRow {
+            key: row.get(0)?,
+            value: row.get(1)?,
+            enabled: row.get::<_, i64>(2)? != 0,
+            updated_at: row.get(3)?,
+            updated_by: row.get(4)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+}
+
+fn read_setting(conn: &Connection, key: &str) -> Result<Option<(String, bool)>> {
+    use rusqlite::OptionalExtension as _;
+    conn.query_row(
+        "SELECT value, enabled FROM settings WHERE key = ?1",
+        params![key],
+        |row| Ok((row.get(0)?, row.get::<_, i64>(1)? != 0)),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn write_setting(
+    conn: &Connection,
+    key: &str,
+    value: &str,
+    enabled: bool,
+    at: i64,
+    actor: &str,
+) -> Result<()> {
+    conn.execute(
+        r#"
+        INSERT INTO settings (key, value, enabled, updated_at, updated_by)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            enabled = excluded.enabled,
+            updated_at = excluded.updated_at,
+            updated_by = excluded.updated_by
+        "#,
+        params![key, value, enabled as i64, at, actor],
+    )?;
+    Ok(())
+}
+
+fn insert_setting_audit(
+    conn: &Connection,
+    at: i64,
+    actor: &str,
+    key: &str,
+    action: &str,
+    old_value: Option<&str>,
+    new_value: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO settings_audit (at, actor, key, action, old_value, new_value)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![at, actor, key, action, old_value, new_value],
+    )?;
+    Ok(())
+}
+
 fn is_empty_conn(conn: &Connection) -> Result<bool> {
     let count: i64 = conn.query_row(
         r#"
@@ -2552,6 +2722,7 @@ mod tests {
             users: vec![user.clone()],
             templates: vec![],
             cas: vec![(ca_row.clone(), vec![cert_row.clone(), cert_row.clone()])],
+            settings: None,
         };
         assert!(db.restore_backup(&broken).is_err());
         assert!(
@@ -2563,6 +2734,7 @@ mod tests {
             users: vec![user],
             templates: vec![],
             cas: vec![(ca_row, vec![cert_row])],
+            settings: None,
         };
         db.restore_backup(&good).unwrap();
         let snapshot = db.backup_snapshot().unwrap();

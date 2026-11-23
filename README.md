@@ -10,6 +10,11 @@ the same mental model — CAs and certificates managed over a Basic-auth REST AP
 with admin/viewer roles — while replacing the runtime, storage, and operational
 story with something smaller, safer, and easier to run.
 
+> **Getting certificate warnings?** Clients must trust your CA first. See
+> [Trusting a MiniCA certificate authority](docs/trusting-the-ca.md) for
+> step-by-step setup on operating systems, browsers, command-line tools,
+> programming languages, and servers.
+
 ## Screenshots
 
 <img width="1728" height="494" alt="image" src="https://github.com/user-attachments/assets/794bc50a-7fc1-4593-bf8c-ed4022d6ba4b" />
@@ -336,6 +341,7 @@ Common Docker-friendly variables:
 | `MINICA_PUBLIC_BASE_URL` | `http://127.0.0.1:9988/minica` | External URL used in links and CRL distribution points. |
 | `MINICA_CRL_ENABLED` | `true` | Enable CRL generation and serving. |
 | `MINICA_CRL_NEXT_UPDATE_DAYS` | `30` | CRL `nextUpdate` interval. |
+| `MINICA_EXTRA_LONG_VALIDITY` | `false` | Raise the validity limit from 7350 days to 3,000,000 days, ending no later than 9999-12-31. Some clients reject very long lifetimes. |
 | `MINICA_RUNTIME_FOLDER` | `/data/runtime` in the image | Runtime state folder. |
 | `MINICA_DB_FOLDER` | `/data/sqlite` in the image | Folder containing `db.sqlite`. |
 | `MINICA_LOG_FILE` | `/data/logs/minica.log` in the image | Log file path. |
@@ -378,6 +384,22 @@ docker run --rm -p 8443:8443 -v minica-data:/data \
   -e MINICA_TRUSTED_REMOTE_1=10.0.0.7 \
   minica:local
 ```
+
+### Admin Console configuration
+
+Admins can manage some settings in **Admin Console > Configuration**, without
+editing the config file or restarting:
+
+- Editable keys: `public_base_url`, `crl.enabled`, `crl.next_update_days` and
+  `certificates.extra_long_validity`.
+- Precedence: SQLite, then the config file, then environment variables
+  referenced by the file, then built-in defaults.
+- A disabled setting is treated as not defined. An enabled unknown key is
+  stored but has no effect.
+- Server, storage, OpenSSL, logging and auth settings stay file-only.
+- The Effective configuration table shows every value and its source, with
+  passwords masked. Changes are recorded in the change history.
+- To recover from a bad value, start with `--start --ignore-db-config`.
 
 ### Using LibreSSL instead of OpenSSL
 
