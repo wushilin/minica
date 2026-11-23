@@ -125,6 +125,14 @@ fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<V
     })
 }
 
+/// The `openssl ca` validity option: an exact end time when one is given.
+fn validity_args(valid_days: i64, not_after: Option<&str>) -> (&'static str, String) {
+    match not_after {
+        Some(end) => ("-enddate", end.to_string()),
+        None => ("-days", valid_days.to_string()),
+    }
+}
+
 impl OpenSsl {
     pub fn new(config: OpenSslConfig) -> Self {
         Self { config }
@@ -431,6 +439,7 @@ impl OpenSsl {
         subject: &str,
         common_name: &str,
         valid_days: i64,
+        not_after: Option<&str>,
         digest: &str,
         algorithm: &str,
         options: &Value,
@@ -482,14 +491,15 @@ impl OpenSsl {
                 subject,
             ],
         )?;
+        let (validity_flag, validity_value) = validity_args(valid_days, not_after);
         self.run_ok(
             dir,
             &[
                 "ca",
                 "-config",
                 "openssl-ca.conf",
-                "-days",
-                &valid_days.to_string(),
+                validity_flag,
+                &validity_value,
                 "-md",
                 &digest,
                 "-batch",
@@ -610,6 +620,7 @@ impl OpenSsl {
         cert: &CertSecrets,
         renewal: &RenewalRequest<'_>,
         valid_days: i64,
+        not_after: Option<&str>,
         digest: &str,
         crl_url: Option<&str>,
         crl_days: i64,
@@ -671,14 +682,15 @@ impl OpenSsl {
         if !rebuilt {
             fs::write(cert_dir.join("cert.csr"), &cert.csr_pem)?;
         }
+        let (validity_flag, validity_value) = validity_args(valid_days, not_after);
         self.run_ok(
             dir,
             &[
                 "ca",
                 "-config",
                 "openssl-ca.conf",
-                "-days",
-                &valid_days.to_string(),
+                validity_flag,
+                &validity_value,
                 "-md",
                 &digest,
                 "-batch",
