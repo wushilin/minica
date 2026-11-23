@@ -300,6 +300,9 @@
   "template.submit_create": "Criar modelo",
   "template.submit_update": "Salvar modelo",
   "template.unset": "— não definido —",
+  "validity.ca_max_confirm": "O certificado da CA expira antes, portanto este certificado pode ser válido por no máximo {max} dias. Deseja usar este valor?",
+  "validity.max_confirm": "O valor máximo é {max} dias. Deseja usar este valor?",
+  "validity.use_max": "Usar {max} dias",
   "validity.expired": "expirou há {days} dia(s)",
   "validity.left": "{days} dia(s) restante(s)",
   "validity.today": "expira hoje"

@@ -300,6 +300,9 @@
   "template.submit_create": "Vytvoriť šablónu",
   "template.submit_update": "Uložiť šablónu",
   "template.unset": "— nenastavené —",
+  "validity.ca_max_confirm": "Certifikát CA vyprší skôr, preto môže byť tento certifikát platný najviac {max} dní. Chcete použiť túto hodnotu?",
+  "validity.max_confirm": "Maximálna hodnota je {max} dní. Chcete ju použiť?",
+  "validity.use_max": "Použiť {max} dní",
   "validity.expired": "vypršalo pred {days} dňami",
   "validity.left": "zostáva {days} dní",
   "validity.today": "vyprší dnes"

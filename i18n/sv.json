@@ -300,6 +300,9 @@
   "template.submit_create": "Skapa mall",
   "template.submit_update": "Spara mall",
   "template.unset": "— inte angiven —",
+  "validity.ca_max_confirm": "CA-certifikatet upphör först, så det här certifikatet kan som mest gälla i {max} dagar. Vill du använda det värdet i stället?",
+  "validity.max_confirm": "Maxvärdet är {max} dagar. Vill du använda det i stället?",
+  "validity.use_max": "Använd {max} dagar",
   "validity.expired": "gick ut för {days} dag(ar) sedan",
   "validity.left": "{days} dag(ar) kvar",
   "validity.today": "går ut idag"

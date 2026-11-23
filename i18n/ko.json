@@ -300,6 +300,9 @@
   "template.submit_create": "템플릿 만들기",
   "template.submit_update": "템플릿 저장",
   "template.unset": "— 설정 안 함 —",
+  "validity.ca_max_confirm": "CA 인증서가 먼저 만료되므로 이 인증서의 유효 기간은 최대 {max}일입니다. 이 값을 대신 사용하시겠습니까?",
+  "validity.max_confirm": "최댓값은 {max}일입니다. 이 값을 대신 사용하시겠습니까?",
+  "validity.use_max": "{max}일 사용",
   "validity.expired": "{days}일 전 만료됨",
   "validity.left": "{days}일 남음",
   "validity.today": "오늘 만료"

@@ -3955,6 +3955,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn certificate_forms_know_how_long_the_ca_lasts() {
+        let env = TestEnv::with_extra_long_validity();
+        let csrf = env.get_csrf().await;
+        let admin = Some(("admin", "adminpass"));
+        let mut body = ca_payload("short.lived");
+        body["valid_days"] = json!(100);
+        let ca = env.json("PUT", "/minica/api/cas", admin, Some(&csrf), body).await;
+        ca.assert_status(StatusCode::OK);
+        let ca_id = ca.json()["id"].as_str().unwrap().to_string();
+        let uri = format!("/minica/cas/{ca_id}/certs/new");
+        let page = env.send("GET", &uri, admin, None, None, Body::empty()).await;
+        page.assert_status(StatusCode::OK);
+        assert!(page.text().contains(r#"data-ca-max-days="99""#), "CA limit missing");
+
+        // The server stays strict for API clients and still caps at the CA.
+        let mut over = ca_payload("over.limit");
+        over["valid_days"] = json!(9_999_999_999_999i64);
+        let rejected = env.json("PUT", "/minica/api/cas", admin, Some(&csrf), over).await;
+        assert_ne!(rejected.status, StatusCode::OK);
+        let mut cert = cert_payload("leaf.capped");
+        cert["valid_days"] = json!(5000);
+        let cert = env
+            .json("PUT", &format!("/minica/api/cas/{ca_id}/certs"), admin, Some(&csrf), cert)
+            .await;
+        cert.assert_status(StatusCode::OK);
+        assert_eq!(cert.json()["valid_days"], json!(99));
+    }
+
+    #[tokio::test]
     async fn extra_long_validity_reaches_the_last_x509_date() {
         let env = TestEnv::with_extra_long_validity();
         let csrf = env.get_csrf().await;

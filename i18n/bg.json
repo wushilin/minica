@@ -300,6 +300,9 @@
   "template.submit_create": "Създаване на шаблон",
   "template.submit_update": "Запазване на шаблон",
   "template.unset": "— не е зададено —",
+  "validity.ca_max_confirm": "Сертификатът на CA изтича по-рано, затова този сертификат може да е валиден най-много {max} дни. Искате ли да използвате тази стойност?",
+  "validity.max_confirm": "Максималната стойност е {max} дни. Искате ли да я използвате?",
+  "validity.use_max": "Използвай {max} дни",
   "validity.expired": "изтекъл преди {days} дни",
   "validity.left": "остават {days} дни",
   "validity.today": "изтича днес"

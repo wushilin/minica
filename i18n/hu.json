@@ -300,6 +300,9 @@
   "template.submit_create": "Sablon létrehozása",
   "template.submit_update": "Sablon mentése",
   "template.unset": "— nincs beállítva —",
+  "validity.ca_max_confirm": "A CA-tanúsítvány hamarabb lejár, ezért ez a tanúsítvány legfeljebb {max} napig lehet érvényes. Szeretné ezt az értéket használni?",
+  "validity.max_confirm": "A legnagyobb érték {max} nap. Szeretné ezt használni?",
+  "validity.use_max": "{max} nap használata",
   "validity.expired": "{days} napja lejárt",
   "validity.left": "{days} nap van hátra",
   "validity.today": "ma lejár"

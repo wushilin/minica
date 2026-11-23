@@ -300,6 +300,9 @@
   "template.submit_create": "Створити шаблон",
   "template.submit_update": "Зберегти шаблон",
   "template.unset": "— не задано —",
+  "validity.ca_max_confirm": "Сертифікат ЦС спливає раніше, тому цей сертифікат може діяти не більше {max} дн. Використати це значення?",
+  "validity.max_confirm": "Максимальне значення: {max} дн. Використати його?",
+  "validity.use_max": "Використати {max} дн.",
   "validity.expired": "термін минув {days} дн. тому",
   "validity.left": "залишилося {days} дн.",
   "validity.today": "спливає сьогодні"

@@ -300,6 +300,9 @@
   "template.submit_create": "टेम्पलेट बनाएँ",
   "template.submit_update": "टेम्पलेट सहेजें",
   "template.unset": "— सेट नहीं —",
+  "validity.ca_max_confirm": "CA प्रमाणपत्र पहले समाप्त होता है, इसलिए यह प्रमाणपत्र अधिकतम {max} दिन मान्य रह सकता है। क्या आप इसके बजाय यह मान उपयोग करना चाहते हैं?",
+  "validity.max_confirm": "अधिकतम मान {max} दिन है। क्या आप इसके बजाय यह मान उपयोग करना चाहते हैं?",
+  "validity.use_max": "{max} दिन उपयोग करें",
   "validity.expired": "{days} दिन पहले समाप्त हुआ",
   "validity.left": "{days} दिन शेष",
   "validity.today": "आज समाप्त हो रहा है"

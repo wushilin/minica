@@ -300,6 +300,9 @@
   "template.submit_create": "Креирај шаблон",
   "template.submit_update": "Сачувај шаблон",
   "template.unset": "— није постављено —",
+  "validity.ca_max_confirm": "Сертификат CA истиче први, па овај сертификат може да важи највише {max} дана. Желите ли да користите ову вредност?",
+  "validity.max_confirm": "Највећа вредност је {max} дана. Желите ли да је користите?",
+  "validity.use_max": "Користи {max} дана",
   "validity.expired": "истекао пре {days} дана",
   "validity.left": "преостало {days} дана",
   "validity.today": "истиче данас"

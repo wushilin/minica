@@ -1626,18 +1626,30 @@ impl AppService {
         Ok(())
     }
 
+    /// Whole days until the CA certificate expires, if its expiry is readable.
+    fn ca_days_left(&self, ca_cert_pem: &str) -> Result<Option<i64>> {
+        let work = self.openssl.workdir()?;
+        let info = self.openssl.inspect_cert(work.path(), ca_cert_pem)?;
+        Ok(info_value(&info, "notAfter")
+            .and_then(|v| parse_openssl_date(&v))
+            .map(|not_after| (not_after - Utc::now().timestamp_millis()) / 86_400_000))
+    }
+
+    /// The longest validity a new certificate from this CA can get, for the
+    /// forms to offer. `None` when it cannot be determined or the CA is ending.
+    pub fn max_cert_days(&self, ca_id: &str) -> Option<i64> {
+        let ca = self.db.get_ca(ca_id).ok()?;
+        self.ca_days_left(&ca.cert_pem).ok().flatten().filter(|days| *days >= 1)
+    }
+
     /// Caps a leaf validity so it never outlives the issuing CA certificate.
     /// Returns the effective number of days (recorded as the cert's
     /// `valid_days`).
     fn clamp_to_ca_validity(&self, ca_cert_pem: &str, days: i64) -> Result<i64> {
-        let work = self.openssl.workdir()?;
-        let info = self.openssl.inspect_cert(work.path(), ca_cert_pem)?;
-        let Some(not_after) = info_value(&info, "notAfter").and_then(|v| parse_openssl_date(&v))
-        else {
+        let Some(max_days) = self.ca_days_left(ca_cert_pem)? else {
             tracing::warn!("could not read CA notAfter; leaf validity not clamped");
             return Ok(days);
         };
-        let max_days = (not_after - Utc::now().timestamp_millis()) / 86_400_000;
         if max_days < 1 {
             bail!("the CA certificate expires within a day; it can no longer issue certificates");
         }

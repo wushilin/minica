@@ -300,6 +300,9 @@
   "template.submit_create": "Vorlage anlegen",
   "template.submit_update": "Vorlage speichern",
   "template.unset": "— nicht gesetzt —",
+  "validity.ca_max_confirm": "Das CA-Zertifikat läuft zuerst ab, daher kann dieses Zertifikat höchstens {max} Tage gültig sein. Möchten Sie stattdessen diesen Wert verwenden?",
+  "validity.max_confirm": "Der Höchstwert beträgt {max} Tage. Möchten Sie stattdessen diesen Wert verwenden?",
+  "validity.use_max": "{max} Tage verwenden",
   "validity.expired": "vor {days} Tag(en) abgelaufen",
   "validity.left": "noch {days} Tag(e)",
   "validity.today": "läuft heute ab"

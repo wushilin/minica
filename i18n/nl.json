@@ -300,6 +300,9 @@
   "template.submit_create": "Sjabloon aanmaken",
   "template.submit_update": "Sjabloon opslaan",
   "template.unset": "— niet ingesteld —",
+  "validity.ca_max_confirm": "Het CA-certificaat verloopt eerder, dus dit certificaat kan maximaal {max} dagen geldig zijn. Wilt u deze waarde gebruiken?",
+  "validity.max_confirm": "De maximumwaarde is {max} dagen. Wilt u deze waarde gebruiken?",
+  "validity.use_max": "{max} dagen gebruiken",
   "validity.expired": "{days} dag(en) geleden verlopen",
   "validity.left": "nog {days} dag(en)",
   "validity.today": "verloopt vandaag"

@@ -300,6 +300,9 @@
   "template.submit_create": "إنشاء القالب",
   "template.submit_update": "حفظ القالب",
   "template.unset": "— غير محدد —",
+  "validity.ca_max_confirm": "تنتهي شهادة CA أولًا، لذا يمكن أن تكون هذه الشهادة صالحة لمدة {max} يومًا كحد أقصى. هل تريد استخدام هذه القيمة بدلًا من ذلك؟",
+  "validity.max_confirm": "القيمة القصوى هي {max} يومًا. هل تريد استخدامها بدلًا من ذلك؟",
+  "validity.use_max": "استخدام {max} يومًا",
   "validity.expired": "انتهت صلاحيتها منذ {days} يوم",
   "validity.left": "متبقٍ {days} يوم",
   "validity.today": "تنتهي اليوم"

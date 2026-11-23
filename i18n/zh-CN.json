@@ -300,6 +300,9 @@
   "template.submit_create": "创建模板",
   "template.submit_update": "保存模板",
   "template.unset": "— 未设置 —",
+  "validity.ca_max_confirm": "CA 证书会先到期,因此此证书最长有效期为 {max} 天。是否改用此值?",
+  "validity.max_confirm": "最大值为 {max} 天。是否改用此值?",
+  "validity.use_max": "使用 {max} 天",
   "validity.expired": "已过期 {days} 天",
   "validity.left": "剩余 {days} 天",
   "validity.today": "今天到期"
