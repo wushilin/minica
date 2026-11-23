@@ -36,6 +36,10 @@ crl:
   enabled: {{ENV:MINICA_CRL_ENABLED:true}}
   next_update_days: {{ENV:MINICA_CRL_NEXT_UPDATE_DAYS:30}}
 
+certificates:
+  # false: up to 7350 days. true: up to 3,000,000 days, ending by 9999-12-31.
+  extra_long_validity: {{ENV:MINICA_EXTRA_LONG_VALIDITY:false}}
+
 runtime:
   folder: {{ENV:MINICA_RUNTIME_FOLDER:./runtime}}
   db_folder: {{ENV:MINICA_DB_FOLDER:null}}

@@ -147,8 +147,10 @@ uses it), unless `MINICA_BASIC_AUTH_ENABLE=false`.
 - The web pages load Bootstrap's stylesheet from `cdn.jsdelivr.net` in the
   **browser**. MiniCA itself never needs outbound access, but a browser on a
   network without internet gets an unstyled (still working) page.
-- The public CA index (`/minica/`), the CA certificates
-  (`/minica/<ca-id>/download`), the truststores and the CRLs
+- The public CA index (`/minica/`), the How to Use guide
+  (`/minica/how-to-use`), the language switch (`/minica/lang/<code>`), the CA
+  certificates (`/minica/<ca-id>/download`), the truststores and the CRLs
   (`/minica/crl/<ca-id>`) need no login by design, so clients can fetch the
   trust anchor and revocation list without credentials. Everything else
-  requires a user.
+  requires a user. With SSO, expose these through one Nginx rule as shown in
+  [Publishing MiniCA through Nginx](trusting-the-ca.md#publishing-minica-through-nginx).

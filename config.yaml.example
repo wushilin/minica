@@ -9,6 +9,10 @@ crl:
   enabled: true
   next_update_days: 30
 
+certificates:
+  # false: up to 7350 days. true: up to 3,000,000 days, ending by 9999-12-31.
+  extra_long_validity: false
+
 runtime:
   folder: ./runtime
   db_folder: null

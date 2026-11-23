@@ -1,3 +1,4 @@
+use crate::settings::{ConfigOption, CrlDays, Source};
 use anyhow::{Context, Result};
 use ipnet::IpNet;
 use serde::{Deserialize, Deserializer, de::Error as _};
@@ -16,11 +17,16 @@ pub struct Config {
     pub public_base_url: Option<String>,
     #[serde(default)]
     pub crl: CrlConfig,
+    #[serde(default)]
+    pub certificates: CertificatesConfig,
     pub runtime: RuntimeConfig,
     pub openssl: OpenSslConfig,
     pub auth: AuthConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    /// Where each value came from, for the effective configuration view.
+    #[serde(skip)]
+    pub sources: ConfigSources,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -34,7 +40,7 @@ pub struct ServerConfig {
     pub base_path: String,
     /// Mark cookies `Secure`. MiniCA itself speaks plain HTTP, so only enable
     /// this when every browser reaches it over HTTPS (e.g. a TLS proxy).
-    #[serde(default, deserialize_with = "lenient::bool")]
+    #[serde(default = "default_secure_cookies", deserialize_with = "lenient::bool")]
     pub secure_cookies: bool,
 }
 
@@ -56,9 +62,9 @@ pub struct OpenSslConfig {
     )]
     pub timeout_seconds: u64,
     pub working_root: PathBuf,
-    #[serde(deserialize_with = "lenient::bool")]
+    #[serde(default = "default_keep_failed_workdirs", deserialize_with = "lenient::bool")]
     pub keep_failed_workdirs: bool,
-    #[serde(deserialize_with = "lenient::from_str")]
+    #[serde(default = "default_reap_after_hours", deserialize_with = "lenient::from_str")]
     pub reap_after_hours: u64,
 }
 
@@ -126,8 +132,64 @@ mod lenient {
     }
 }
 
+fn default_secure_cookies() -> bool {
+    ConfigOption::ServerSecureCookies.default_as()
+}
+
+fn default_keep_failed_workdirs() -> bool {
+    ConfigOption::OpensslKeepFailedWorkdirs.default_as()
+}
+
+fn default_reap_after_hours() -> u64 {
+    ConfigOption::OpensslReapAfterHours.default_as()
+}
+
+fn default_users_enabled() -> bool {
+    ConfigOption::AuthUsersEnabled.default_as()
+}
+
+fn default_headers_enabled() -> bool {
+    ConfigOption::AuthHeadersEnabled.default_as()
+}
+
+fn default_trusted_remotes() -> Vec<String> {
+    ConfigOption::AuthHeadersTrustedRemotes.default_as()
+}
+
+fn default_trust_all_remotes() -> bool {
+    ConfigOption::AuthHeadersTrustAllRemotes.default_as()
+}
+
+fn default_log_file() -> PathBuf {
+    ConfigOption::LoggingFile.default_as()
+}
+
+fn default_rotate_size_bytes() -> u64 {
+    ConfigOption::LoggingRotateSizeBytes.default_as()
+}
+
+fn default_max_backups() -> usize {
+    ConfigOption::LoggingMaxBackups.default_as()
+}
+
+fn default_log_compress() -> bool {
+    ConfigOption::LoggingCompress.default_as()
+}
+
+fn default_extra_long_validity() -> bool {
+    ConfigOption::ExtraLongValidity.default_as()
+}
+
+fn default_crl_enabled() -> bool {
+    ConfigOption::CrlEnabled.default_as()
+}
+
+fn default_crl_next_update_days() -> i64 {
+    ConfigOption::CrlNextUpdateDays.default_as::<CrlDays>().0
+}
+
 fn default_timeout_seconds() -> u64 {
-    15
+    ConfigOption::OpensslTimeoutSeconds.default_as()
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -139,10 +201,6 @@ pub struct AuthConfig {
     /// basic auth, so both sections can coexist in one config template.
     #[serde(default)]
     pub headers: Option<HeaderAuthConfig>,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// Basic-auth section: an `enabled` toggle plus the bootstrap account list.
@@ -157,7 +215,7 @@ pub struct UsersConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UsersObject {
-    #[serde(default = "default_true", deserialize_with = "lenient::bool")]
+    #[serde(default = "default_users_enabled", deserialize_with = "lenient::bool")]
     enabled: bool,
     #[serde(default)]
     list: Vec<UserConfig>,
@@ -170,7 +228,7 @@ impl<'de> Deserialize<'de> for UsersConfig {
         match Value::deserialize(deserializer)? {
             value @ Value::Sequence(_) => serde_yaml::from_value(value)
                 .map(|list| Self {
-                    enabled: true,
+                    enabled: default_users_enabled(),
                     list,
                 })
                 .map_err(|err| D::Error::custom(format!("auth.users list: {err}"))),
@@ -191,7 +249,7 @@ impl<'de> Deserialize<'de> for UsersConfig {
 #[serde(deny_unknown_fields)]
 pub struct HeaderAuthConfig {
     /// Toggle for this mode; on by default when the section is present.
-    #[serde(default = "default_true", deserialize_with = "lenient::bool")]
+    #[serde(default = "default_headers_enabled", deserialize_with = "lenient::bool")]
     pub enabled: bool,
     /// Header carrying the authenticated user id.
     #[serde(default = "default_username_header")]
@@ -207,13 +265,13 @@ pub struct HeaderAuthConfig {
     pub viewer_group: String,
     /// Peers (bare IPs or CIDRs) allowed to assert identity headers. Must be
     /// non-empty unless `trust_all_remotes` is set.
-    #[serde(default)]
+    #[serde(default = "default_trusted_remotes")]
     pub trusted_remotes: Vec<String>,
     /// Explicit opt-in to honour identity headers from every remote when
     /// `trusted_remotes` is empty. Only safe when MiniCA is reachable solely
     /// through the authenticating proxy. Ignored when `trusted_remotes` lists
     /// at least one peer.
-    #[serde(default, deserialize_with = "lenient::bool")]
+    #[serde(default = "default_trust_all_remotes", deserialize_with = "lenient::bool")]
     pub trust_all_remotes: bool,
     /// Parsed form of `trusted_remotes`, populated by `AuthConfig::validate`.
     #[serde(skip)]
@@ -221,19 +279,19 @@ pub struct HeaderAuthConfig {
 }
 
 fn default_username_header() -> String {
-    "Remote-User".to_string()
+    ConfigOption::AuthHeadersUsername.default_as()
 }
 
 fn default_group_header() -> String {
-    "Remote-Groups".to_string()
+    ConfigOption::AuthHeadersGroup.default_as()
 }
 
 fn default_admin_group() -> String {
-    "admin".to_string()
+    ConfigOption::AuthHeadersAdminGroup.default_as()
 }
 
 fn default_viewer_group() -> String {
-    "user".to_string()
+    ConfigOption::AuthHeadersViewerGroup.default_as()
 }
 
 impl AuthConfig {
@@ -301,6 +359,48 @@ fn parse_config_with_env(
     Ok((serde_yaml::from_value(value)?, used_names))
 }
 
+/// Sources by dotted config path. A path that is absent uses its default.
+#[derive(Clone, Debug, Default)]
+pub struct ConfigSources(std::collections::HashMap<String, Source>);
+
+impl ConfigSources {
+    pub fn get(&self, path: &str) -> Option<&Source> {
+        self.0.get(path)
+    }
+
+    fn from_text(text: &str, lookup: &impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let (placeholdered, tokens) = EnvPlaceholders::extract(text)?;
+        let value: Value = serde_yaml::from_str(&placeholdered)?;
+        let mut sources = Self::default();
+        sources.collect("", &value, &tokens, lookup);
+        Ok(sources)
+    }
+
+    fn collect(
+        &mut self,
+        path: &str,
+        value: &Value,
+        tokens: &EnvPlaceholders,
+        lookup: &impl Fn(&str) -> Option<String>,
+    ) {
+        if let Value::Mapping(map) = value {
+            for (key, item) in map {
+                if let Some(key) = key.as_str() {
+                    let child = if path.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    self.collect(&child, item, tokens, lookup);
+                }
+            }
+            return;
+        }
+        self.0
+            .insert(path.to_string(), tokens.source_of(value, lookup));
+    }
+}
+
 /// Raw `{{ENV:...}}` tokens lifted out of the config text, each replaced by
 /// `<prefix><index>__` — a plain identifier that is valid anywhere in YAML.
 struct EnvPlaceholders {
@@ -332,6 +432,35 @@ impl EnvPlaceholders {
         }
         out.push_str(rest);
         Ok((out, Self { prefix, tokens }))
+    }
+
+    /// The first set environment variable a value refers to, if any.
+    fn source_of(
+        &self,
+        value: &Value,
+        lookup: &impl Fn(&str) -> Option<String>,
+    ) -> Source {
+        let text = serde_yaml::to_string(value).unwrap_or_default();
+        let mut rest = text.as_str();
+        while let Some(start) = rest.find(&self.prefix) {
+            let after = &rest[start + self.prefix.len()..];
+            let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+            let name = after[..digits]
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| self.tokens.get(index))
+                .and_then(|token| {
+                    let inner = token.strip_prefix("{{ENV:")?.strip_suffix("}}")?;
+                    parse_env_token(inner).ok().map(|(name, _)| name.to_string())
+                });
+            if let Some(name) = name
+                && lookup(&name).is_some()
+            {
+                return Source::Environment(name);
+            }
+            rest = &after[digits..];
+        }
+        Source::File
     }
 
     /// Substitute placeholders in one string scalar: restore the original
@@ -563,28 +692,68 @@ fn parse_trusted_remotes(entries: &[String]) -> Result<Vec<IpNet>> {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct LoggingConfig {
+    #[serde(default = "default_log_file")]
     pub file: PathBuf,
-    #[serde(deserialize_with = "lenient::from_str")]
+    #[serde(default = "default_rotate_size_bytes", deserialize_with = "lenient::from_str")]
     pub rotate_size_bytes: u64,
-    #[serde(deserialize_with = "lenient::from_str")]
+    #[serde(default = "default_max_backups", deserialize_with = "lenient::from_str")]
     pub max_backups: usize,
-    #[serde(deserialize_with = "lenient::bool")]
+    #[serde(default = "default_log_compress", deserialize_with = "lenient::bool")]
     pub compress: bool,
+}
+
+/// The longest validity, in days, without the extra-long override.
+pub const STANDARD_MAX_VALID_DAYS: i64 = 7350;
+
+/// The longest validity, in days, with the extra-long override.
+pub const EXTRA_LONG_MAX_VALID_DAYS: i64 = 3_000_000;
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct CertificatesConfig {
+    /// Allows validity up to `EXTRA_LONG_MAX_VALID_DAYS`, ending no later
+    /// than 9999-12-31.
+    #[serde(default = "default_extra_long_validity", deserialize_with = "lenient::bool")]
+    pub extra_long_validity: bool,
+}
+
+impl Default for CertificatesConfig {
+    fn default() -> Self {
+        Self {
+            extra_long_validity: default_extra_long_validity(),
+        }
+    }
+}
+
+impl CertificatesConfig {
+    pub fn effective_max_days(self) -> i64 {
+        if self.extra_long_validity {
+            EXTRA_LONG_MAX_VALID_DAYS.min(days_until_x509_limit())
+        } else {
+            STANDARD_MAX_VALID_DAYS
+        }
+    }
+}
+
+/// Days from today (UTC) to 9999-12-31, the last date X.509 can represent.
+/// One more day would be year 10000.
+pub fn days_until_x509_limit() -> i64 {
+    let last = chrono::NaiveDate::from_ymd_opt(9999, 12, 31).expect("valid date");
+    (last - chrono::Utc::now().date_naive()).num_days()
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct CrlConfig {
-    #[serde(deserialize_with = "lenient::bool")]
+    #[serde(default = "default_crl_enabled", deserialize_with = "lenient::bool")]
     pub enabled: bool,
-    #[serde(deserialize_with = "lenient::from_str")]
+    #[serde(default = "default_crl_next_update_days", deserialize_with = "lenient::from_str")]
     pub next_update_days: i64,
 }
 
 impl Default for CrlConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
-            next_update_days: 30,
+            enabled: default_crl_enabled(),
+            next_update_days: default_crl_next_update_days(),
         }
     }
 }
@@ -592,10 +761,10 @@ impl Default for CrlConfig {
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
-            file: PathBuf::from("./logs/minica.log"),
-            rotate_size_bytes: 10 * 1024 * 1024,
-            max_backups: 10,
-            compress: true,
+            file: default_log_file(),
+            rotate_size_bytes: default_rotate_size_bytes(),
+            max_backups: default_max_backups(),
+            compress: default_log_compress(),
         }
     }
 }
@@ -672,7 +841,8 @@ impl Config {
         text: &str,
         lookup: impl Fn(&str) -> Option<String>,
     ) -> Result<(Self, HashSet<String>)> {
-        let (mut config, used_names) = parse_config_with_env(text, lookup)?;
+        let (mut config, used_names) = parse_config_with_env(text, &lookup)?;
+        config.sources = ConfigSources::from_text(text, &lookup)?;
         config.auth.validate().context("invalid auth config")?;
         config.server.base_path = normalize_base_path(&config.server.base_path);
         if let Some(base) = config.public_base_url.as_mut() {
@@ -946,6 +1116,52 @@ mod env_token_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("invalid number"), "{err}");
+    }
+
+    #[test]
+    fn a_minimal_config_gets_its_defaults_from_the_registry() {
+        let yaml = "server:\n  host: 127.0.0.1\n  port: 9988\n  base_path: /minica\nruntime:\n  folder: ./runtime\nopenssl:\n  path: /usr/bin/openssl\n  working_root: ./w\nlogging:\n  max_backups: 3\nauth:\n  users:\n    - username: admin\n      password: x\n      role: admin\n";
+        let (config, _) = Config::from_yaml_with(yaml, lookup(&[])).expect("loads");
+        assert_eq!(config.openssl.timeout_seconds, 15);
+        assert!(!config.openssl.keep_failed_workdirs);
+        assert_eq!(config.openssl.reap_after_hours, 24);
+        assert!(config.crl.enabled);
+        assert_eq!(config.crl.next_update_days, 30);
+        assert!(!config.certificates.extra_long_validity);
+        assert_eq!(config.logging.max_backups, 3);
+        assert_eq!(config.logging.rotate_size_bytes, 10_485_760);
+        assert!(config.logging.compress);
+    }
+
+    #[test]
+    fn sources_name_the_environment_variable_only_when_it_is_set() {
+        let docker = include_str!("../config.yaml.docker");
+        let (config, _) =
+            Config::from_yaml_with(docker, lookup(&[("MINICA_PORT", "8443")])).expect("loads");
+        assert_eq!(
+            config.sources.get("server.port"),
+            Some(&Source::Environment("MINICA_PORT".to_string()))
+        );
+        assert_eq!(config.sources.get("server.host"), Some(&Source::File));
+        assert_eq!(config.sources.get("no.such.key"), None);
+    }
+
+    #[test]
+    fn extra_long_validity_is_off_unless_the_env_enables_it() {
+        let docker = include_str!("../config.yaml.docker");
+        let (standard, _) = Config::from_yaml_with(docker, lookup(&[])).expect("loads");
+        assert!(!standard.certificates.extra_long_validity);
+        assert_eq!(standard.certificates.effective_max_days(), 7350);
+        let (extra, _) = Config::from_yaml_with(
+            docker,
+            lookup(&[("MINICA_EXTRA_LONG_VALIDITY", "true")]),
+        )
+        .expect("loads");
+        assert!(extra.certificates.extra_long_validity);
+        assert_eq!(
+            extra.certificates.effective_max_days(),
+            EXTRA_LONG_MAX_VALID_DAYS.min(days_until_x509_limit())
+        );
     }
 
     #[test]
